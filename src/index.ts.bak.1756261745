@@ -38,11 +38,6 @@ const commands = [
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
-  new SlashCommandBuilder().setName('set_reviewer_role')
-    .setDescription('Only this role may approve/deny withdrawals (clears if omitted)')
-    .addRoleOption(o => o.setName('role').setDescription('Reviewer role').setRequired(false))
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
-
   new SlashCommandBuilder().setName('link_nation')
     .setDescription('Link your Discord to your PnW nation for safekeeping')
     .addIntegerOption(o => o.setName('nation_id').setDescription('Your nation id').setRequired(true))
@@ -126,8 +121,6 @@ client.on('interactionCreate', async (i: Interaction) => {
     if (i.isChatInputCommand()) {
       if (i.commandName === 'setup_alliance') return handleSetupAlliance(i);
       if (i.commandName === 'set_review_channel') return handleSetReviewChannel(i);
-      if (i.commandName === 'set_reviewer_role') return handleSetReviewerRole(i);
-      if (i.commandName === 'config_autopay') return handleConfigAutopay(i);
       if (i.commandName === 'link_nation') return handleLinkNation(i);
       if (i.commandName === 'balance') return handleBalance(i);
       if (i.commandName === 'withdraw') return handleWithdrawStart(i);
@@ -179,21 +172,6 @@ async function handleSetReviewChannel(i: ChatInputCommandInteraction) {
   if (!channel || channel.type !== ChannelType.GuildText) return i.reply({ content: 'Pick a text channel.', ephemeral: true });
   await prisma.alliance.update({ where: { id: alliance.id }, data: { reviewChannelId: channel.id } });
   await i.reply({ content: `✅ Review channel set to #${(channel as any).name}.`, ephemeral: true });
-}
-
-async function handleSetReviewerRole(i: ChatInputCommandInteraction) {
-  const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
-  if (!alliance) return i.reply({ content: 'This server is not linked yet. Run /setup_alliance first.', ephemeral: true });
-
-  const role = i.options.getRole('role', false);
-  await prisma.allianceConfig.upsert({
-    where: { allianceId: alliance.id },
-    update: { reviewerRoleId: role?.id || null },
-    create: { allianceId: alliance.id, reviewerRoleId: role?.id || null },
-  });
-
-  const msg = role ? `✅ Reviewer role set to <@&${role.id}>.` : '✅ Reviewer role cleared. (Fallback: Manage Server can approve.)';
-  await i.reply({ content: msg, ephemeral: true });
 }
 
 async function handleLinkNation(i: ChatInputCommandInteraction) {
@@ -422,46 +400,12 @@ async function handleWithdrawSet(i: ChatInputCommandInteraction) {
   }
 }
 
-
-async function handleConfigAutopay(i: ChatInputCommandInteraction) {
-  const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
-  if (!alliance) return i.reply({ content: 'This server is not linked yet. Run /setup_alliance first.', ephemeral: true });
-
-  const enabled = i.options.getBoolean('enabled', true);
-  await prisma.allianceConfig.upsert({
-    where: { allianceId: alliance.id },
-    update: { autopayEnabled: enabled },
-    create: { allianceId: alliance.id, autopayEnabled: enabled },
-  });
-  await i.reply({ content: `⚙️ Autopay is now **${enabled ? 'ON' : 'OFF'}** for this alliance.`, ephemeral: true });
-}
 // --- Button approvals + DMs + Auto-Pay ---
 async function handleApprovalButton(i: ButtonInteraction) {
   if (!i.guildId) return i.reply({ content: 'Guild only.', ephemeral: true });
-
-  // Permission gate:
-  // If a reviewer role is configured, require that role.
-  // Otherwise, fallback to ManageGuild permission.
-  const alliance = await prisma.alliance.findFirst({
-    where: { guildId: i.guildId }});
-  if (alliance?.config?.reviewerRoleId) {
-    try {
-      const gm = await i.guild!.members.fetch(i.user.id);
-      if (!gm.roles.cache.has(alliance.config.reviewerRoleId)) {
-        return i.reply({
-          content: `You must have the <@&${alliance.config.reviewerRoleId}> role to approve/deny.`,
-          ephemeral: true
-        });
-      }
-    } catch {
-      return i.reply({ content: 'Cannot verify your roles right now.', ephemeral: true });
-    }
-  } else {
-    if (!i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
-      return i.reply({ content: 'You lack permission to approve/deny.', ephemeral: true });
-    }
+  if (!i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+    return i.reply({ content: 'You lack permission to approve/deny.', ephemeral: true });
   }
-
   const [prefix, action, id] = i.customId.split(':');
   if (prefix !== 'w' || !id) return;
   const status: WithdrawStatus = action === 'approve' ? 'APPROVED' : 'REJECTED';
@@ -499,17 +443,15 @@ async function handleApprovalButton(i: ButtonInteraction) {
   } catch {}
 
   // --- Optional Auto-Pay on APPROVE ---
-  const cfg2 = await prisma.allianceConfig.findUnique({ where: { allianceId: req.allianceId } });
-  const isAutoEnabled = process.env.AUTOPAY_ENABLED === '1' && (cfg2?.autopayEnabled ?? true);
-  if (status === 'APPROVED' && isAutoEnabled) {
+  if (status === 'APPROVED' && process.env.AUTOPAY_ENABLED === '1') {
     try {
       // get alliance + latest api key
-      const allianceForPay = await prisma.alliance.findUnique({
+      const alliance = await prisma.alliance.findUnique({
         where: { id: req.allianceId },
         include: { keys: { orderBy: { id: 'desc' }, take: 1 } }
       });
       const member = await prisma.member.findUnique({ where: { id: req.memberId } });
-      const apiKeyEnc = allianceForPay?.keys[0];
+      const apiKeyEnc = alliance?.keys[0];
       const apiKey = apiKeyEnc ? open(apiKeyEnc.encryptedApiKey as any, apiKeyEnc.nonceApi as any) : (process.env.PNW_DEFAULT_API_KEY || '');
       const botKey = process.env.PNW_BOT_KEY || '';
 
@@ -546,7 +488,6 @@ async function handleApprovalButton(i: ButtonInteraction) {
         await i.followUp({ content: '⚠️ Auto-pay failed. Left as **APPROVED**.', ephemeral: true });
       }
     } catch (e) {
-      console.error('AUTOPAY_ERR_THROW', e);
       await i.followUp({ content: '⚠️ Auto-pay error. Left as **APPROVED**.', ephemeral: true });
     }
   }
