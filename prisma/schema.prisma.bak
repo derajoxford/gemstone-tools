@@ -19,7 +19,6 @@ model Alliance {
   id              Int        @id                 // PnW alliance id
   guildId         String?
   name            String?
-  reviewChannelId String?    // NEW: channel to post approval buttons
   createdAt       DateTime   @default(now())
   updatedAt       DateTime   @updatedAt
   lastBankrecId   Int?

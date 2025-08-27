@@ -1,0 +1,50 @@
+import { GraphQLClient, gql } from 'graphql-request';
+
+export type PnwKeys = { apiKey: string; botKey?: string };
+
+export function pnwClient(keys: PnwKeys) {
+  // Use URL auth (?api_key=...) which is officially documented and avoids the 401 you saw.
+  const url = 'https://api.politicsandwar.com/graphql?api_key=' + encodeURIComponent(keys.apiKey);
+  const headers: Record<string, string> = {};
+  if (keys.botKey) headers['X-Bot-Key'] = keys.botKey; // used later for mutations
+  const client = new GraphQLClient(url, { headers, timeout: 30000 });
+  return client;
+}
+
+// NOTE: 'alliances' returns an AlliancePaginator — you must query 'data { ... }'
+export const BANKRECS_QUERY = gql`
+  query AllianceBankrecs($ids: [Int!]) {
+    alliances(id: $ids) {
+      data {
+        id
+        bankrecs {
+          id
+          date
+          note
+          sender_type
+          sender_id
+          receiver_type
+          receiver_id
+          money
+          food
+          coal
+          oil
+          uranium
+          lead
+          iron
+          bauxite
+          gasoline
+          munitions
+          steel
+          aluminum
+        }
+      }
+    }
+  }
+`;
+
+export async function fetchBankrecs(keys: PnwKeys, allianceIds: number[]) {
+  const client = pnwClient(keys);
+  const data = await client.request(BANKRECS_QUERY, { ids: allianceIds });
+  return ((data as any).alliances?.data ?? []) as any[];
+}

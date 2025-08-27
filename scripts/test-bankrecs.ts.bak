@@ -1,0 +1,48 @@
+import 'dotenv/config';
+import { PrismaClient } from '@prisma/client';
+import { open } from '../src/lib/crypto.js';
+import { GraphQLClient, gql } from 'graphql-request';
+
+const prisma = new PrismaClient();
+const Q = gql`
+  query($ids:[Int!]) {
+    alliances(id:$ids) {
+      id
+      name
+      bankrecs { id date note money steel aluminum }
+    }
+  }
+`;
+
+(async () => {
+  const a = await prisma.alliance.findFirst({
+    include: { keys: { orderBy: { id: 'desc' }, take: 1 } }
+  });
+  if (!a || !a.keys[0]) {
+    console.error('No alliance or keys saved. Run /setup_alliance first.');
+    process.exit(1);
+  }
+  const k = a.keys[0];
+  const apiKey = open(k.encryptedApiKey as any, k.nonceApi as any);
+
+  const client = new GraphQLClient('https://api.politicsandwar.com/graphql', {
+    headers: { 'X-Api-Key': apiKey }
+  });
+
+  try {
+    const data = await client.request(Q, { ids: [a.id] });
+    console.log(JSON.stringify(data, null, 2));
+    const rows = data?.alliances?.[0]?.bankrecs ?? null;
+    if (rows === null) {
+      console.error('bankrecs returned NULL: your nation likely lacks bank-view permission for this alliance.');
+      process.exit(2);
+    }
+    if (!rows.length) {
+      console.error('bankrecs returned 0 rows (either no activity in ~14 days or insufficient access).');
+      process.exit(3);
+    }
+  } catch (e: any) {
+    console.error('GraphQL error:', e.response?.errors ?? e.message);
+    process.exit(4);
+  }
+})();
