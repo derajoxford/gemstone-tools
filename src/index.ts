@@ -114,6 +114,8 @@ function parseNum(s: string): number {
   const n = Number(cleaned);
   return Number.isFinite(n) && n >= 0 ? n : NaN;
 }
+// Keep per-user withdraw modal session (paged amounts)
+const wdSessions: Map<string, { data: Record<string, number>, createdAt: number }> = new Map();
 
 // ---------- Interaction Handling ----------
 client.on('interactionCreate', async (i: Interaction) => {
@@ -128,10 +130,13 @@ client.on('interactionCreate', async (i: Interaction) => {
       if (i.commandName === 'withdraw_list') return handleWithdrawList(i);
       if (i.commandName === 'withdraw_set') return handleWithdrawSet(i);
     } else if (i.isModalSubmit()) {
+      if (i.customId.startsWith('wd:modal:')) return handleWithdrawPagedModal(i as any);
       if (i.customId.startsWith('wd:req:')) return handleWithdrawModal(i);
+      if (String(i.customId).startsWith('wd:modal:')) return handleWithdrawModalSubmit(i as any);
       if (i.customId.startsWith('alliancekeys:')) return handleAllianceModal(i as any);
     } else if (i.isButton()) {
-      if (i.customId === 'wd:open') return handleWithdrawOpenButton(i);
+      if (i.customId.startsWith('wd:open:')) return handleWithdrawOpenButtonPaged(i as any);
+      if (i.customId === 'wd:done') return handleWithdrawDone(i as any);
       return handleApprovalButton(i);
     }
   } catch (err) {
@@ -212,6 +217,8 @@ async function handleBalance(i: ChatInputCommandInteraction) {
 
 // ---- Withdraw flow: start → button → modal → create request ----
 async function handleWithdrawStart(i: ChatInputCommandInteraction) {
+  // reset paged-session
+  wdSessions.set(i.user.id, { data: {}, createdAt: Date.now() });
   const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
   if (!alliance) return i.reply({ content: 'No alliance linked yet. Run /setup_alliance first.', ephemeral: true });
 
@@ -221,7 +228,7 @@ async function handleWithdrawStart(i: ChatInputCommandInteraction) {
     .setColor(Colors.Gold);
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId('wd:open').setLabel('Start').setEmoji('✨').setStyle(ButtonStyle.Primary)
+    new ButtonBuilder().setCustomId('wd:open:0').setLabel('Start').setEmoji('✨').setStyle(ButtonStyle.Primary)
   );
 
   await i.reply({ embeds: [embed], components: [row], ephemeral: true });
@@ -627,4 +634,175 @@ cron.schedule('*/2 * * * *', async () => {
   }
 });
 
+// ---- Paged withdraw: helpers & handlers ----
+const WD_PAGE_SIZE = 5;
+function wdPageCount(keys: string[]) { return Math.ceil(keys.length / WD_PAGE_SIZE); }
+function wdSlice(keys: string[], page: number) { const s = page * WD_PAGE_SIZE; return keys.slice(s, s + WD_PAGE_SIZE); }
+
+async function wdOpenModal(i: any, page: number) {
+  const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
+  if (!alliance) return i.reply({ content: 'No alliance linked here.', ephemeral: true });
+  const member = await prisma.member.findFirst({ where: { allianceId: alliance.id, discordId: i.user.id }, include: { balance: true } });
+  if (!member || !member.balance) return i.reply({ content: 'No safekeeping found. Run /link_nation first.', ephemeral: true });
+
+  const bal: any = member.balance as any;
+  const haveKeys = ORDER.filter((k) => Number(bal[k] || 0) > 0);
+  if (!haveKeys.length) return i.reply({ content: 'You have nothing in safekeeping to withdraw.', ephemeral: true });
+
+  const total = wdPageCount(haveKeys);
+  const idx = Math.max(0, Math.min(page, Math.max(0, total - 1)));
+  const pageKeys = wdSlice(haveKeys, idx);
+
+  // Pre-fill from session if present
+  const sess = wdSessions.get(i.user.id);
+
+  const modal = new ModalBuilder().setCustomId(`wd:modal:${idx}`).setTitle(`💸 Withdraw (${idx + 1}/${total})`);
+  for (const k of pageKeys) {
+    const avail = Number(bal[k] || 0);
+    const input = new TextInputBuilder()
+      .setCustomId(k)
+      .setLabel(`${RES_EMOJI[k]} ${k} (avail: ${avail.toLocaleString()})`)
+      .setStyle(TextInputStyle.Short)
+      .setRequired(false)
+      .setPlaceholder('0');
+    const prev = sess?.data?.[k];
+    if (typeof prev === 'number' && prev > 0) (input as any).setValue(String(prev));
+    modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+  }
+  await i.showModal(modal);
+}
+
+async function handleWithdrawOpenButtonPaged(i: any) {
+  const m = String(i.customId).match(/^wd:open(?::(\d+))?$/);
+  const page = m && m[1] ? Math.max(0, parseInt(m[1], 10)) : 0;
+  return wdOpenModal(i, page);
+}
+
+async function handleWithdrawPagedModal(i: any) {
+  const m = String(i.customId).match(/^wd:modal:(\d+)$/);
+  const page = m ? Math.max(0, parseInt(m[1], 10)) : 0;
+
+  const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
+  if (!alliance) return i.reply({ content: 'No alliance linked here.', ephemeral: true });
+  const member = await prisma.member.findFirst({ where: { allianceId: alliance.id, discordId: i.user.id }, include: { balance: true } });
+  if (!member || !member.balance) return i.reply({ content: 'No safekeeping found.', ephemeral: true });
+
+  const bal: any = member.balance as any;
+  const haveKeys = ORDER.filter(k => Number(bal[k] || 0) > 0);
+  const total = wdPageCount(haveKeys);
+  const idx = Math.max(0, Math.min(page, Math.max(0, total - 1)));
+  const pageKeys = wdSlice(haveKeys, idx);
+
+  // Update session with validated values
+  const sess = wdSessions.get(i.user.id) || { data: {}, createdAt: Date.now() };
+  for (const k of pageKeys) {
+    const raw = i.fields.getTextInputValue(k) || '';
+    const num = parseNum(raw);
+    if (Number.isNaN(num) || num < 0) {
+      return i.reply({ content: `Invalid number for ${k}.`, ephemeral: true });
+    }
+    if (num > Number(bal[k] || 0)) {
+      return i.reply({ content: `Requested ${num.toLocaleString()} ${k}, but only ${Number(bal[k] || 0).toLocaleString()} available.`, ephemeral: true });
+    }
+    if (num > 0) sess.data[k] = num; else delete sess.data[k];
+  }
+  wdSessions.set(i.user.id, sess);
+
+  // Prev / Next / Done buttons
+  const btns: ButtonBuilder[] = [];
+  if (idx > 0) btns.push(new ButtonBuilder().setCustomId(`wd:open:${idx - 1}`).setStyle(ButtonStyle.Secondary).setLabel(`◀ Prev (${idx}/${total})`));
+  if (idx < total - 1) btns.push(new ButtonBuilder().setCustomId(`wd:open:${idx + 1}`).setStyle(ButtonStyle.Primary).setLabel(`Next (${idx + 2}/${total}) ▶`));
+  btns.push(new ButtonBuilder().setCustomId('wd:done').setStyle(ButtonStyle.Success).setLabel('Done ✅'));
+
+  const rows = [new ActionRowBuilder<ButtonBuilder>().addComponents(...btns)];
+  const picked = Object.entries(sess.data).map(([k,v]) => `${k}:${Number(v).toLocaleString()}`).join(', ');
+  const msg = picked ? `Saved: ${picked}` : 'No amounts entered yet.';
+
+  await i.reply({ content: msg, components: rows, ephemeral: true });
+}
+
+async function handleWithdrawDone(i: any) {
+  const sess = wdSessions.get(i.user.id);
+  if (!sess || !Object.keys(sess.data).length) {
+    return i.reply({ content: 'Nothing to submit — all zero. Start again with **/withdraw**.', ephemeral: true });
+  }
+
+  const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
+  if (!alliance) return i.reply({ content: 'No alliance linked here.', ephemeral: true });
+  const member = await prisma.member.findFirst({ where: { allianceId: alliance.id, discordId: i.user.id }, include: { balance: true } });
+  if (!member || !member.balance) return i.reply({ content: 'No safekeeping found.', ephemeral: true });
+
+  try {
+    await submitWithdraw(i, alliance.id, member, sess.data);
+    wdSessions.delete(i.user.id);
+  } catch (e) {
+    console.error('[wd:done][err]', e);
+    return i.reply({ content: 'Something went wrong submitting your request.', ephemeral: true });
+  }
+}
 client.login(process.env.DISCORD_TOKEN);
+/* ==== AUTOGEN: Paged withdraw v1 ==== */
+function wdPageCountAll() { return Math.ceil(ORDER.length / WD_PAGE_SIZE); }
+function wdSliceAll(page: number) { const s = page * WD_PAGE_SIZE; return ORDER.slice(s, s + WD_PAGE_SIZE); }
+
+
+async function wdOpenModalPaged(i: ButtonInteraction, page: number) {
+  const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
+  if (!alliance) return i.reply({ content: 'No alliance linked here.', ephemeral: true });
+  const member = await prisma.member.findFirst({ where: { allianceId: alliance.id, discordId: i.user.id }, include: { balance: true } });
+  if (!member || !member.balance) return i.reply({ content: 'No safekeeping found. Run /link_nation first.', ephemeral: true });
+
+  const bal: any = member.balance as any;
+  const keys = wdSliceAll(page);
+  const total = wdPageCountAll();
+  const modal = new ModalBuilder().setCustomId(`wd:modal:${page}`).setTitle(`💸 Withdrawal (${page+1}/${total})`);
+
+  for (const k of keys) {
+    const avail = Number(bal[k] || 0);
+    const input = new TextInputBuilder()
+      .setCustomId(k)
+      .setLabel(`${RES_EMOJI[k] ?? ''} ${k} (avail: ${avail.toLocaleString()})`)
+      .setStyle(TextInputStyle.Short)
+      .setRequired(false)
+      .setPlaceholder('0');
+    modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+  }
+  await i.showModal(modal);
+}
+
+async function handleWithdrawModalSubmit(i: any) {
+  try {
+    const m = String(i.customId).match(/^wd:modal:(\d+)$/);
+    if (!m) return;
+    const page = Number(m[1]);
+
+    const sess = wdSessions.get(i.user.id) || { data: {}, createdAt: Date.now() };
+    const keys = wdSliceAll(page);
+    for (const k of keys) {
+      const raw = i.fields.getTextInputValue(k) || '';
+      const n = parseNum(raw);
+      if (Number.isFinite(n) && n > 0) sess.data[k] = n;
+      else delete sess.data[k];
+    }
+    wdSessions.set(i.user.id, sess);
+
+    const total = wdPageCountAll();
+    const summary = Object.entries(sess.data)
+      .filter(([,v]) => Number(v) > 0)
+      .map(([k,v]) => `${RES_EMOJI[k] ?? ''}${k}: ${Number(v).toLocaleString()}`)
+      .join('  •  ') || '— none yet —';
+
+    const btns: ButtonBuilder[] = [];
+    if (page > 0) btns.push(new ButtonBuilder().setCustomId(`wd:open:${page-1}`).setStyle(ButtonStyle.Secondary).setLabel('Prev'));
+    if (page < total - 1) btns.push(new ButtonBuilder().setCustomId(`wd:open:${page+1}`).setStyle(ButtonStyle.Primary).setLabel(`Next (${page+2}/${total})`));
+    btns.push(new ButtonBuilder().setCustomId('wd:done').setStyle(ButtonStyle.Success).setLabel('Done'));
+
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(...btns);
+    await i.reply({ content: `Saved so far:\n${summary}`, components: [row], ephemeral: true });
+  } catch (err) {
+    console.error('[wd modal submit]', err);
+    try { await i.reply({ content: 'Something went wrong.', ephemeral: true }); } catch {}
+  }
+}
+
+/* ==== AUTOGEN END ==== */
