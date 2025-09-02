@@ -1,4 +1,3 @@
-// src/index.ts
 import 'dotenv/config';
 import {
   Client, GatewayIntentBits, Partials, REST, Routes, SlashCommandBuilder,
@@ -13,7 +12,7 @@ import { seal, open } from './lib/crypto.js';
 import { RES_EMOJI, ORDER } from './lib/emojis.js';
 import { fetchBankrecs } from './lib/pnw.js';
 
-const log = pino({ level: process.env.LOG_LEVEL || 'info' });
+const log = pino({ level: 'info' });
 const prisma = new PrismaClient();
 
 const client = new Client({
@@ -84,8 +83,6 @@ const commands = [
         )
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
-
-  // NEW: Admin-friendly guided safekeeping editor
   new SlashCommandBuilder().setName('safekeeping_edit')
     .setDescription('Admin: edit a member’s safekeeping (guided)')
     .addUserOption(o => o.setName('user').setDescription('Member to edit').setRequired(true))
@@ -97,11 +94,9 @@ async function register() {
   const guildId = process.env.TEST_GUILD_ID;
   try {
     if (guildId) {
-      log.info({ appId, guildId, commands: (commands as any[]).map((x: any) => x.name) }, 'REGISTER guild');
       await rest.put(Routes.applicationGuildCommands(appId, guildId), { body: commands });
       log.info('Guild slash commands registered');
     } else {
-      log.info({ appId, commands: (commands as any[]).map((x: any) => x.name) }, 'REGISTER global');
       await rest.put(Routes.applicationCommands(appId), { body: commands });
       log.info('Global slash commands registered');
     }
@@ -123,19 +118,13 @@ function parseNum(s: string): number {
   const n = Number(cleaned);
   return Number.isFinite(n) && n >= 0 ? n : NaN;
 }
-
 // Keep per-user withdraw modal session (paged amounts)
 const wdSessions: Map<string, { data: Record<string, number>, createdAt: number }> = new Map();
-
-// Keep per-admin safekeeping edit session (target + working values)
-const skSessions: Map<string, { targetMemberId: number, data: Record<string, number>, createdAt: number }> = new Map();
 
 // ---------- Interaction Handling ----------
 client.on('interactionCreate', async (i: Interaction) => {
   try {
     if (i.isChatInputCommand()) {
-      log.info({ cmd: i.commandName, user: (i as any).user?.id }, 'CMD_RCVD');
-
       if (i.commandName === 'setup_alliance') return handleSetupAlliance(i);
       if (i.commandName === 'set_review_channel') return handleSetReviewChannel(i);
       if (i.commandName === 'link_nation') return handleLinkNation(i);
@@ -144,27 +133,19 @@ client.on('interactionCreate', async (i: Interaction) => {
       if (i.commandName === 'withdraw_json') return handleWithdrawJson(i);
       if (i.commandName === 'withdraw_list') return handleWithdrawList(i);
       if (i.commandName === 'withdraw_set') return handleWithdrawSet(i);
-      if (i.commandName === 'safekeeping_edit') return handleSafekeepingStart(i);
     } else if (i.isModalSubmit()) {
       if (i.customId.startsWith('wd:modal:')) return handleWithdrawPagedModal(i as any);
-      if (String(i.customId).startsWith('wd:modal:')) return handleWithdrawModalSubmit(i as any); // legacy
+      if (i.customId.startsWith('wd:req:')) return handleWithdrawModal(i);
+      if (String(i.customId).startsWith('wd:modal:')) return handleWithdrawModalSubmit(i as any);
       if (i.customId.startsWith('alliancekeys:')) return handleAllianceModal(i as any);
-
-      if (i.customId.startsWith('sk:modal:')) return handleSafekeepingModalSubmit(i as any);
     } else if (i.isButton()) {
       if (i.customId.startsWith('wd:open:')) return handleWithdrawOpenButtonPaged(i as any);
       if (i.customId === 'wd:done') return handleWithdrawDone(i as any);
-
-      if (i.customId.startsWith('sk:open:')) return handleSafekeepingOpenPaged(i as any);
-      if (i.customId === 'sk:done') return handleSafekeepingDone(i as any);
-
       return handleApprovalButton(i);
     }
   } catch (err) {
     console.error(err);
-    if ('isRepliable' in i && i.isRepliable()) {
-      try { await (i as any).reply({ content: 'Something went wrong.', ephemeral: true }); } catch {}
-    }
+    if ('isRepliable' in i && i.isRepliable()) await (i as any).reply({ content: 'Something went wrong.' });
   }
 });
 
@@ -190,23 +171,23 @@ async function handleAllianceModal(i: any) {
     create: { id: allianceId, guildId: i.guildId ?? undefined },
   });
   await prisma.allianceKey.create({ data: { allianceId, encryptedApiKey: encApi, nonceApi: ivApi, addedBy: i.user.id } });
-  await i.reply({ content: `✅ API key saved for alliance ${allianceId}.`, ephemeral: true });
+  await i.reply({ content: `✅ API key saved for alliance ${allianceId}.` });
 }
 
 async function handleSetReviewChannel(i: ChatInputCommandInteraction) {
   const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
-  if (!alliance) return i.reply({ content: 'This server is not linked yet. Run /setup_alliance first.', ephemeral: true });
+  if (!alliance) return i.reply({ content: 'This server is not linked yet. Run /setup_alliance first.' });
   const channel = i.options.getChannel('channel') ?? i.channel;
-  if (!channel || channel.type !== ChannelType.GuildText) return i.reply({ content: 'Pick a text channel.', ephemeral: true });
+  if (!channel || channel.type !== ChannelType.GuildText) return i.reply({ content: 'Pick a text channel.' });
   await prisma.alliance.update({ where: { id: alliance.id }, data: { reviewChannelId: channel.id } });
-  await i.reply({ content: `✅ Review channel set to #${(channel as any).name}.`, ephemeral: true });
+  await i.reply({ content: `✅ Review channel set to #${(channel as any).name}.` });
 }
 
 async function handleLinkNation(i: ChatInputCommandInteraction) {
   const nationId = i.options.getInteger('nation_id', true);
   const nationName = i.options.getString('nation_name', true);
   const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
-  if (!alliance) return i.reply({ content: 'This server is not linked yet. Run /setup_alliance first.', ephemeral: true });
+  if (!alliance) return i.reply({ content: 'This server is not linked yet. Run /setup_alliance first.' });
   await prisma.member.upsert({
     where: { allianceId_discordId: { allianceId: alliance.id, discordId: i.user.id } },
     update: { nationId, nationName },
@@ -214,14 +195,14 @@ async function handleLinkNation(i: ChatInputCommandInteraction) {
   });
   const member = await prisma.member.findFirstOrThrow({ where: { allianceId: alliance.id, discordId: i.user.id } });
   await prisma.safekeeping.upsert({ where: { memberId: member.id }, update: {}, create: { memberId: member.id } });
-  await i.reply({ content: '🔗 Nation linked for safekeeping.', ephemeral: true });
+  await i.reply({ content: '🔗 Nation linked for safekeeping.' });
 }
 
 async function handleBalance(i: ChatInputCommandInteraction) {
   const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
-  if (!alliance) return i.reply({ content: 'No alliance linked to this server yet.', ephemeral: true });
+  if (!alliance) return i.reply({ content: 'No alliance linked to this server yet.' });
   const member = await prisma.member.findFirst({ where: { allianceId: alliance.id, discordId: i.user.id }, include: { balance: true } });
-  if (!member || !member.balance) return i.reply({ content: 'No safekeeping account found. Run /link_nation first.', ephemeral: true });
+  if (!member || !member.balance) return i.reply({ content: 'No safekeeping account found. Run /link_nation first.' });
 
   const bal: any = member.balance as any;
   const lines = ORDER.map(k => {
@@ -235,18 +216,15 @@ async function handleBalance(i: ChatInputCommandInteraction) {
     .setFooter({ text: `Nation: ${member.nationName} (${member.nationId})` })
     .setColor(Colors.Blurple);
 
-  await i.reply({ embeds: [embed], ephemeral: true });
+  await i.reply({ embeds: [embed] });
 }
 
-// ---- Withdraw flow (paged: modal pages of ORDER by 5) ----
-const WD_PAGE_SIZE = 5;
-function wdPageCountAll() { return Math.ceil(ORDER.length / WD_PAGE_SIZE); }
-function wdSliceAll(page: number) { const s = page * WD_PAGE_SIZE; return ORDER.slice(s, s + WD_PAGE_SIZE); }
-
+// ---- Withdraw flow: start → button → modal → create request ----
 async function handleWithdrawStart(i: ChatInputCommandInteraction) {
+  // reset paged-session
   wdSessions.set(i.user.id, { data: {}, createdAt: Date.now() });
   const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
-  if (!alliance) return i.reply({ content: 'No alliance linked yet. Run /setup_alliance first.', ephemeral: true });
+  if (!alliance) return i.reply({ content: 'No alliance linked yet. Run /setup_alliance first.' });
 
   const embed = new EmbedBuilder()
     .setTitle('💸 Start a Withdrawal')
@@ -257,25 +235,27 @@ async function handleWithdrawStart(i: ChatInputCommandInteraction) {
     new ButtonBuilder().setCustomId('wd:open:0').setLabel('Start').setEmoji('✨').setStyle(ButtonStyle.Primary)
   );
 
-  await i.reply({ embeds: [embed], components: [row], ephemeral: true });
+  await i.reply({ embeds: [embed], components: [row] });
 }
 
-async function wdOpenModalPaged(i: ButtonInteraction, page: number) {
+async function handleWithdrawOpenButton(i: ButtonInteraction) {
   const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
-  if (!alliance) return i.reply({ content: 'No alliance linked here.', ephemeral: true });
+  if (!alliance) return i.reply({ content: 'No alliance linked here.' });
   const member = await prisma.member.findFirst({ where: { allianceId: alliance.id, discordId: i.user.id }, include: { balance: true } });
-  if (!member || !member.balance) return i.reply({ content: 'No safekeeping found. Run /link_nation first.', ephemeral: true });
+  if (!member || !member.balance) return i.reply({ content: 'No safekeeping found. Run /link_nation first.' });
 
   const bal: any = member.balance as any;
-  const keys = wdSliceAll(page);
-  const total = wdPageCountAll();
-  const modal = new ModalBuilder().setCustomId(`wd:modal:${page}`).setTitle(`💸 Withdrawal (${page + 1}/${total})`);
+  const haveKeys = ORDER.filter(k => Number(bal[k] || 0) > 0);
+  if (!haveKeys.length) return i.reply({ content: 'You have nothing in safekeeping to withdraw.' });
+
+  const keys = haveKeys.slice(0, 5); // Discord modal max 5 inputs
+  const modal = new ModalBuilder().setCustomId(`wd:req:${keys.join(',')}`).setTitle('💸 Request Withdrawal');
 
   for (const k of keys) {
     const avail = Number(bal[k] || 0);
     const input = new TextInputBuilder()
       .setCustomId(k)
-      .setLabel(`${RES_EMOJI[k] ?? ''} ${k} (avail: ${avail.toLocaleString()})`)
+      .setLabel(`${RES_EMOJI[k]} ${k} (avail: ${avail.toLocaleString()})`)
       .setStyle(TextInputStyle.Short)
       .setRequired(false)
       .setPlaceholder('0');
@@ -284,95 +264,48 @@ async function wdOpenModalPaged(i: ButtonInteraction, page: number) {
   await i.showModal(modal);
 }
 
-async function handleWithdrawOpenButtonPaged(i: any) {
-  const m = String(i.customId).match(/^wd:open:(\d+)$/);
-  const page = m && m[1] ? Math.max(0, parseInt(m[1], 10)) : 0;
-  return wdOpenModalPaged(i as ButtonInteraction, page);
-}
-
-async function handleWithdrawPagedModal(i: any) {
-  try {
-    const m = String(i.customId).match(/^wd:modal:(\d+)$/);
-    if (!m) return;
-    const page = Number(m[1]);
-
-    const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
-    if (!alliance) return i.reply({ content: 'No alliance linked here.', ephemeral: true });
-    const member = await prisma.member.findFirst({ where: { allianceId: alliance.id, discordId: i.user.id }, include: { balance: true } });
-    if (!member || !member.balance) return i.reply({ content: 'No safekeeping found.', ephemeral: true });
-
-    const bal: any = member.balance as any;
-    const keys = wdSliceAll(page);
-
-    const sess = wdSessions.get(i.user.id) || { data: {}, createdAt: Date.now() };
-    for (const k of keys) {
-      const raw = i.fields.getTextInputValue(k) || '';
-      const num = parseNum(raw);
-      if (Number.isNaN(num) || num < 0) return i.reply({ content: `Invalid number for ${k}.`, ephemeral: true });
-      if (num > Number(bal[k] || 0)) return i.reply({ content: `Requested ${num.toLocaleString()} ${k}, but only ${Number(bal[k] || 0).toLocaleString()} available.`, ephemeral: true });
-      if (num > 0) sess.data[k] = num; else delete sess.data[k];
-    }
-    wdSessions.set(i.user.id, sess);
-
-    const total = wdPageCountAll();
-    const summary = Object.entries(sess.data)
-      .filter(([, v]) => Number(v) > 0)
-      .map(([k, v]) => `${RES_EMOJI[k as any] ?? ''}${k}: ${Number(v).toLocaleString()}`)
-      .join('  •  ') || '— none yet —';
-
-    const btns: ButtonBuilder[] = [];
-    if (page > 0) btns.push(new ButtonBuilder().setCustomId(`wd:open:${page - 1}`).setStyle(ButtonStyle.Secondary).setLabel('Prev'));
-    if (page < total - 1) btns.push(new ButtonBuilder().setCustomId(`wd:open:${page + 1}`).setStyle(ButtonStyle.Primary).setLabel(`Next (${page + 2}/${total})`));
-    btns.push(new ButtonBuilder().setCustomId('wd:done').setStyle(ButtonStyle.Success).setLabel('Done'));
-
-    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(...btns);
-    await i.reply({ content: `Saved so far:\n${summary}`, components: [row], ephemeral: true });
-  } catch (err) {
-    console.error('[wd modal submit]', err);
-    try { await i.reply({ content: 'Something went wrong.', ephemeral: true }); } catch {}
-  }
-}
-
-async function handleWithdrawDone(i: any) {
-  const sess = wdSessions.get(i.user.id);
-  if (!sess || !Object.keys(sess.data).length) {
-    return i.reply({ content: 'Nothing to submit — all zero. Start again with **/withdraw**.', ephemeral: true });
-  }
-
+async function handleWithdrawModal(i: any) {
+  const suffix = i.customId.split(':')[2] || '';
+  const keys = suffix ? suffix.split(',').filter(Boolean) : [];
   const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
-  if (!alliance) return i.reply({ content: 'No alliance linked here.', ephemeral: true });
+  if (!alliance) return i.reply({ content: 'No alliance linked here.' });
   const member = await prisma.member.findFirst({ where: { allianceId: alliance.id, discordId: i.user.id }, include: { balance: true } });
-  if (!member || !member.balance) return i.reply({ content: 'No safekeeping found.', ephemeral: true });
+  if (!member || !member.balance) return i.reply({ content: 'No safekeeping found.' });
 
-  try {
-    await submitWithdraw(i, alliance.id, member, sess.data);
-    wdSessions.delete(i.user.id);
-  } catch (e) {
-    console.error('[wd:done][err]', e);
-    return i.reply({ content: 'Something went wrong submitting your request.', ephemeral: true });
+  const bal: any = member.balance as any;
+  const payload: Record<string, number> = {};
+  for (const k of keys) {
+    const raw = i.fields.getTextInputValue(k) || '';
+    const num = parseNum(raw);
+    if (isNaN(num)) return i.reply({ content: `Invalid number for ${k}.` });
+    if (num > Number(bal[k] || 0)) return i.reply({ content: `Requested ${num.toLocaleString()} ${k}, but only ${Number(bal[k]||0).toLocaleString()} available.` });
+    if (num > 0) payload[k] = num;
   }
+  if (!Object.keys(payload).length) return i.reply({ content: 'Nothing requested.' });
+
+  await submitWithdraw(i, alliance.id, member, payload);
 }
 
 async function handleWithdrawJson(i: ChatInputCommandInteraction) {
   const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
-  if (!alliance) return i.reply({ content: 'No alliance linked to this server yet.', ephemeral: true });
+  if (!alliance) return i.reply({ content: 'No alliance linked to this server yet.' });
   const member = await prisma.member.findFirst({ where: { allianceId: alliance.id, discordId: i.user.id }, include: { balance: true } });
-  if (!member || !member.balance) return i.reply({ content: 'No safekeeping found. Run /link_nation first.', ephemeral: true });
+  if (!member || !member.balance) return i.reply({ content: 'No safekeeping found. Run /link_nation first.' });
 
   let payload: any;
   try { payload = JSON.parse(i.options.getString('payload', true)); }
-  catch { return i.reply({ content: 'Invalid JSON.', ephemeral: true }); }
+  catch { return i.reply({ content: 'Invalid JSON.' }); }
 
   const bal: any = member.balance as any;
   const clean: Record<string, number> = {};
   for (const [k, v] of Object.entries(payload)) {
-    if (!ORDER.includes(k as any)) return i.reply({ content: `Unknown resource: ${k}`, ephemeral: true });
+    if (!ORDER.includes(k as any)) return i.reply({ content: `Unknown resource: ${k}` });
     const num = Number(v);
-    if (!Number.isFinite(num) || num < 0) return i.reply({ content: `Invalid amount for ${k}`, ephemeral: true });
-    if (num > Number(bal[k] || 0)) return i.reply({ content: `Requested ${num} ${k}, but only ${Number(bal[k] || 0)} available.`, ephemeral: true });
+    if (!Number.isFinite(num) || num < 0) return i.reply({ content: `Invalid amount for ${k}` });
+    if (num > Number(bal[k] || 0)) return i.reply({ content: `Requested ${num} ${k}, but only ${Number(bal[k]||0)} available.` });
     if (num > 0) clean[k] = num;
   }
-  if (!Object.keys(clean).length) return i.reply({ content: 'Nothing requested.', ephemeral: true });
+  if (!Object.keys(clean).length) return i.reply({ content: 'Nothing requested.' });
 
   await submitWithdraw(i, alliance.id, member, clean);
 }
@@ -402,7 +335,7 @@ async function submitWithdraw(i: any, allianceId: number, member: any, payload: 
     new ButtonBuilder().setCustomId(`w:deny:${req.id}`).setLabel('Deny').setEmoji('❌').setStyle(ButtonStyle.Danger),
   );
 
-  await i.reply({ content: '✅ Request submitted for review by bankers.', ephemeral: true });
+  await i.reply({ content: '✅ Request submitted for review by bankers.' });
 
   const a = await prisma.alliance.findFirst({ where: { id: allianceId } });
   const targetChannelId = a?.reviewChannelId || i.channelId;
@@ -415,7 +348,7 @@ async function submitWithdraw(i: any, allianceId: number, member: any, payload: 
 // --- list / set ---
 async function handleWithdrawList(i: ChatInputCommandInteraction) {
   const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
-  if (!alliance) return i.reply({ content: 'No alliance linked here.', ephemeral: true });
+  if (!alliance) return i.reply({ content: 'No alliance linked here.' });
 
   const statusStr = i.options.getString('status') as WithdrawStatus | null;
   const status = statusStr ?? 'PENDING';
@@ -426,7 +359,7 @@ async function handleWithdrawList(i: ChatInputCommandInteraction) {
     take: 10,
   });
 
-  if (!rows.length) return i.reply({ content: `No ${status} requests.`, ephemeral: true });
+  if (!rows.length) return i.reply({ content: `No ${status} requests.` });
 
   const embed = new EmbedBuilder()
     .setTitle(`📜 Withdrawal Requests — ${status}`)
@@ -446,12 +379,12 @@ async function handleWithdrawList(i: ChatInputCommandInteraction) {
 
     embed.addFields({ name, value, inline: false });
   }
-  await i.reply({ embeds: [embed], ephemeral: true });
+  await i.reply({ embeds: [embed] });
 }
 
 async function handleWithdrawSet(i: ChatInputCommandInteraction) {
   const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
-  if (!alliance) return i.reply({ content: 'No alliance linked here.', ephemeral: true });
+  if (!alliance) return i.reply({ content: 'No alliance linked here.' });
 
   const id = i.options.getString('id', true);
   const status = i.options.getString('status', true) as WithdrawStatus;
@@ -472,24 +405,24 @@ async function handleWithdrawSet(i: ChatInputCommandInteraction) {
       .setDescription(`Request **${updated.id}** → **${status}** by <@${i.user.id}>`)
       .setColor(color);
 
-    await i.reply({ embeds: [embed], ephemeral: true });
+    await i.reply({ embeds: [embed] });
   } catch {
-    await i.reply({ content: 'Could not update. Check the ID.', ephemeral: true });
+    await i.reply({ content: 'Could not update. Check the ID.' });
   }
 }
 
 // --- Button approvals + DMs + Auto-Pay ---
 async function handleApprovalButton(i: ButtonInteraction) {
-  if (!i.guildId) return i.reply({ content: 'Guild only.', ephemeral: true });
+  if (!i.guildId) return i.reply({ content: 'Guild only.' });
   if (!i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
-    return i.reply({ content: 'You lack permission to approve/deny.', ephemeral: true });
+    return i.reply({ content: 'You lack permission to approve/deny.' });
   }
   const [prefix, action, id] = i.customId.split(':');
   if (prefix !== 'w' || !id) return;
   const status: WithdrawStatus = action === 'approve' ? 'APPROVED' : 'REJECTED';
   const req = await prisma.withdrawalRequest.findUnique({ where: { id } });
-  if (!req) return i.reply({ content: 'Request not found.', ephemeral: true });
-  if (req.status !== 'PENDING') return i.reply({ content: `Already ${req.status}.`, ephemeral: true });
+  if (!req) return i.reply({ content: 'Request not found.' });
+  if (req.status !== 'PENDING') return i.reply({ content: `Already ${req.status}.` });
 
   await prisma.withdrawalRequest.update({ where: { id }, data: { status, reviewerId: i.user.id } });
 
@@ -503,14 +436,14 @@ async function handleApprovalButton(i: ButtonInteraction) {
     .setDescription(`Request **${id}**`)
     .setColor(status === 'APPROVED' ? Colors.Green : Colors.Red);
   await i.update({ embeds: [embed], components: [row] });
-  await i.followUp({ content: `Set to **${status}** by <@${i.user.id}>`, ephemeral: true });
+  await i.followUp({ content: `Set to **${status}** by <@${i.user.id}>` });
 
   // DM requester with details
   try {
     const member = await prisma.member.findUnique({ where: { id: req.memberId } });
     if (member) {
       const user = await client.users.fetch(member.discordId);
-      const reqLine = Object.entries(req.payload as any).map(([k, v]) => fmtLine(k, Number(v))).join(' · ') || '—';
+      const reqLine = Object.entries(req.payload as any).map(([k,v]) => fmtLine(k, Number(v))).join(' · ') || '—';
       const dm = new EmbedBuilder()
         .setTitle(status === 'APPROVED' ? '✅ Withdrawal Approved' : '❌ Withdrawal Rejected')
         .setDescription(`Request **${id}** — reviewed by <@${i.user.id}>`)
@@ -523,6 +456,7 @@ async function handleApprovalButton(i: ButtonInteraction) {
   // --- Optional Auto-Pay on APPROVE ---
   if (status === 'APPROVED' && process.env.AUTOPAY_ENABLED === '1') {
     try {
+      // get alliance + latest api key
       const alliance = await prisma.alliance.findUnique({
         where: { id: req.allianceId },
         include: { keys: { orderBy: { id: 'desc' }, take: 1 } }
@@ -533,7 +467,7 @@ async function handleApprovalButton(i: ButtonInteraction) {
       const botKey = process.env.PNW_BOT_KEY || '';
 
       if (!member || !apiKey || !botKey) {
-        await i.followUp({ content: '⚠️ Auto-pay skipped (missing nation API key or bot key).', ephemeral: true });
+        await i.followUp({ content: '⚠️ Auto-pay skipped (missing nation API key or bot key).' });
         return;
       }
 
@@ -551,7 +485,7 @@ async function handleApprovalButton(i: ButtonInteraction) {
 
         try {
           const user = await client.users.fetch(member.discordId);
-          const paidLine = Object.entries(req.payload as any).map(([k, v]) => fmtLine(k, Number(v))).join(' · ') || '—';
+          const paidLine = Object.entries(req.payload as any).map(([k,v]) => fmtLine(k, Number(v))).join(' · ') || '—';
           const emb = new EmbedBuilder()
             .setTitle('💵 Paid')
             .setDescription(`Your withdrawal **${id}** has been sent in-game.`)
@@ -560,12 +494,12 @@ async function handleApprovalButton(i: ButtonInteraction) {
           await user.send({ embeds: [emb] });
         } catch {}
 
-        await i.followUp({ content: '💸 Auto-pay sent and marked **PAID**.', ephemeral: true });
+        await i.followUp({ content: '💸 Auto-pay sent and marked **PAID**.' });
       } else {
-        await i.followUp({ content: '⚠️ Auto-pay failed. Left as **APPROVED**.', ephemeral: true });
+        await i.followUp({ content: '⚠️ Auto-pay failed. Left as **APPROVED**.' });
       }
-    } catch {
-      await i.followUp({ content: '⚠️ Auto-pay error. Left as **APPROVED**.', ephemeral: true });
+    } catch (e) {
+      await i.followUp({ content: '⚠️ Auto-pay error. Left as **APPROVED**.' });
     }
   }
 }
@@ -576,8 +510,8 @@ async function pnwAutoPay(opts: {
   payload: Record<string, number>; note?: string;
 }): Promise<boolean> {
   const fields = Object.entries(opts.payload)
-    .filter(([, v]) => Number(v) > 0)
-    .map(([k, v]) => `${k}:${Number(v)}`);
+    .filter(([,v]) => Number(v) > 0)
+    .map(([k,v]) => `${k}:${Number(v)}`);
   if (opts.note) fields.push(`note:${JSON.stringify(opts.note)}`);
 
   const q = `mutation{
@@ -601,166 +535,74 @@ async function pnwAutoPay(opts: {
   return res.ok && !(data as any).errors && (data as any)?.data?.bankWithdraw;
 }
 
-// ---------- Admin: /safekeeping_edit (paged, absolute set) ----------
-const SK_PAGE_SIZE = 5;
-function skPageCountAll() { return Math.ceil(ORDER.length / SK_PAGE_SIZE); }
-function skSliceAll(page: number) { const s = page * SK_PAGE_SIZE; return ORDER.slice(s, s + SK_PAGE_SIZE); }
-
+// ---------- Admin: /safekeeping_edit (placeholders first) ----------
 async function handleSafekeepingStart(i: ChatInputCommandInteraction) {
-  // Immediate ack to avoid timeouts
-  await i.deferReply({ ephemeral: true });
-
   const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
-  if (!alliance) return i.editReply({ content: 'No alliance linked yet. Run /setup_alliance first.' });
+  console.log('DBG handleSafekeepingStart');
+  await i.deferReply({ ephemeral: true });
+  console.log('CMD safekeeping_edit -> start', { user: i.user?.id, guild: i.guildId });
+  try { await i.deferReply({ ephemeral: true }); } catch {}
+  console.log('SK_ENTER', i.user?.id);
+  await i.deferReply({ ephemeral: true });
+  if (!alliance) return i.reply({ content: 'No alliance linked yet. Run /setup_alliance first.' });
 
   if (!i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
-    return i.editReply({ content: 'You lack permission to edit safekeeping.' });
+    return i.reply({ content: 'You lack permission to edit safekeeping.' });
   }
 
   const target = i.options.getUser('user', true);
-  const member = await prisma.member.findFirst({ where: { allianceId: alliance.id, discordId: target.id }, include: { balance: true } });
-  if (!member) return i.editReply({ content: 'That user is not linked in this alliance.' });
-
-  // Ensure a safekeeping row exists
-  if (!member.balance) {
-    await prisma.safekeeping.create({ data: { memberId: member.id } });
-  }
+  const member = await prisma.member.findFirst({ where: { allianceId: alliance.id, discordId: target.id } });
+  if (!member) return i.reply({ content: 'That user is not linked in this alliance.' });
 
   // start/clear session for this admin
   skSessions.set(i.user.id, { targetMemberId: member.id, data: {}, createdAt: Date.now() });
 
   const embed = new EmbedBuilder()
     .setTitle('🧰 Safekeeping Editor')
-    .setDescription(`Editing <@${target.id}>'s safekeeping. Use **Start** to open page 1.`)
+    .setDescription('Editing <@' + String(target.id) + ">'s safekeeping. Use **Start** to open page 1.")
     .setColor(Colors.Blurple);
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(`sk:open:${member.id}:0`).setLabel('Start').setEmoji('✨').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('sk:open:' + String(member.id) + ':0').setLabel('Start').setEmoji('✨').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('sk:done').setLabel('Done').setStyle(ButtonStyle.Success).setDisabled(true)
   );
 
-  await i.editReply({ embeds: [embed], components: [row] });
+  await i.reply({ embeds: [embed], components: [row] });
 }
 
+// button: open a page (placeholder for now)
 async function handleSafekeepingOpenPaged(i: any) {
   const parts = i.customId.split(':'); // sk:open:<memberId>:<page>
   const memberId = Number(parts[2] || 0);
   const page = Math.max(0, Number(parts[3] || 0) || 0);
-  const total = skPageCountAll();
 
   const sess = skSessions.get(i.user.id);
   if (!sess || sess.targetMemberId !== memberId) {
-    return i.reply({ content: 'Session expired. Run /safekeeping_edit again.', ephemeral: true });
+    return i.reply({ content: 'Session expired. Run /safekeeping_edit again.' });
   }
 
-  // Show a modal for this page
-  return skOpenModalPaged(i as ButtonInteraction, memberId, page, total);
+  // placeholder UI message; next step we’ll show a real modal
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId('sk:open:' + String(memberId) + ':' + String(Math.max(0, page - 1))).setLabel('◀ Prev').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('sk:open:' + String(memberId) + ':' + String(page)).setLabel('Open Page ' + String(page + 1) + '/' + String(totalPages)).setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('sk:open:' + String(memberId) + ':' + String(Math.min(totalPages - 1, page + 1))).setLabel('Next ▶').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('sk:done').setLabel('Done').setStyle(ButtonStyle.Success)
+  );
+  await i.reply({ content: '(placeholder) Open Page ' + String(page + 1), components: [row] });
 }
 
-async function skOpenModalPaged(i: ButtonInteraction, memberId: number, page: number, total: number) {
-  // Load current balance of the target member (not the button clicker)
-  const member = await prisma.member.findUnique({ where: { id: memberId }, include: { balance: true } });
-  if (!member) return i.reply({ content: 'Member not found.', ephemeral: true });
-  const bal: any = member.balance as any || {};
-
-  const keys = skSliceAll(page);
-  const modal = new ModalBuilder().setCustomId(`sk:modal:${memberId}:${page}`).setTitle(`🧰 Edit (${page + 1}/${total})`);
-
-  for (const k of keys) {
-    const curr = Number(bal[k] || 0);
-    const input = new TextInputBuilder()
-      .setCustomId(k)
-      .setLabel(`${RES_EMOJI[k] ?? ''} ${k} (current: ${curr.toLocaleString()})`)
-      .setStyle(TextInputStyle.Short)
-      .setRequired(false)
-      .setPlaceholder(String(curr));
-    modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
-  }
-  await i.showModal(modal);
+// modal submit (placeholder)
+async function handleSafekeepingModal(i: any) {
+  return i.reply({ content: 'Modal submit received (placeholder).' });
 }
 
-async function handleSafekeepingModalSubmit(i: any) {
-  // customId: sk:modal:<memberId>:<page>
-  const m = String(i.customId).match(/^sk:modal:(\d+):(\d+)$/);
-  if (!m) return;
-  const memberId = Number(m[1]);
-  const page = Number(m[2]);
-  const total = skPageCountAll();
-
-  const sess = skSessions.get(i.user.id);
-  if (!sess || sess.targetMemberId !== memberId) {
-    return i.reply({ content: 'Session expired. Run /safekeeping_edit again.', ephemeral: true });
-  }
-
-  const keys = skSliceAll(page);
-  for (const k of keys) {
-    const raw = (i.fields.getTextInputValue(k) || '').trim();
-    if (raw === '') { delete sess.data[k]; continue; }
-    const num = parseNum(raw);
-    if (!Number.isFinite(num) || num < 0) {
-      return i.reply({ content: `Invalid number for ${k}.`, ephemeral: true });
-    }
-    sess.data[k] = num;
-  }
-  skSessions.set(i.user.id, sess);
-
-  // Build navigation + Done
-  const btns: ButtonBuilder[] = [];
-  if (page > 0) btns.push(new ButtonBuilder().setCustomId(`sk:open:${memberId}:${page - 1}`).setStyle(ButtonStyle.Secondary).setLabel(`◀ Prev (${page}/${total})`));
-  btns.push(new ButtonBuilder().setCustomId(`sk:open:${memberId}:${page}`).setStyle(ButtonStyle.Primary).setLabel(`Open Page ${page + 1}/${total}`));
-  if (page < total - 1) btns.push(new ButtonBuilder().setCustomId(`sk:open:${memberId}:${page + 1}`).setStyle(ButtonStyle.Secondary).setLabel(`Next (${page + 2}/${total}) ▶`));
-  btns.push(new ButtonBuilder().setCustomId('sk:done').setStyle(ButtonStyle.Success).setLabel('Done ✅'));
-
-  const summary = Object.entries(sess.data)
-    .map(([k, v]) => `${k}:${Number(v).toLocaleString()}`)
-    .join(' · ') || '— none yet —';
-
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(...btns);
-  await i.reply({ content: `Saved (absolute values to set):\n${summary}`, components: [row], ephemeral: true });
-}
-
+// done (placeholder)
 async function handleSafekeepingDone(i: any) {
   const sess = skSessions.get(i.user.id);
-  if (!sess) return i.reply({ content: 'Session expired. Run /safekeeping_edit again.', ephemeral: true });
-
-  // Apply absolute sets for provided keys only
-  const target = await prisma.member.findUnique({ where: { id: sess.targetMemberId }, include: { balance: true } });
-  if (!target) return i.reply({ content: 'Target member not found.', ephemeral: true });
-
-  const data: any = {};
-  for (const [k, v] of Object.entries(sess.data)) {
-    if (!ORDER.includes(k as any)) continue;
-    data[k] = { set: Number(v) };
-  }
-  if (!Object.keys(data).length) {
-    skSessions.delete(i.user.id);
-    return i.reply({ content: 'Nothing to update — no values entered.', ephemeral: true });
-  }
-
-  try {
-    await prisma.safekeeping.update({
-      where: { memberId: target.id },
-      data,
-    });
-    skSessions.delete(i.user.id);
-
-    const setLine = Object.entries(sess.data)
-      .map(([k, v]) => `${RES_EMOJI[k as any] ?? ''}${k}: ${Number(v).toLocaleString()}`)
-      .join(' · ');
-
-    const embed = new EmbedBuilder()
-      .setTitle('✅ Safekeeping Updated')
-      .setDescription(`Edited for <@${target.discordId}>`)
-      .addFields({ name: 'Set To', value: setLine || '—' })
-      .setColor(Colors.Green);
-
-    await i.reply({ embeds: [embed], ephemeral: true });
-  } catch (e) {
-    console.error('[sk:done] update error', e);
-    await i.reply({ content: 'Failed to update safekeeping.', ephemeral: true });
-  }
+  if (!sess) return i.reply({ content: 'Session expired. Run /safekeeping_edit again.' });
+  skSessions.delete(i.user.id);
+  return i.reply({ content: '✅ Editor finished (placeholder).' });
 }
-
 // ---------- Cron: bank monitor ----------
 cron.schedule('*/2 * * * *', async () => {
   const toInt = (v: any) => Number.parseInt(String(v), 10) || 0;
@@ -834,9 +676,9 @@ cron.schedule('*/2 * * * *', async () => {
             try {
               const user = await client.users.fetch(member.discordId);
               const lines: string[] = [];
-              for (const k2 of ORDER) {
-                const val = toNum((r as any)[k2]);
-                if (val) lines.push(fmtLine(k2, val));
+              for (const k of ORDER) {
+                const val = toNum((r as any)[k]);
+                if (val) lines.push(fmtLine(k, val));
               }
               const nationUrl = `https://politicsandwar.com/nation/id=${member.nationId}`;
               const embed = new EmbedBuilder()
@@ -864,5 +706,118 @@ cron.schedule('*/2 * * * *', async () => {
   }
 });
 
-client.login(process.env.DISCORD_TOKEN);
+// ---- Paged withdraw: helpers & handlers ----
+const WD_PAGE_SIZE = 5;
+function wdPageCount(keys: string[]) { return Math.ceil(keys.length / WD_PAGE_SIZE); }
+function wdSlice(keys: string[], page: number) { const s = page * WD_PAGE_SIZE; return keys.slice(s, s + WD_PAGE_SIZE); }
 
+async function wdOpenModal(i: any, page: number) {
+  const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
+  if (!alliance) return i.reply({ content: 'No alliance linked here.' });
+  const member = await prisma.member.findFirst({ where: { allianceId: alliance.id, discordId: i.user.id }, include: { balance: true } });
+  if (!member || !member.balance) return i.reply({ content: 'No safekeeping found. Run /link_nation first.' });
+
+  const bal: any = member.balance as any;
+  const haveKeys = ORDER.filter((k) => Number(bal[k] || 0) > 0);
+  if (!haveKeys.length) return i.reply({ content: 'You have nothing in safekeeping to withdraw.' });
+
+  const total = wdPageCount(haveKeys);
+  const idx = Math.max(0, Math.min(page, Math.max(0, total - 1)));
+  const pageKeys = wdSlice(haveKeys, idx);
+
+  // Pre-fill from session if present
+  const sess = wdSessions.get(i.user.id);
+
+  const modal = new ModalBuilder().setCustomId(`wd:modal:${idx}`).setTitle(`💸 Withdraw (${idx + 1}/${total})`);
+  for (const k of pageKeys) {
+    const avail = Number(bal[k] || 0);
+    const input = new TextInputBuilder()
+      .setCustomId(k)
+      .setLabel(`${RES_EMOJI[k]} ${k} (avail: ${avail.toLocaleString()})`)
+      .setStyle(TextInputStyle.Short)
+      .setRequired(false)
+      .setPlaceholder('0');
+    const prev = sess?.data?.[k];
+    if (typeof prev === 'number' && prev > 0) (input as any).setValue(String(prev));
+    modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+  }
+  await i.showModal(modal);
+}
+
+async function handleWithdrawOpenButtonPaged(i: any) {
+  const m = String(i.customId).match(/^wd:open(?::(\d+))?$/);
+  const page = m && m[1] ? Math.max(0, parseInt(m[1], 10)) : 0;
+  return wdOpenModal(i, page);
+}
+
+async function handleWithdrawPagedModal(i: any) {
+  const m = String(i.customId).match(/^wd:modal:(\d+)$/);
+  const page = m ? Math.max(0, parseInt(m[1], 10)) : 0;
+
+  const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
+  if (!alliance) return i.reply({ content: 'No alliance linked here.' });
+  const member = await prisma.member.findFirst({ where: { allianceId: alliance.id, discordId: i.user.id }, include: { balance: true } });
+  if (!member || !member.balance) return i.reply({ content: 'No safekeeping found.' });
+
+  const bal: any = member.balance as any;
+  const haveKeys = ORDER.filter(k => Number(bal[k] || 0) > 0);
+  const total = wdPageCount(haveKeys);
+  const idx = Math.max(0, Math.min(page, Math.max(0, total - 1)));
+  const pageKeys = wdSlice(haveKeys, idx);
+
+  // Update session with validated values
+  const sess = wdSessions.get(i.user.id) || { data: {}, createdAt: Date.now() };
+  for (const k of pageKeys) {
+    const raw = i.fields.getTextInputValue(k) || '';
+    const num = parseNum(raw);
+    if (Number.isNaN(num) || num < 0) {
+      return i.reply({ content: `Invalid number for ${k}.` });
+    }
+    if (num > Number(bal[k] || 0)) {
+      return i.reply({ content: `Requested ${num.toLocaleString()} ${k}, but only ${Number(bal[k] || 0).toLocaleString()} available.` });
+    }
+    if (num > 0) sess.data[k] = num; else delete sess.data[k];
+  }
+  wdSessions.set(i.user.id, sess);
+
+  // Prev / Next / Done buttons
+  const btns: ButtonBuilder[] = [];
+  if (idx > 0) btns.push(new ButtonBuilder().setCustomId(`wd:open:${idx - 1}`).setStyle(ButtonStyle.Secondary).setLabel(`◀ Prev (${idx}/${total})`));
+  if (idx < total - 1) btns.push(new ButtonBuilder().setCustomId(`wd:open:${idx + 1}`).setStyle(ButtonStyle.Primary).setLabel(`Next (${idx + 2}/${total}) ▶`));
+  btns.push(new ButtonBuilder().setCustomId('wd:done').setStyle(ButtonStyle.Success).setLabel('Done ✅'));
+
+  const rows = [new ActionRowBuilder<ButtonBuilder>().addComponents(...btns)];
+  const picked = Object.entries(sess.data).map(([k,v]) => `${k}:${Number(v).toLocaleString()}`).join(', ');
+  const msg = picked ? `Saved: ${picked}` : 'No amounts entered yet.';
+
+  await i.reply({ content: msg, components: rows });
+}
+
+async function handleWithdrawDone(i: any) {
+  const sess = wdSessions.get(i.user.id);
+  if (!sess || !Object.keys(sess.data).length) {
+    return i.reply({ content: 'Nothing to submit — all zero. Start again with **/withdraw**.' });
+  }
+
+  const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
+  if (!alliance) return i.reply({ content: 'No alliance linked here.' });
+  const member = await prisma.member.findFirst({ where: { allianceId: alliance.id, discordId: i.user.id }, include: { balance: true } });
+  if (!member || !member.balance) return i.reply({ content: 'No safekeeping found.' });
+
+  try {
+    await submitWithdraw(i, alliance.id, member, sess.data);
+    wdSessions.delete(i.user.id);
+  } catch (e) {
+    console.error('[wd:done][err]', e);
+    return i.reply({ content: 'Something went wrong submitting your request.' });
+  }
+}
+client.login(process.env.DISCORD_TOKEN);
+// Keep per-admin safekeeping edit session (target + working values)
+const skSessions: Map<string, { targetMemberId: number, data: Record<string, number>, createdAt: number }> = new Map();
+
+// ---- Admin: safekeeping_edit (start) ----
+  new SlashCommandBuilder().setName('safekeeping_edit')
+    .setDescription('Admin: edit a member’s safekeeping (guided)')
+    .addUserOption(o => o.setName('user').setDescription('Member to edit').setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
