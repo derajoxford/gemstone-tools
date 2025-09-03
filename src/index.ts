@@ -97,6 +97,8 @@ const baseCommands = [
     .setDescription('Admin: edit a member’s safekeeping (guided)')
     .addUserOption(o => o.setName('user').setDescription('Member to edit').setRequired(true))
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+    treasury.data,
+    treasury_add.data,
 ].map(c => c.toJSON());
 
 // NEW: pull in external modules' .data
