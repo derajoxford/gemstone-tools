@@ -1,8 +1,5 @@
 // src/commands/treasury_add.ts
-import {
-  SlashCommandBuilder,
-  type ChatInputCommandInteraction,
-} from 'discord.js';
+import { SlashCommandBuilder, type ChatInputCommandInteraction } from 'discord.js';
 import { prisma } from '../db';
 import { addToTreasury, RESOURCES } from '../utils/treasury';
 
@@ -49,7 +46,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       return interaction.reply({ content: 'Amount must be a positive number.', ephemeral: true });
     }
 
-    // Resolve alliance
+    // Resolve alliance by id/name or by this guild's configured alliance
     let alliance: { id: number; name: string | null } | null = null;
     if (allianceArg) {
       const asNum = Number(allianceArg);
@@ -80,16 +77,12 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
     const label = alliance.name ?? `#${alliance.id}`;
     return interaction.reply({
-      content: `Added **${amount.toLocaleString()}** **${resource}** to **${label}**.${note ? `\n_note:_ ${note}` : ''}`,
+      content: `Added **${amount.toLocaleString()}** **${resource}** to **${label}**.` + (note ? `\n_note:_ ${note}` : ''),
       ephemeral: true,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    try {
-      await interaction.reply({ content: 'Error: ' + msg, ephemeral: true });
-    } catch {
-      // already replied
-    }
+    try { await interaction.reply({ content: 'Error: ' + msg, ephemeral: true }); } catch {}
   }
 }
 
