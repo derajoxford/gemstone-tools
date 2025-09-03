@@ -47,7 +47,7 @@ export async function execute(i: ChatInputCommandInteraction) {
       return i.reply({ content: 'Amount must be > 0.', ephemeral: true });
     }
 
-    // Figure out which alliance
+    // Resolve alliance
     let alliance: { id: number; name: string | null } | null = null;
     if (allianceArg) {
       const asNum = Number(allianceArg);
@@ -69,16 +69,16 @@ export async function execute(i: ChatInputCommandInteraction) {
       }
     }
 
-    // Ensure treasury row exists, then update balances JSON
+    // Ensure treasury row exists
     const row = await prisma.allianceTreasury.upsert({
       where: { allianceId: alliance.id },
       update: {},
       create: { allianceId: alliance.id, balances: {} },
     });
 
+    // Update balances JSON
     const balances = (row.balances as Record<string, number>) || {};
-    const prev = Number(balances[resource] || 0);
-    balances[resource] = prev + amount;
+    balances[resource] = (Number(balances[resource]) || 0) + amount;
 
     await prisma.allianceTreasury.update({
       where: { allianceId: alliance.id },
