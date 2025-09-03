@@ -7,18 +7,16 @@ import {
   ChannelType, ButtonInteraction, Interaction
 } from 'discord.js';
 import pino from 'pino';
+// @ts-ignore - types may not be installed; not needed for runtime
 import cron from 'node-cron';
 import { PrismaClient, WithdrawStatus } from '@prisma/client';
 import { seal, open } from './lib/crypto.js';
 import { RES_EMOJI, ORDER } from './lib/emojis.js';
 import { fetchBankrecs } from './lib/pnw.js';
 
-// NEW: import the external command modules (keep these)
+// Import external command modules (one time only)
 import * as treasury from './commands/treasury';
 import * as treasury_add from './commands/treasury_add';
-import * as treasury from './commands/treasury';
-import * as treasury_add from './commands/treasury_add';
-
 
 const log = pino({ level: process.env.LOG_LEVEL || 'info' });
 const prisma = new PrismaClient();
@@ -97,19 +95,20 @@ const baseCommands = [
     .setDescription('Admin: edit a member’s safekeeping (guided)')
     .addUserOption(o => o.setName('user').setDescription('Member to edit').setRequired(true))
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
-    treasury.data,
-    treasury_add.data,
-].map(c => c.toJSON());
+];
 
-// NEW: pull in external modules' .data
-const extraCommands = [treasury, treasury_add]
+// Convert to JSON for registration
+const baseCommandsJSON = baseCommands.map(c => c.toJSON());
+
+// Pull in external modules' .data as JSON
+const extraCommandsJSON = [treasury, treasury_add]
   .filter((m: any) => m?.data?.toJSON)
   .map((m: any) => m.data.toJSON());
 
-// NEW: combine + de-duplicate by name (fixes Discord 50035)
+// Combine + de-duplicate by name (prevents Discord 50035 duplicate-name error)
 const commands = (() => {
   const seen = new Set<string>();
-  return [...baseCommands, ...extraCommands].filter((c: any) => {
+  return [...baseCommandsJSON, ...extraCommandsJSON].filter((c: any) => {
     if (seen.has(c.name)) return false;
     seen.add(c.name);
     return true;
@@ -169,20 +168,17 @@ client.on('interactionCreate', async (i: Interaction) => {
       if (i.commandName === 'withdraw_list') return handleWithdrawList(i);
       if (i.commandName === 'withdraw_set') return handleWithdrawSet(i);
       if (i.commandName === 'safekeeping_edit') return handleSafekeepingStart(i);
-      if (i.commandName === 'treasury') return treasury.execute(i as any);
-      if (i.commandName === 'treasury_add') return treasury_add.execute(i as any);
 
-
-      // NEW: wire the two new commands
+      // Wire new commands exactly once
       if (i.commandName === 'treasury') return (treasury as any).execute(i);
       if (i.commandName === 'treasury_add') return (treasury_add as any).execute(i);
 
     } else if (i.isModalSubmit()) {
       if (i.customId.startsWith('wd:modal:')) return handleWithdrawPagedModal(i as any);
-      if (String(i.customId).startsWith('wd:modal:')) return handleWithdrawModalSubmit(i as any); // legacy
+      // Removed legacy handleWithdrawModalSubmit (not defined)
       if (i.customId.startsWith('alliancekeys:')) return handleAllianceModal(i as any);
-
       if (i.customId.startsWith('sk:modal:')) return handleSafekeepingModalSubmit(i as any);
+
     } else if (i.isButton()) {
       if (i.customId.startsWith('wd:open:')) return handleWithdrawOpenButtonPaged(i as any);
       if (i.customId === 'wd:done') return handleWithdrawDone(i as any);
@@ -440,7 +436,7 @@ async function submitWithdraw(i: any, allianceId: number, member: any, payload: 
   const targetChannelId = a?.reviewChannelId || i.channelId;
   try {
     const ch = await client.channels.fetch(targetChannelId);
-    if (ch && ch.isTextBased()) await ch.send({ embeds: [embed], components: [row] });
+    if (ch?.isTextBased()) await (ch as any).send({ embeds: [embed], components: [row] });
   } catch {}
 }
 
