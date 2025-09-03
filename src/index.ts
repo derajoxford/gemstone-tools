@@ -12,9 +12,10 @@ import { PrismaClient, WithdrawStatus } from '@prisma/client';
 import { seal, open } from './lib/crypto.js';
 import { RES_EMOJI, ORDER } from './lib/emojis.js';
 import { fetchBankrecs } from './lib/pnw.js';
+
+// NEW: import the external command modules (keep these)
 import * as treasury from './commands/treasury';
 import * as treasury_add from './commands/treasury_add';
-
 
 const log = pino({ level: process.env.LOG_LEVEL || 'info' });
 const prisma = new PrismaClient();
@@ -25,8 +26,8 @@ const client = new Client({
 });
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN!);
 
-// ----- Slash Commands -----
-const commands = [
+// ----- Slash Commands (base) -----
+const baseCommands = [
   new SlashCommandBuilder().setName('setup_alliance')
     .setDescription('Link this Discord to a PnW Alliance banking setup')
     .addIntegerOption(o => o.setName('alliance_id').setDescription('PnW Alliance ID').setRequired(true))
@@ -88,12 +89,27 @@ const commands = [
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
-  // NEW: Admin-friendly guided safekeeping editor
+  // Admin-friendly guided safekeeping editor
   new SlashCommandBuilder().setName('safekeeping_edit')
     .setDescription('Admin: edit a member’s safekeeping (guided)')
     .addUserOption(o => o.setName('user').setDescription('Member to edit').setRequired(true))
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 ].map(c => c.toJSON());
+
+// NEW: pull in external modules' .data
+const extraCommands = [treasury, treasury_add]
+  .filter((m: any) => m?.data?.toJSON)
+  .map((m: any) => m.data.toJSON());
+
+// NEW: combine + de-duplicate by name (fixes Discord 50035)
+const commands = (() => {
+  const seen = new Set<string>();
+  return [...baseCommands, ...extraCommands].filter((c: any) => {
+    if (seen.has(c.name)) return false;
+    seen.add(c.name);
+    return true;
+  });
+})();
 
 async function register() {
   const appId = process.env.DISCORD_CLIENT_ID!;
@@ -148,6 +164,11 @@ client.on('interactionCreate', async (i: Interaction) => {
       if (i.commandName === 'withdraw_list') return handleWithdrawList(i);
       if (i.commandName === 'withdraw_set') return handleWithdrawSet(i);
       if (i.commandName === 'safekeeping_edit') return handleSafekeepingStart(i);
+
+      // NEW: wire the two new commands
+      if (i.commandName === 'treasury') return (treasury as any).execute(i);
+      if (i.commandName === 'treasury_add') return (treasury_add as any).execute(i);
+
     } else if (i.isModalSubmit()) {
       if (i.customId.startsWith('wd:modal:')) return handleWithdrawPagedModal(i as any);
       if (String(i.customId).startsWith('wd:modal:')) return handleWithdrawModalSubmit(i as any); // legacy
@@ -868,4 +889,3 @@ cron.schedule('*/2 * * * *', async () => {
 });
 
 client.login(process.env.DISCORD_TOKEN);
-
