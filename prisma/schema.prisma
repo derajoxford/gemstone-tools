@@ -112,3 +112,11 @@ model WithdrawalRequest {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 }
+model AllianceTreasury {
+  allianceId Int      @id
+  balances   Json     @default("{}")
+  updatedAt  DateTime @updatedAt
+
+  alliance   Alliance @relation(fields: [allianceId], references: [id])
+}
+
