@@ -7,6 +7,8 @@ const RESOURCES = [
   'gasoline','munitions','steel','aluminum','food'
 ] as const;
 
+type Resource = typeof RESOURCES[number];
+
 const resourceChoices = RESOURCES.map(r => ({ name: r, value: r }));
 
 export const data = new SlashCommandBuilder()
@@ -34,21 +36,19 @@ export const data = new SlashCommandBuilder()
       .setRequired(false)
   );
 
-export async function execute(interaction: ChatInputCommandInteraction) {
+export async function execute(i: ChatInputCommandInteraction) {
   try {
-    const resource = interaction.options.getString('resource', true);
-    const amount = interaction.options.getNumber('amount', true);
-    const allianceArg = interaction.options.getString('alliance') || undefined;
+    const resource = i.options.getString('resource', true) as Resource;
+    const amount = i.options.getNumber('amount', true) || 0;
+    const allianceArg = i.options.getString('alliance') || undefined;
+    const note = i.options.getString('note') || undefined;
 
-    if (!RESOURCES.includes(resource as any)) {
-      return interaction.reply({ content: 'Unknown resource.', ephemeral: true });
-    }
-    if (!(Number.isFinite(amount) && amount > 0)) {
-      return interaction.reply({ content: 'Amount must be a positive number.', ephemeral: true });
+    if (amount <= 0) {
+      return i.reply({ content: 'Amount must be > 0.', ephemeral: true });
     }
 
-    // Resolve alliance (by server, id, or name)
-    let alliance = null as null | { id: number; name: string | null };
+    // Figure out which alliance
+    let alliance: { id: number; name: string | null } | null = null;
     if (allianceArg) {
       const asNum = Number(allianceArg);
       if (Number.isInteger(asNum)) {
@@ -59,27 +59,41 @@ export async function execute(interaction: ChatInputCommandInteraction) {
           where: { name: { contains: allianceArg, mode: 'insensitive' } },
         });
       }
-    } else if (interaction.guildId) {
-      alliance = await prisma.alliance.findFirst({ where: { guildId: interaction.guildId } });
+      if (!alliance) {
+        return i.reply({ content: `Alliance not found: ${allianceArg}`, ephemeral: true });
+      }
+    } else {
+      alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
+      if (!alliance) {
+        return i.reply({ content: 'This server is not linked to an alliance. Run /setup_alliance first.', ephemeral: true });
+      }
     }
 
-    if (!alliance) {
-      return interaction.reply({ content: 'Alliance not found. Use /setup_alliance or pass an alliance.', ephemeral: true });
-    }
-
-    // Ensure treasury row, then increment chosen resource
-    await prisma.allianceTreasury.upsert({
+    // Ensure treasury row exists, then update balances JSON
+    const row = await prisma.allianceTreasury.upsert({
       where: { allianceId: alliance.id },
-      update: { [resource]: { increment: amount } as any },
-      create: { allianceId: alliance.id, balances: {}, [resource]: amount } as any,
+      update: {},
+      create: { allianceId: alliance.id, balances: {} },
     });
 
-    return interaction.reply({
-      content: `Added **${amount.toLocaleString()}** **${resource}** to **${alliance.name ?? `#${alliance.id}`}**.`,
+    const balances = (row.balances as Record<string, number>) || {};
+    const prev = Number(balances[resource] || 0);
+    balances[resource] = prev + amount;
+
+    await prisma.allianceTreasury.update({
+      where: { allianceId: alliance.id },
+      data: { balances },
+    });
+
+    const label = alliance.name ? alliance.name : `#${alliance.id}`;
+    const noteLine = note ? ` Note: ${note}` : '';
+    return i.reply({
+      content: `Added **${amount.toLocaleString()}** **${resource}** to **${label}**.${noteLine}`,
       ephemeral: true,
     });
-  } catch (err) {
-    return interaction.reply({ content: `Error: ${String(err)}`, ephemeral: true });
+  } catch (err: any) {
+    const msg = err?.message || String(err);
+    return i.reply({ content: 'Error: ' + msg, ephemeral: true });
   }
 }
 
