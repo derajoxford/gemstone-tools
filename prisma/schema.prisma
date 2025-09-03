@@ -16,67 +16,70 @@ enum WithdrawStatus {
 }
 
 model Alliance {
-  id              Int        @id                 // PnW alliance id
+  id              Int      @id // PnW alliance id
   guildId         String?
   name            String?
-  reviewChannelId String?    // NEW: channel to post approval buttons
-  createdAt       DateTime   @default(now())
-  updatedAt       DateTime   @updatedAt
+  reviewChannelId String? // NEW: channel to post approval buttons
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
   lastBankrecId   Int?
 
-  keys            AllianceKey[]
-  members         Member[]
-  bankrecs        Bankrec[]
+  keys          AllianceKey[]     @relation(name: "AllianceKeysOnAlliance")
+  members       Member[]
+  treasury      AllianceTreasury? @relation(name: "AllianceTreasuryOnAlliance")
+  ledgerEntries LedgerEntry[]     @relation(name: "LedgerAlliance")
+  bankrecs      Bankrec[]
 }
 
 model AllianceKey {
-  id               Int      @id @default(autoincrement())
-  allianceId       Int
-  encryptedApiKey  Bytes
-  encryptedBotKey  Bytes?
-  nonceApi         Bytes
-  nonceBot         Bytes?
-  addedBy          String   // discord user id
-  createdAt        DateTime @default(now())
-  alliance         Alliance @relation(fields: [allianceId], references: [id])
+  id              Int      @id @default(autoincrement())
+  allianceId      Int
+  encryptedApiKey Bytes
+  encryptedBotKey Bytes?
+  nonceApi        Bytes
+  nonceBot        Bytes?
+  addedBy         String // discord user id
+  createdAt       DateTime @default(now())
+  alliance        Alliance @relation(name: "AllianceKeysOnAlliance", fields: [allianceId], references: [id])
 }
 
 model Member {
-  id          Int      @id @default(autoincrement())
-  allianceId  Int
-  discordId   String   // discord user id
-  nationId    Int
-  nationName  String
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id         Int      @id @default(autoincrement())
+  allianceId Int
+  discordId  String // discord user id
+  nationId   Int
+  nationName String
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
 
-  balance     Safekeeping?
-  alliance    Alliance @relation(fields: [allianceId], references: [id])
+  balance       Safekeeping?
+  ledgerEntries LedgerEntry[] @relation(name: "LedgerMember")
+  alliance      Alliance      @relation(fields: [allianceId], references: [id])
 
   @@unique([allianceId, discordId])
 }
 
 model Safekeeping {
-  id         Int     @id @default(autoincrement())
-  memberId   Int     @unique
-  money      Decimal @default(0)
-  food       Decimal @default(0)
-  coal       Decimal @default(0)
-  oil        Decimal @default(0)
-  uranium    Decimal @default(0)
-  lead       Decimal @default(0)
-  iron       Decimal @default(0)
-  bauxite    Decimal @default(0)
-  gasoline   Decimal @default(0)
-  munitions  Decimal @default(0)
-  steel      Decimal @default(0)
-  aluminum   Decimal @default(0)
-  updatedAt  DateTime @updatedAt
-  member     Member  @relation(fields: [memberId], references: [id])
+  id        Int      @id @default(autoincrement())
+  memberId  Int      @unique
+  money     Decimal  @default(0)
+  food      Decimal  @default(0)
+  coal      Decimal  @default(0)
+  oil       Decimal  @default(0)
+  uranium   Decimal  @default(0)
+  lead      Decimal  @default(0)
+  iron      Decimal  @default(0)
+  bauxite   Decimal  @default(0)
+  gasoline  Decimal  @default(0)
+  munitions Decimal  @default(0)
+  steel     Decimal  @default(0)
+  aluminum  Decimal  @default(0)
+  updatedAt DateTime @updatedAt
+  member    Member   @relation(fields: [memberId], references: [id])
 }
 
 model Bankrec {
-  id           Int      @id            // bankrec id from PnW
+  id           Int      @id // bankrec id from PnW
   allianceId   Int
   date         DateTime
   note         String?
@@ -84,31 +87,98 @@ model Bankrec {
   senderId     Int
   receiverType Int
   receiverId   Int
-  money        Decimal @default(0)
-  food         Decimal @default(0)
-  coal         Decimal @default(0)
-  oil          Decimal @default(0)
-  uranium      Decimal @default(0)
-  lead         Decimal @default(0)
-  iron         Decimal @default(0)
-  bauxite      Decimal @default(0)
-  gasoline     Decimal @default(0)
-  munitions    Decimal @default(0)
-  steel        Decimal @default(0)
-  aluminum     Decimal @default(0)
+  money        Decimal  @default(0)
+  food         Decimal  @default(0)
+  coal         Decimal  @default(0)
+  oil          Decimal  @default(0)
+  uranium      Decimal  @default(0)
+  lead         Decimal  @default(0)
+  iron         Decimal  @default(0)
+  bauxite      Decimal  @default(0)
+  gasoline     Decimal  @default(0)
+  munitions    Decimal  @default(0)
+  steel        Decimal  @default(0)
+  aluminum     Decimal  @default(0)
 
-  alliance     Alliance @relation(fields: [allianceId], references: [id])
+  alliance Alliance @relation(fields: [allianceId], references: [id])
 }
 
 model WithdrawalRequest {
-  id          String   @id @default(uuid())
+  id          String         @id @default(uuid())
   allianceId  Int
   memberId    Int
   status      WithdrawStatus @default(PENDING)
   payload     Json
-  createdBy   String   // discord user id
-  reviewerId  String?  // discord user id
-  bankrecPaid Int?     // bankrec id once paid
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  createdBy   String // discord user id
+  reviewerId  String? // discord user id
+  bankrecPaid Int? // bankrec id once paid
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+}
+
+model Setting {
+  id        String   @id @default(cuid())
+  guildId   String
+  key       String
+  value     String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([guildId, key], name: "guildId_key")
+}
+
+/// --- Gemstone Tools: Alliance Treasury & Ledger ---
+enum AccountScope {
+  ALLIANCE
+  SAFEKEEPING
+}
+
+enum EntryKind {
+  DEPOSIT
+  WITHDRAW
+  TRANSFER
+  ADJUST
+}
+
+model AllianceTreasury {
+  id         String   @id @default(cuid())
+  allianceId Int      @unique
+  alliance   Alliance @relation(name: "AllianceTreasuryOnAlliance", fields: [allianceId], references: [id])
+
+  /// JSON object like: {"money": 123456, "steel": 50}
+  balances Json @default("{}")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([allianceId])
+}
+
+model LedgerEntry {
+  id String @id @default(cuid())
+
+  allianceId Int
+  alliance   Alliance @relation(name: "LedgerAlliance", fields: [allianceId], references: [id])
+
+  /// Optional member context for safekeeping entries
+  memberId Int?
+  member   Member? @relation(name: "LedgerMember", fields: [memberId], references: [id])
+
+  scope AccountScope
+  kind  EntryKind
+
+  /// JSON amounts; ex: {"money": 5000} (positive/negative deltas allowed)
+  amounts Json
+  note    String?
+
+  /// Who performed the action in Discord (if applicable)
+  actorDiscordId String?
+
+  /// Source bankrec id (if from PnW polling)
+  bankrecId Int?
+
+  createdAt DateTime @default(now())
+
+  @@index([allianceId, createdAt])
+  @@index([scope, createdAt])
 }

@@ -1,5 +1,12 @@
-node_modules
-.env
-dist
-.DS_Store
+node_modules/
+dist/
+build/
+*.tsbuildinfo
 *.log
+logs/
+.env
+.env.*.local
+prisma/*.db*
+.DS_Store
+.idea/
+.vscode/

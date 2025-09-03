@@ -1,3 +1,10 @@
+import treasury_add from "./commands/treasury_add.js";
+// De-dupe commands by name before sending to Discord
+function uniqueByName(arr:any[]){const m=new Map(arr.map((c:any)=>[c.name,c])); return [...m.values()];}
+
+import treasury from "./commands/treasury.js";
+import { logBankEvent } from "./utils/bankLog.js";
+import { handleWithdrawModalSubmit } from "./legacyStubs.js";
 // src/index.ts
 import 'dotenv/config';
 import {
@@ -8,11 +15,14 @@ import {
 } from 'discord.js';
 import pino from 'pino';
 import cron from 'node-cron';
-import { PrismaClient, WithdrawStatus } from '@prisma/client';
+import { PrismaClient, WithdrawStatus, Prisma } from '@prisma/client';
 import { seal, open } from './lib/crypto.js';
 import { RES_EMOJI, ORDER } from './lib/emojis.js';
 import { fetchBankrecs } from './lib/pnw.js';
+import { addToTreasury } from "./utils/treasury.js";
 
+import * as set_log_channel from "./commands/set_log_channel.js";
+import * as banklog_test from "./commands/banklog_test.js";
 const log = pino({ level: process.env.LOG_LEVEL || 'info' });
 const prisma = new PrismaClient();
 
@@ -23,7 +33,7 @@ const client = new Client({
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN!);
 
 // ----- Slash Commands -----
-const commands = [
+ const commands = [
   new SlashCommandBuilder().setName('setup_alliance')
     .setDescription('Link this Discord to a PnW Alliance banking setup')
     .addIntegerOption(o => o.setName('alliance_id').setDescription('PnW Alliance ID').setRequired(true))
@@ -90,7 +100,9 @@ const commands = [
     .setDescription('Admin: edit a member’s safekeeping (guided)')
     .addUserOption(o => o.setName('user').setDescription('Member to edit').setRequired(true))
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
-].map(c => c.toJSON());
+  set_log_channel.data,
+  banklog_test.data,
+, treasury, treasury_add, treasury, treasury_add].filter(Boolean).filter((c,i,a)=>a.findIndex(x=>(((x as any).data?.name ?? (x as any).name)===((c as any).data?.name ?? (c as any).name)))===i).map(c => ((c as any).data?.toJSON?.() ?? (c as any).toJSON()));
 
 async function register() {
   const appId = process.env.DISCORD_CLIENT_ID!;
@@ -102,7 +114,7 @@ async function register() {
       log.info('Guild slash commands registered');
     } else {
       log.info({ appId, commands: (commands as any[]).map((x: any) => x.name) }, 'REGISTER global');
-      await rest.put(Routes.applicationCommands(appId), { body: commands });
+      await rest.put(Routes.applicationCommands(appId), { body: uniqueByName(uniqueByName(commands ) ) });
       log.info('Global slash commands registered');
     }
   } catch (e) { log.error(e); }
@@ -145,6 +157,8 @@ client.on('interactionCreate', async (i: Interaction) => {
       if (i.commandName === 'withdraw_list') return handleWithdrawList(i);
       if (i.commandName === 'withdraw_set') return handleWithdrawSet(i);
       if (i.commandName === 'safekeeping_edit') return handleSafekeepingStart(i);
+      if (i.commandName === 'set_log_channel') return (set_log_channel as any).execute(i as any);
+      if (i.commandName === 'banklog_test') return (banklog_test as any).execute(i as any);
     } else if (i.isModalSubmit()) {
       if (i.customId.startsWith('wd:modal:')) return handleWithdrawPagedModal(i as any);
       if (String(i.customId).startsWith('wd:modal:')) return handleWithdrawModalSubmit(i as any); // legacy
@@ -408,7 +422,7 @@ async function submitWithdraw(i: any, allianceId: number, member: any, payload: 
   const targetChannelId = a?.reviewChannelId || i.channelId;
   try {
     const ch = await client.channels.fetch(targetChannelId);
-    if (ch && ch.isTextBased()) await ch.send({ embeds: [embed], components: [row] });
+    if (ch && ch.isTextBased()) await (ch as any).send({ embeds: [embed], components: [row] });
   } catch {}
 }
 
@@ -809,6 +823,30 @@ cron.schedule('*/2 * * * *', async () => {
 
         const isDeposit = toInt(r.sender_type) === 1 && toInt(r.receiver_type) === 2 && toInt(r.receiver_id) === a.id;
         if (isDeposit) {
+  // Update alliance treasury & ledger
+  try {
+    const RES = ["money","coal","oil","uranium","iron","bauxite","lead","gasoline","munitions","steel","aluminum","food"] as const;
+    const delta: Record<string, number> = {};
+    for (const k of RES) {
+      const v = Number((r as any)[k]);
+      if (Number.isFinite(v) && v > 0) delta[k] = (delta[k]||0) + v;
+    }
+    if (Object.keys(delta).length) {
+      await addToTreasury(prisma, a.id, delta);}
+  } catch (err) { log.warn({ err: String(err) }, "treasury update failed"); }
+// Emit alliance DEPOSIT to bank-log (skips if note contains #ignore)
+  try {
+    if (a.guildId) {
+      const guild = await client.guilds.fetch(a.guildId);
+      const amt = BigInt(Math.max(0, Math.trunc(Number((r as any).money ?? 0))));
+      await logBankEvent(guild, {
+        account: "ALLIANCE",
+        kind: "DEPOSIT",
+        amount: amt,
+        note: (r as any).note || undefined,
+      });
+    }
+  } catch (err) { log.warn({ err: String(err) }, "banklog emit failed"); }
           const member = await prisma.member.findFirst({ where: { allianceId: a.id, nationId: toInt(r.sender_id) } });
           if (member) {
             await prisma.safekeeping.upsert({

@@ -1,0 +1,68 @@
+// src/utils/treasury.ts
+import type { PrismaClient } from '@prisma/client';
+
+export const RESOURCES = [
+  'money','coal','oil','uranium','iron','bauxite','lead',
+  'gasoline','munitions','steel','aluminum','food'
+] as const;
+
+export type ResourceName = typeof RESOURCES[number];
+export type ResourceBag = Partial<Record<ResourceName, number>> & Record<string, number>;
+
+function normalizeBag(input: Record<string, number>): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [k, raw] of Object.entries(input || {})) {
+    const v = Number(raw);
+    if (Number.isFinite(v) && v !== 0) out[k] = (out[k] || 0) + v;
+  }
+  return out;
+}
+
+export async function addToTreasury(
+  prisma: PrismaClient,
+  allianceId: number,
+  delta: Record<string, number>
+) {
+  const row = await prisma.allianceTreasury.upsert({
+    where: { allianceId },
+    update: {},
+    create: { allianceId, balances: {} },
+  });
+
+  const balances = (row.balances as Record<string, number>) || {};
+  const patch = normalizeBag(delta);
+
+  for (const [k, v] of Object.entries(patch)) {
+    balances[k] = (Number(balances[k]) || 0) + Number(v);
+  }
+
+  return prisma.allianceTreasury.update({
+    where: { id: row.id },
+    data: { balances },
+  });
+}
+
+export type LedgerParams = {
+  allianceId: number;
+  amounts: Record<string, number>;
+  note?: string;
+  bankrecId?: number | null;
+  actorDiscordId?: string | null;
+  memberId?: number | null;
+  kind?: 'DEPOSIT' | 'WITHDRAW' | 'ADJUST';
+};
+
+export async function writeLedgerEntry(prisma: PrismaClient, p: LedgerParams) {
+  return prisma.ledgerEntry.create({
+    data: {
+      allianceId: p.allianceId,
+      memberId: p.memberId ?? null,
+      scope: 'ALLIANCE' as any,
+      kind: (p.kind ?? 'ADJUST') as any,
+      amounts: p.amounts,
+      note: p.note,
+      actorDiscordId: p.actorDiscordId ?? null,
+      bankrecId: p.bankrecId ?? null,
+    },
+  });
+}

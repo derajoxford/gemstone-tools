@@ -1,13 +1,9 @@
 generator client {
   provider = "prisma-client-js"
-}
-
-datasource db {
+}datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
-}
-
-model Alliance {
+}model Alliance {
   id              Int             @id
   guildId         String?
   name            String?
@@ -21,11 +17,7 @@ model Alliance {
   bankrecs        Bankrec[]
   members         Member[]
   treasury      AllianceTreasury? @relation(name: "AllianceTreasuryOnAlliance")
-  ledgerEntries LedgerEntry[]     @relation(name: "LedgerAlliance")
-
-}
-
-model AllianceKey {
+  ledgerEntries LedgerEntry[]     @relation(name: "LedgerAlliance")}model AllianceKey {
   id              Int      @id @default(autoincrement())
   allianceId      Int
   encryptedApiKey Bytes
@@ -34,10 +26,8 @@ model AllianceKey {
   nonceBot        Bytes?
   addedBy         String
   createdAt       DateTime @default(now())
-  alliance   Alliance (name: "AllianceKeysOnAlliance", fields: [allianceId], references: [id])
-}
-
-model Member {
+  alliance   Alliance @relation(name: "AllianceKeysOnAlliance", fields: [allianceId], references: [id])
+}model Member {
   id         Int          @id @default(autoincrement())
   allianceId Int
   discordId  String
@@ -46,12 +36,8 @@ model Member {
   createdAt  DateTime     @default(now())
   updatedAt  DateTime     @updatedAt
   alliance   Alliance     @relation(fields: [allianceId], references: [id])
-  balance    Safekeeping?
-
-  @@unique([allianceId, discordId])
-}
-
-model Safekeeping {
+  balance    Safekeeping?  @@unique([allianceId, discordId])
+}model Safekeeping {
   id        Int      @id @default(autoincrement())
   memberId  Int      @unique
   money     Decimal  @default(0)
@@ -68,9 +54,8 @@ model Safekeeping {
   aluminum  Decimal  @default(0)
   updatedAt DateTime @updatedAt
   member    Member   @relation(fields: [memberId], references: [id])
-}
-
-model Bankrec {
+  ledgerEntries LedgerEntry[] @relation(name: "LedgerMember")
+}model Bankrec {
   id           Int      @id
   allianceId   Int
   date         DateTime
@@ -92,9 +77,8 @@ model Bankrec {
   steel        Decimal  @default(0)
   aluminum     Decimal  @default(0)
   alliance     Alliance @relation(fields: [allianceId], references: [id])
-}
-
-model WithdrawalRequest {
+  ledgerEntries LedgerEntry[] @relation(name: "LedgerMember")
+}model WithdrawalRequest {
   id          String         @id @default(uuid())
   allianceId  Int
   memberId    Int
@@ -105,9 +89,7 @@ model WithdrawalRequest {
   bankrecPaid Int?
   createdAt   DateTime       @default(now())
   updatedAt   DateTime       @updatedAt
-}
-
-model AllianceConfig {
+}model AllianceConfig {
   allianceId     Int      @id
   reviewerRoleId String?
   autopayEnabled Boolean  @default(true)
@@ -127,79 +109,45 @@ model AllianceConfig {
   updatedAt      DateTime
   logChannelId   String?
   Alliance       Alliance @relation(fields: [allianceId], references: [id])
-}
-
-enum WithdrawStatus {
+}enum WithdrawStatus {
   PENDING
   APPROVED
   REJECTED
   PAID
   CANCELED
-}
-
-model Setting {
+}model Setting {
   id         String   @id @default(cuid())
   guildId    String
   key        String
   value      String
   createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
-
-  @@unique([guildId, key], name: "guildId_key")
-}
-
-/// --- Gemstone Tools: Alliance Treasury & Ledger ---
+  updatedAt  DateTime @updatedAt  @@unique([guildId, key], name: "guildId_key")
+}/// --- Gemstone Tools: Alliance Treasury & Ledger ---
 /// JSON-based balances to avoid schema churn for new resources.
 enum AccountScope {
   ALLIANCE
   SAFEKEEPING
-}
-
-enum EntryKind {
+}enum EntryKind {
   DEPOSIT
   WITHDRAW
   TRANSFER
   ADJUST
-}
-
-model AllianceTreasury {
+}model AllianceTreasury {
   id         String   @id @default(cuid())
   allianceId Int      @unique
-  alliance   Alliance (name: "AllianceTreasuryOnAlliance", fields: [allianceId], references: [id])
-
-  /// JSON object like: {"money": 123456, "steel": 50}
-  balances   Json     @default("{}")
-
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
-
-  @@index([allianceId])
-}
-
-model LedgerEntry {
+  alliance   Alliance @relation(name: "AllianceTreasuryOnAlliance", fields: [allianceId], references: [id])  /// JSON object like: {"money": 123456, "steel": 50}
+  balances   Json     @default("{}")  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt  @@index([allianceId])
+}model LedgerEntry {
   id             String       @id @default(cuid())
   allianceId     Int
-  alliance       Alliance @relation(name: "LedgerAlliance", fields: [allianceId], references: [id])
-
-  /// Optional member context for safekeeping entries
+  alliance       Alliance @relation(name: "LedgerAlliance", fields: [allianceId], references: [id])  /// Optional member context for safekeeping entries
   memberId       Int?
-  member         Member? @relation(name: "LedgerMember", fields: [memberId], references: [id])
-
-  scope          AccountScope
-  kind           EntryKind
-
-  /// JSON amounts; ex: {"money": 5000} (positive/negative deltas allowed)
+  member         Member? @relation(name: "LedgerMember", fields: [memberId], references: [id])  scope          AccountScope
+  kind           EntryKind  /// JSON amounts; ex: {"money": 5000} (positive/negative deltas allowed)
   amounts        Json
-  note           String?
-
-  /// Who performed the action in Discord (if applicable)
-  actorDiscordId String?
-
-  /// Source bankrec id (if from PnW polling)
-  bankrecId      Int?
-
-  createdAt      DateTime     @default(now())
-
-  @@index([allianceId, createdAt])
+  note           String?  /// Who performed the action in Discord (if applicable)
+  actorDiscordId String?  /// Source bankrec id (if from PnW polling)
+  bankrecId      Int?  createdAt      DateTime     @default(now())  @@index([allianceId, createdAt])
   @@index([scope, createdAt])
 }
