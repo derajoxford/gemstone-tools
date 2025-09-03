@@ -16,6 +16,9 @@ import { fetchBankrecs } from './lib/pnw.js';
 // NEW: import the external command modules (keep these)
 import * as treasury from './commands/treasury';
 import * as treasury_add from './commands/treasury_add';
+import * as treasury from './commands/treasury';
+import * as treasury_add from './commands/treasury_add';
+
 
 const log = pino({ level: process.env.LOG_LEVEL || 'info' });
 const prisma = new PrismaClient();
