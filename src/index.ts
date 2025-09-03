@@ -169,6 +169,9 @@ client.on('interactionCreate', async (i: Interaction) => {
       if (i.commandName === 'withdraw_list') return handleWithdrawList(i);
       if (i.commandName === 'withdraw_set') return handleWithdrawSet(i);
       if (i.commandName === 'safekeeping_edit') return handleSafekeepingStart(i);
+      if (i.commandName === 'treasury') return treasury.execute(i as any);
+      if (i.commandName === 'treasury_add') return treasury_add.execute(i as any);
+
 
       // NEW: wire the two new commands
       if (i.commandName === 'treasury') return (treasury as any).execute(i);
