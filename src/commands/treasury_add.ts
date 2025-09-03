@@ -1,13 +1,7 @@
 // src/commands/treasury_add.ts
 import { SlashCommandBuilder, type ChatInputCommandInteraction } from 'discord.js';
 import { prisma } from '../db';
-
-const RESOURCES = [
-  'money','coal','oil','uranium','iron','bauxite','lead',
-  'gasoline','munitions','steel','aluminum','food'
-] as const;
-
-type Resource = typeof RESOURCES[number];
+import { addToTreasury, RESOURCES } from '../utils/treasury';
 
 const resourceChoices = RESOURCES.map(r => ({ name: r, value: r }));
 
@@ -36,64 +30,44 @@ export const data = new SlashCommandBuilder()
       .setRequired(false)
   );
 
-export async function execute(i: ChatInputCommandInteraction) {
+export async function execute(interaction: ChatInputCommandInteraction) {
   try {
-    const resource = i.options.getString('resource', true) as Resource;
-    const amount = i.options.getNumber('amount', true) || 0;
-    const allianceArg = i.options.getString('alliance') || undefined;
-    const note = i.options.getString('note') || undefined;
+    await interaction.deferReply({ ephemeral: true });
 
-    if (amount <= 0) {
-      return i.reply({ content: 'Amount must be > 0.', ephemeral: true });
+    const resource = interaction.options.getString('resource', true);
+    const amount = interaction.options.getNumber('amount', true);
+    const arg = interaction.options.getString('alliance') || undefined;
+
+    if (!RESOURCES.includes(resource as any)) {
+      return interaction.editReply({ content: 'Unknown resource.' });
+    }
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return interaction.editReply({ content: 'Amount must be a positive number.' });
     }
 
-    // Resolve alliance
+    const guildId = interaction.guildId || undefined;
     let alliance: { id: number; name: string | null } | null = null;
-    if (allianceArg) {
-      const asNum = Number(allianceArg);
-      if (Number.isInteger(asNum)) {
-        alliance = await prisma.alliance.findUnique({ where: { id: asNum } });
-      }
-      if (!alliance) {
-        alliance = await prisma.alliance.findFirst({
-          where: { name: { contains: allianceArg, mode: 'insensitive' } },
-        });
-      }
-      if (!alliance) {
-        return i.reply({ content: `Alliance not found: ${allianceArg}`, ephemeral: true });
-      }
-    } else {
-      alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
-      if (!alliance) {
-        return i.reply({ content: 'This server is not linked to an alliance. Run /setup_alliance first.', ephemeral: true });
-      }
+    if (arg) {
+      const asNum = Number(arg);
+      if (Number.isInteger(asNum)) alliance = await prisma.alliance.findUnique({ where: { id: asNum } });
+      if (!alliance) alliance = await prisma.alliance.findFirst({ where: { name: { contains: arg, mode: 'insensitive' } } });
+    } else if (guildId) {
+      alliance = await prisma.alliance.findFirst({ where: { guildId } });
     }
+    if (!alliance) return interaction.editReply({ content: 'Alliance not found for this server. Run /setup_alliance.' });
 
-    // Ensure treasury row exists
-    const row = await prisma.allianceTreasury.upsert({
-      where: { allianceId: alliance.id },
-      update: {},
-      create: { allianceId: alliance.id, balances: {} },
-    });
+    const delta: Record<string, number> = { [resource]: amount };
+    const balances = await addToTreasury(prisma, alliance.id, delta);
 
-    // Update balances JSON
-    const balances = (row.balances as Record<string, number>) || {};
-    balances[resource] = (Number(balances[resource]) || 0) + amount;
+    const label = alliance.name ?? `#${alliance.id}`;
+    const newAmt = Number(balances[resource] || 0);
 
-    await prisma.allianceTreasury.update({
-      where: { allianceId: alliance.id },
-      data: { balances },
-    });
-
-    const label = alliance.name ? alliance.name : `#${alliance.id}`;
-    const noteLine = note ? ` Note: ${note}` : '';
-    return i.reply({
-      content: `Added **${amount.toLocaleString()}** **${resource}** to **${label}**.${noteLine}`,
-      ephemeral: true,
-    });
+    return interaction.editReply(
+      `Added **${amount.toLocaleString()}** **${resource}** to **${label}**.\n` +
+      `New **${resource}** balance: **${newAmt.toLocaleString()}**`
+    );
   } catch (err: any) {
-    const msg = err?.message || String(err);
-    return i.reply({ content: 'Error: ' + msg, ephemeral: true });
+    return interaction.editReply({ content: 'Error: ' + (err?.message || String(err)) });
   }
 }
 
