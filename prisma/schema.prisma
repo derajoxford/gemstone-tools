@@ -111,6 +111,8 @@ model WithdrawalRequest {
   bankrecPaid Int?     // bankrec id once paid
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
+  treasury       AllianceTreasury?
+
 }
 model AllianceTreasury {
   allianceId Int      @id
