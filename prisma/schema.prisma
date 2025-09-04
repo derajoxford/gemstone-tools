@@ -1,3 +1,4 @@
+// prisma/schema.prisma
 generator client {
   provider = "prisma-client-js"
 }
@@ -27,6 +28,9 @@ model Alliance {
   keys            AllianceKey[]
   members         Member[]
   bankrecs        Bankrec[]
+
+  // 👇 Added: opposite side of the 1–1 treasury relation
+  treasury        AllianceTreasury?
 }
 
 model AllianceKey {
@@ -57,22 +61,22 @@ model Member {
 }
 
 model Safekeeping {
-  id         Int     @id @default(autoincrement())
-  memberId   Int     @unique
-  money      Decimal @default(0)
-  food       Decimal @default(0)
-  coal       Decimal @default(0)
-  oil        Decimal @default(0)
-  uranium    Decimal @default(0)
-  lead       Decimal @default(0)
-  iron       Decimal @default(0)
-  bauxite    Decimal @default(0)
-  gasoline   Decimal @default(0)
-  munitions  Decimal @default(0)
-  steel      Decimal @default(0)
-  aluminum   Decimal @default(0)
+  id         Int      @id @default(autoincrement())
+  memberId   Int      @unique
+  money      Decimal  @default(0)
+  food       Decimal  @default(0)
+  coal       Decimal  @default(0)
+  oil        Decimal  @default(0)
+  uranium    Decimal  @default(0)
+  lead       Decimal  @default(0)
+  iron       Decimal  @default(0)
+  bauxite    Decimal  @default(0)
+  gasoline   Decimal  @default(0)
+  munitions  Decimal  @default(0)
+  steel      Decimal  @default(0)
+  aluminum   Decimal  @default(0)
   updatedAt  DateTime @updatedAt
-  member     Member  @relation(fields: [memberId], references: [id])
+  member     Member   @relation(fields: [memberId], references: [id])
 }
 
 model Bankrec {
@@ -84,41 +88,40 @@ model Bankrec {
   senderId     Int
   receiverType Int
   receiverId   Int
-  money        Decimal @default(0)
-  food         Decimal @default(0)
-  coal         Decimal @default(0)
-  oil          Decimal @default(0)
-  uranium      Decimal @default(0)
-  lead         Decimal @default(0)
-  iron         Decimal @default(0)
-  bauxite      Decimal @default(0)
-  gasoline     Decimal @default(0)
-  munitions    Decimal @default(0)
-  steel        Decimal @default(0)
-  aluminum     Decimal @default(0)
+  money        Decimal  @default(0)
+  food         Decimal  @default(0)
+  coal         Decimal  @default(0)
+  oil          Decimal  @default(0)
+  uranium      Decimal  @default(0)
+  lead         Decimal  @default(0)
+  iron         Decimal  @default(0)
+  bauxite      Decimal  @default(0)
+  gasoline     Decimal  @default(0)
+  munitions    Decimal  @default(0)
+  steel        Decimal  @default(0)
+  aluminum     Decimal  @default(0)
 
   alliance     Alliance @relation(fields: [allianceId], references: [id])
 }
 
 model WithdrawalRequest {
-  id          String   @id @default(uuid())
+  id          String          @id @default(uuid())
   allianceId  Int
   memberId    Int
-  status      WithdrawStatus @default(PENDING)
+  status      WithdrawStatus  @default(PENDING)
   payload     Json
-  createdBy   String   // discord user id
-  reviewerId  String?  // discord user id
-  bankrecPaid Int?     // bankrec id once paid
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-  treasury       AllianceTreasury?
-
+  createdBy   String          // discord user id
+  reviewerId  String?         // discord user id
+  bankrecPaid Int?            // bankrec id once paid
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
 }
+
 model AllianceTreasury {
-  allianceId Int      @id
-  balances   Json     @default("{}")
-  updatedAt  DateTime @updatedAt
+  allianceId Int       @id
+  balances   Json      @default("{}")
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
 
-  alliance   Alliance @relation(fields: [allianceId], references: [id])
+  alliance   Alliance  @relation(fields: [allianceId], references: [id])
 }
-
