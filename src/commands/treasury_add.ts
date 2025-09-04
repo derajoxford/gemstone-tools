@@ -1,124 +1,76 @@
-// src/commands/treasury_add.ts
-import {
-  SlashCommandBuilder,
-  type ChatInputCommandInteraction,
-} from 'discord.js';
+import { SlashCommandBuilder, type ChatInputCommandInteraction } from 'discord.js';
 import { prisma } from '../db';
-
-const RESOURCES = [
-  'money',
-  'coal',
-  'oil',
-  'uranium',
-  'iron',
-  'bauxite',
-  'lead',
-  'gasoline',
-  'munitions',
-  'steel',
-  'aluminum',
-  'food',
-] as const;
+import { addToTreasury, RESOURCES } from '../utils/treasury';
 
 export const data = new SlashCommandBuilder()
   .setName('treasury_add')
-  .setDescription(
-    'Add a resource amount to an alliance treasury (manual adjustment)',
+  .setDescription('Add a resource amount to an alliance treasury (manual adjustment)')
+  .addStringOption(o =>
+    o.setName('resource')
+     .setDescription('Resource to add')
+     .setRequired(true)
+     .addChoices(...(RESOURCES as readonly string[]).map(r => ({ name: r, value: r })))
   )
-  .addStringOption((opt) =>
-    opt
-      .setName('resource')
-      .setDescription('Resource to add')
-      .setRequired(true)
-      .addChoices(
-        ...RESOURCES.map((r) => ({ name: r, value: r })),
-      ),
+  .addNumberOption(o =>
+    o.setName('amount')
+     .setDescription('Amount to add (positive)')
+     .setRequired(true)
   )
-  .addNumberOption((opt) =>
-    opt
-      .setName('amount')
-      .setDescription('Amount to add (positive)')
-      .setRequired(true),
+  .addStringOption(o =>
+    o.setName('alliance')
+     .setDescription('Alliance (ID or name). If omitted, uses this server’s alliance.')
+     .setRequired(false)
   )
-  .addStringOption((opt) =>
-    opt
-      .setName('alliance')
-      .setDescription(
-        'Alliance (ID or name). If omitted, uses this server’s alliance.',
-      )
-      .setRequired(false),
-  )
-  .addStringOption((opt) =>
-    opt.setName('note').setDescription('Optional note for context').setRequired(false),
+  .addStringOption(o =>
+    o.setName('note')
+     .setDescription('Optional note for context')
+     .setRequired(false)
   );
 
 export async function execute(interaction: ChatInputCommandInteraction) {
   try {
-    const guildId = interaction.guildId ?? undefined;
-    const resource = interaction.options.getString('resource', true);
+    const resource = interaction.options.getString('resource', true) as (typeof RESOURCES)[number];
     const amount = interaction.options.getNumber('amount', true);
-    const argAlliance = interaction.options.getString('alliance') ?? undefined;
+    const arg = interaction.options.getString('alliance') ?? undefined;
 
-    if (!RESOURCES.includes(resource as any)) {
-      return interaction.reply({ content: 'Unknown resource.', ephemeral: true });
-    }
     if (!Number.isFinite(amount) || amount <= 0) {
-      return interaction.reply({
-        content: 'Amount must be a positive number.',
-        ephemeral: true,
-      });
+      return interaction.reply({ content: 'Amount must be a positive number.', ephemeral: true });
     }
 
     // Resolve alliance
     let alliance: { id: number; name: string | null } | null = null;
-    if (argAlliance) {
-      const asNum = Number(argAlliance);
+
+    if (arg) {
+      const asNum = Number(arg);
       if (Number.isInteger(asNum)) {
         alliance = await prisma.alliance.findUnique({ where: { id: asNum } });
       }
       if (!alliance) {
         alliance = await prisma.alliance.findFirst({
-          where: { name: { contains: argAlliance, mode: 'insensitive' } },
+          where: { name: { contains: arg, mode: 'insensitive' } },
+          select: { id: true, name: true },
         });
       }
-    } else if (guildId) {
-      alliance = await prisma.alliance.findFirst({ where: { guildId } });
-    }
-
-    if (!alliance) {
-      return interaction.reply({
-        content:
-          'Alliance not found. Provide an ID or name, or link this server with **/setup_alliance**.',
-        ephemeral: true,
+    } else if (interaction.guildId) {
+      alliance = await prisma.alliance.findFirst({
+        where: { guildId: interaction.guildId },
+        select: { id: true, name: true },
       });
     }
 
-    // Upsert row and mutate balances blob
-    const row = await prisma.allianceTreasury.upsert({
-      where: { allianceId: alliance.id },
-      update: {},
-      create: { allianceId: alliance.id, balances: {} },
-    });
+    if (!alliance) {
+      return interaction.reply({ content: 'Alliance not found for this server. Use `/setup_alliance` or pass an ID/name.', ephemeral: true });
+    }
 
-    const balances = (row.balances as Record<string, number>) || {};
-    balances[resource] = (Number(balances[resource]) || 0) + Number(amount);
+    await addToTreasury(prisma, alliance.id, { [resource]: amount });
 
-    await prisma.allianceTreasury.update({
-      where: { allianceId: alliance.id },
-      data: { balances },
-    });
-
+    const label = alliance.name ?? `#${alliance.id}`;
     return interaction.reply({
-      content: `Added **${amount.toLocaleString()}** **${resource}** to **${
-        alliance.name ?? `#${alliance.id}`
-      }**.`,
+      content: `Added ${amount.toLocaleString()} ${resource} to ${label}.`,
       ephemeral: true,
     });
   } catch (err) {
-    return interaction.reply({
-      content: `Error: ${String(err)}`,
-      ephemeral: true,
-    });
+    return interaction.reply({ content: `Error: ${String(err)}`, ephemeral: true });
   }
 }
 
