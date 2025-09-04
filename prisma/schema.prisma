@@ -20,7 +20,7 @@ model Alliance {
   id              Int        @id                 // PnW alliance id
   guildId         String?
   name            String?
-  reviewChannelId String?    // NEW: channel to post approval buttons
+  reviewChannelId String?    // channel to post approval buttons
   createdAt       DateTime   @default(now())
   updatedAt       DateTime   @updatedAt
   lastBankrecId   Int?
@@ -29,7 +29,7 @@ model Alliance {
   members         Member[]
   bankrecs        Bankrec[]
 
-  // 👇 Added: opposite side of the 1–1 treasury relation
+  // 1:1 link to treasury
   treasury        AllianceTreasury?
 }
 
@@ -124,4 +124,18 @@ model AllianceTreasury {
   updatedAt  DateTime  @updatedAt
 
   alliance   Alliance  @relation(fields: [allianceId], references: [id])
+}
+
+//
+// Legacy tables we do NOT want Prisma to manage or drop.
+// Keeping them ignored prevents `db push` from proposing to delete them.
+//
+model Setting {
+  id Int @id @default(autoincrement())
+  @@ignore
+}
+
+model AllianceConfig {
+  id Int @id @default(autoincrement())
+  @@ignore
 }
