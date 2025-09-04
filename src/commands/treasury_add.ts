@@ -1,24 +1,31 @@
 // src/commands/treasury_add.ts
 import {
   SlashCommandBuilder,
+  PermissionFlagsBits,
   ChatInputCommandInteraction,
   EmbedBuilder,
   Colors,
-  PermissionFlagsBits,
 } from 'discord.js';
-import { prisma } from '../db';
-import { ORDER, RES_EMOJI } from '../lib/emojis.js';
+import { PrismaClient } from '@prisma/client';
+import { RES_EMOJI, ORDER } from '../lib/emojis.js';
 
+const prisma = new PrismaClient();
+
+/**
+ * Required options MUST be declared before optional ones.
+ * Order here: resource (required) -> amount (required) -> op (optional).
+ */
 export const data = new SlashCommandBuilder()
   .setName('treasury_add')
   .setDescription('Adjust the alliance-wide treasury (add or subtract).')
-  // REQUIRED options first (fixes Discord 50035)
   .addStringOption(o =>
     o
       .setName('resource')
       .setDescription('Resource to adjust')
       .setRequired(true)
-      .addChoices(...ORDER.map(r => ({ name: r, value: r })))
+      .addChoices(
+        ...(ORDER as string[]).map((r: string) => ({ name: r, value: r }))
+      )
   )
   .addNumberOption(o =>
     o
@@ -26,79 +33,69 @@ export const data = new SlashCommandBuilder()
       .setDescription('Amount (use positive numbers)')
       .setRequired(true)
   )
-  // Optional goes AFTER required
   .addStringOption(o =>
     o
       .setName('op')
       .setDescription('Add or subtract')
-      .addChoices({ name: 'add', value: 'add' }, { name: 'subtract', value: 'subtract' })
       .setRequired(false)
+      .addChoices({ name: 'add', value: 'add' }, { name: 'subtract', value: 'subtract' })
   )
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
 
 export async function execute(i: ChatInputCommandInteraction) {
   await i.deferReply({ ephemeral: true });
 
-  if (!i.guildId) {
-    return i.editReply('Guild only.');
+  // Require Manage Guild just like data.defaultMemberPermissions indicates.
+  if (!i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+    return i.editReply('You lack permission to use this command.');
   }
-  const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId } });
+
+  const alliance = await prisma.alliance.findFirst({
+    where: { guildId: i.guildId ?? '' },
+  });
   if (!alliance) {
-    return i.editReply('This server is not linked yet. Run **/setup_alliance** first.');
+    return i.editReply('No alliance linked here. Run **/setup_alliance** first.');
   }
 
   const resource = i.options.getString('resource', true);
-  const amount = Number(i.options.getNumber('amount', true));
-  const op = (i.options.getString('op') || 'add') as 'add' | 'subtract';
+  const amount = i.options.getNumber('amount', true)!;
+  const op = (i.options.getString('op') as 'add' | 'subtract' | null) ?? 'add';
 
-  if (!ORDER.includes(resource as any)) {
-    return i.editReply('Unknown resource.');
+  if (!(ORDER as string[]).includes(resource)) {
+    return i.editReply(`Unknown resource: \`${resource}\`.`);
   }
   if (!Number.isFinite(amount) || amount <= 0) {
     return i.editReply('Amount must be a positive number.');
   }
 
-  // Load current balances
-  const treas = await prisma.allianceTreasury.findUnique({
+  const delta = op === 'subtract' ? -amount : amount;
+
+  // Load row and update balances JSON
+  const row = await prisma.allianceTreasury.findUnique({
     where: { allianceId: alliance.id },
   });
-  const balances = (treas?.balances as Record<string, number>) || {};
+  const balances: Record<string, number> = { ...(row?.balances as any || {}) };
 
-  const current = Number(balances[resource] || 0);
-  const delta = op === 'subtract' ? -amount : amount;
-  const nextVal = current + delta;
-
-  if (nextVal < 0) {
-    return i.editReply(
-      `Cannot subtract ${amount.toLocaleString()} ${resource}; only ${current.toLocaleString()} available.`
-    );
-  }
-
-  const next = { ...balances, [resource]: nextVal };
+  const before = Number(balances[resource] || 0);
+  const after = Math.max(0, before + delta); // never below zero
+  balances[resource] = after;
 
   await prisma.allianceTreasury.upsert({
     where: { allianceId: alliance.id },
-    update: { balances: next },
-    create: { allianceId: alliance.id, balances: next },
+    update: { balances },
+    create: { allianceId: alliance.id, balances },
   });
 
-  // Pretty embed, like safekeeping
-  const lines = ORDER.map(k => {
-    const v = Number(next[k] || 0);
-    return v ? `${RES_EMOJI[k as any] ?? ''} **${k}**: ${v.toLocaleString()}` : undefined;
-  })
-    .filter(Boolean)
-    .join('\n') || '—';
-
+  const emoji = RES_EMOJI[resource as keyof typeof RES_EMOJI] ?? '';
+  const sign = delta >= 0 ? '+' : '';
   const embed = new EmbedBuilder()
-    .setTitle(`🏛️ Alliance Treasury — #${alliance.id}${alliance.name ? ` (${alliance.name})` : ''}`)
-    .setDescription(lines)
-    .setColor(Colors.Blurple)
-    .setFooter({ text: 'Use /treasury to view. Use /treasury_add again to adjust.' });
+    .setTitle('🏦 Alliance Treasury Updated')
+    .setDescription(
+      `${emoji} **${resource}**: ${before.toLocaleString()} → ${after.toLocaleString()} ` +
+      `(${sign}${delta.toLocaleString()})`
+    )
+    .setFooter({ text: `Alliance #${alliance.id}` })
+    .setColor(delta >= 0 ? Colors.Green : Colors.Red);
 
-  const verb = op === 'subtract' ? 'decreased' : 'increased';
-  await i.editReply({
-    content: `✅ **${resource}** ${verb} by **${amount}**. New total: **${nextVal.toLocaleString()}**`,
-    embeds: [embed],
-  });
+  return i.editReply({ embeds: [embed] });
 }
