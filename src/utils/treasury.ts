@@ -1,72 +1,66 @@
 // src/utils/treasury.ts
 import type { PrismaClient } from '@prisma/client';
 
-export type Balances = Record<string, number>;
+export type TreasuryBalances = Record<string, number>;
 
 /**
- * Ensure a treasury row exists and return its balances object.
+ * Fetch the alliance-wide treasury balances JSON.
+ * Returns an empty object if the row doesn't exist yet.
  */
-export async function getTreasury(prisma: PrismaClient, allianceId: number): Promise<Balances> {
-  const row = await prisma.allianceTreasury.findUnique({ where: { allianceId } });
-  if (row?.balances && typeof row.balances === 'object') {
-    // Prisma returns JSON as unknown; cast to our shape.
-    return row.balances as unknown as Balances;
-  }
-  // create empty if missing
-  await prisma.allianceTreasury.upsert({
-    where: { allianceId },
-    create: { allianceId, balances: {} },
-    update: {},
-  });
-  return {};
-}
-
-/**
- * Overwrite the treasury balances with the provided object.
- */
-export async function setTreasury(
+export async function getTreasury(
   prisma: PrismaClient,
-  allianceId: number,
-  balances: Balances,
-): Promise<void> {
-  // Normalize numbers
-  const clean: Balances = {};
-  for (const [k, v] of Object.entries(balances)) {
-    const n = Number(v);
-    if (Number.isFinite(n)) clean[k] = n;
-  }
-
-  await prisma.allianceTreasury.upsert({
+  allianceId: number
+): Promise<TreasuryBalances> {
+  const row = await prisma.allianceTreasury.findUnique({
     where: { allianceId },
-    create: { allianceId, balances: clean },
-    update: { balances: clean },
   });
+  const raw = (row?.balances ?? {}) as Record<string, unknown>;
+  const out: TreasuryBalances = {};
+  for (const [k, v] of Object.entries(raw)) {
+    const n = Number(v);
+    if (Number.isFinite(n)) out[k] = n;
+  }
+  return out;
 }
 
 /**
- * Add deltas to the existing balances (negative or positive numbers).
- * Returns the updated balances.
+ * Increment (or decrement with negatives) the alliance treasury.
+ * Creates the AllianceTreasury row if it doesn't exist yet.
+ * Returns the new balances object.
  */
 export async function addToTreasury(
   prisma: PrismaClient,
   allianceId: number,
-  delta: Balances,
-): Promise<Balances> {
-  const current = await getTreasury(prisma, allianceId);
-  const next: Balances = { ...current };
-
-  for (const [k, v] of Object.entries(delta)) {
-    const add = Number(v);
-    if (!Number.isFinite(add)) continue;
-    const prev = Number(next[k] ?? 0);
-    next[k] = prev + add;
-  }
-
-  await prisma.allianceTreasury.upsert({
+  delta: Record<string, number>
+): Promise<TreasuryBalances> {
+  // Ensure a row exists
+  const existing = await prisma.allianceTreasury.upsert({
     where: { allianceId },
-    create: { allianceId, balances: next },
-    update: { balances: next },
+    update: {},
+    create: { allianceId, balances: {} },
   });
 
-  return next;
+  const balances = { ...(existing.balances as Record<string, unknown>) } as TreasuryBalances;
+
+  for (const [k, v] of Object.entries(delta)) {
+    const inc = Number(v) || 0;
+    const cur = Number(balances[k] ?? 0) || 0;
+    const next = cur + inc;
+    // Keep only finite numbers; drop NaNs
+    if (Number.isFinite(next)) balances[k] = next;
+  }
+
+  const updated = await prisma.allianceTreasury.update({
+    where: { allianceId },
+    data: { balances },
+  });
+
+  // Normalize to numbers on return
+  const raw = updated.balances as Record<string, unknown>;
+  const out: TreasuryBalances = {};
+  for (const [k, v] of Object.entries(raw)) {
+    const n = Number(v);
+    if (Number.isFinite(n)) out[k] = n;
+  }
+  return out;
 }
