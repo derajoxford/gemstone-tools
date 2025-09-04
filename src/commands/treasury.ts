@@ -1,42 +1,68 @@
-// src/utils/treasury.ts
-import type { PrismaClient } from '@prisma/client';
+import {
+  SlashCommandBuilder,
+  type ChatInputCommandInteraction,
+  EmbedBuilder,
+} from 'discord.js';
+import { prisma } from '../db';
+import { getTreasury } from '../utils/treasury';
 
-export const RESOURCES = [
-  'money','coal','oil','uranium','iron','bauxite','lead',
-  'gasoline','munitions','steel','aluminum','food'
-] as const;
+export const data = new SlashCommandBuilder()
+  .setName('treasury')
+  .setDescription('Show alliance treasury balances')
+  .addStringOption(opt =>
+    opt
+      .setName('alliance')
+      .setDescription('Alliance (ID or name). If omitted, uses this server’s alliance.')
+      .setRequired(false)
+  );
 
-// Read (and lazily create) an alliance’s treasury row, returning a plain object of balances
-export async function getTreasury(prisma: PrismaClient, allianceId: number) {
-  const row = await prisma.allianceTreasury.upsert({
-    where: { allianceId },
-    update: {},
-    create: { allianceId, balances: {} },
-  });
-  return (row.balances as Record<string, number>) || {};
-}
+export async function execute(interaction: ChatInputCommandInteraction) {
+  try {
+    const guildId = interaction.guildId;
+    const arg = interaction.options.getString('alliance') ?? undefined;
 
-// Increment/decrement one or more resource balances
-export async function addToTreasury(
-  prisma: PrismaClient,
-  allianceId: number,
-  delta: Record<string, number>
-) {
-  const row = await prisma.allianceTreasury.upsert({
-    where: { allianceId },
-    update: {},
-    create: { allianceId, balances: {} },
-  });
+    // Resolve alliance
+    let alliance: { id: number; name: string | null } | null = null;
+    if (arg) {
+      const asNum = Number(arg);
+      if (Number.isInteger(asNum)) {
+        alliance = await prisma.alliance.findUnique({ where: { id: asNum } });
+      }
+      if (!alliance) {
+        alliance = await prisma.alliance.findFirst({
+          where: { name: { contains: arg, mode: 'insensitive' } },
+          select: { id: true, name: true },
+        });
+      }
+    } else if (guildId) {
+      alliance = await prisma.alliance.findFirst({
+        where: { guildId },
+        select: { id: true, name: true },
+      });
+    }
 
-  const balances = (row.balances as Record<string, number>) || {};
-  for (const [k, raw] of Object.entries(delta)) {
-    const v = Number(raw);
-    if (!Number.isFinite(v) || v === 0) continue;
-    balances[k] = (Number(balances[k]) || 0) + v;
+    if (!alliance) {
+      return interaction.reply({
+        content: 'Alliance not found. Provide an ID or name, or link this server with /setup_alliance.',
+        ephemeral: true,
+      });
+    }
+
+    const balances = await getTreasury(prisma, alliance.id);
+    const nonzero = Object.entries(balances).filter(([, v]) => (Number(v) || 0) !== 0);
+
+    const desc = nonzero.length
+      ? nonzero.map(([k, v]) => `• **${k}**: ${Number(v).toLocaleString()}`).join('\n')
+      : '_No balances recorded yet_';
+
+    const embed = new EmbedBuilder()
+      .setTitle(`Alliance Treasury — ${alliance.name ?? `#${alliance.id}`}`)
+      .setDescription(desc);
+
+    return interaction.reply({ embeds: [embed], ephemeral: true });
+  } catch (err) {
+    return interaction.reply({ content: `Error: ${String(err)}`, ephemeral: true });
   }
-
-  await prisma.allianceTreasury.update({
-    where: { allianceId },
-    data: { balances },
-  });
 }
+
+export default { data, execute };
