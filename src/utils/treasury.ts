@@ -1,41 +1,72 @@
 // src/utils/treasury.ts
 import type { PrismaClient } from '@prisma/client';
 
-export const RESOURCES = [
-  'money','coal','oil','uranium','iron','bauxite','lead',
-  'gasoline','munitions','steel','aluminum','food'
-] as const;
+export type Balances = Record<string, number>;
 
-/** Read current balances (empty object if none yet) */
-export async function getTreasury(prisma: PrismaClient, allianceId: number) {
+/**
+ * Ensure a treasury row exists and return its balances object.
+ */
+export async function getTreasury(prisma: PrismaClient, allianceId: number): Promise<Balances> {
   const row = await prisma.allianceTreasury.findUnique({ where: { allianceId } });
-  return (row?.balances as Record<string, number>) ?? {};
+  if (row?.balances && typeof row.balances === 'object') {
+    // Prisma returns JSON as unknown; cast to our shape.
+    return row.balances as unknown as Balances;
+  }
+  // create empty if missing
+  await prisma.allianceTreasury.upsert({
+    where: { allianceId },
+    create: { allianceId, balances: {} },
+    update: {},
+  });
+  return {};
 }
 
-/** Apply +/- deltas to balances (creates row if missing) */
+/**
+ * Overwrite the treasury balances with the provided object.
+ */
+export async function setTreasury(
+  prisma: PrismaClient,
+  allianceId: number,
+  balances: Balances,
+): Promise<void> {
+  // Normalize numbers
+  const clean: Balances = {};
+  for (const [k, v] of Object.entries(balances)) {
+    const n = Number(v);
+    if (Number.isFinite(n)) clean[k] = n;
+  }
+
+  await prisma.allianceTreasury.upsert({
+    where: { allianceId },
+    create: { allianceId, balances: clean },
+    update: { balances: clean },
+  });
+}
+
+/**
+ * Add deltas to the existing balances (negative or positive numbers).
+ * Returns the updated balances.
+ */
 export async function addToTreasury(
   prisma: PrismaClient,
   allianceId: number,
-  delta: Record<string, number>
-) {
-  // Load existing
-  const existing = await prisma.allianceTreasury.findUnique({ where: { allianceId } });
-  const balances: Record<string, number> = { ...(existing?.balances as any) };
+  delta: Balances,
+): Promise<Balances> {
+  const current = await getTreasury(prisma, allianceId);
+  const next: Balances = { ...current };
 
-  // Merge deltas
-  for (const [k, raw] of Object.entries(delta)) {
-    const v = Number(raw);
-    if (!Number.isFinite(v) || v === 0) continue;
-    const cur = Number(balances[k] ?? 0);
-    balances[k] = cur + v;
+  for (const [k, v] of Object.entries(delta)) {
+    const add = Number(v);
+    if (!Number.isFinite(add)) continue;
+    const prev = Number(next[k] ?? 0);
+    next[k] = prev + add;
   }
 
-  // Upsert
   await prisma.allianceTreasury.upsert({
     where: { allianceId },
-    update: { balances },
-    create: { allianceId, balances },
+    create: { allianceId, balances: next },
+    update: { balances: next },
   });
 
-  return balances;
+  return next;
 }
