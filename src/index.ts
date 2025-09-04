@@ -13,6 +13,7 @@ import { PrismaClient, WithdrawStatus } from '@prisma/client';
 import { seal, open } from './lib/crypto.js';
 import { RES_EMOJI, ORDER } from './lib/emojis.js';
 import { fetchBankrecs } from './lib/pnw.js';
+import { extraCommandsJSON, findCommandByName } from './commands/registry';
 
 // Import external command modules (one time only)
 import * as treasury from './commands/treasury';
