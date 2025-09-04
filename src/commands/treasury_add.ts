@@ -3,14 +3,16 @@ import {
   SlashCommandBuilder,
   ChatInputCommandInteraction,
   PermissionFlagsBits,
+  EmbedBuilder,
+  Colors,
 } from 'discord.js';
 import { prisma } from '../db';
 import { addToTreasury } from '../utils/treasury';
-import { ORDER as RESOURCES } from '../lib/emojis.js';
+import { ORDER as RESOURCES, RES_EMOJI } from '../lib/emojis.js';
 
 export const data = new SlashCommandBuilder()
   .setName('treasury_add')
-  .setDescription('Add to the alliance-wide treasury (positive or negative).')
+  .setDescription('Adjust the alliance-wide treasury (add or subtract).')
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .addStringOption(o =>
     o
@@ -19,10 +21,17 @@ export const data = new SlashCommandBuilder()
       .setRequired(true)
       .addChoices(...RESOURCES.map((r: string) => ({ name: r, value: r })))
   )
+  .addStringOption(o =>
+    o
+      .setName('op')
+      .setDescription('Add or subtract')
+      .setRequired(false)
+      .addChoices({ name: 'add', value: 'add' }, { name: 'subtract', value: 'subtract' })
+  )
   .addNumberOption(o =>
     o
       .setName('amount')
-      .setDescription('Amount to add (use negative to subtract)')
+      .setDescription('Amount (use positive numbers)')
       .setRequired(true)
   );
 
@@ -37,19 +46,38 @@ export async function execute(i: ChatInputCommandInteraction) {
   }
 
   const resource = i.options.getString('resource', true);
+  const op = i.options.getString('op') ?? 'add';
   const amount = i.options.getNumber('amount', true);
 
-  // Validate resource just in case
   if (!RESOURCES.includes(resource)) {
     return i.reply({ content: `Unknown resource: ${resource}`, ephemeral: true });
   }
+  if (amount <= 0) {
+    return i.reply({ content: 'Amount must be a positive number.', ephemeral: true });
+  }
 
-  // Apply the delta
-  const updated = await addToTreasury(prisma, alliance.id, { [resource]: amount });
+  const signed = op === 'subtract' ? -amount : amount;
 
+  const updated = await addToTreasury(prisma, alliance.id, { [resource]: signed });
   const newVal = Number(updated[resource] || 0);
-  await i.reply({
-    content: `✅ **${resource}** adjusted by ${amount.toLocaleString()}. New total: **${newVal.toLocaleString()}**`,
-    ephemeral: true,
-  });
+
+  const emoji = (RES_EMOJI as any)[resource] ?? '';
+  const emb = new EmbedBuilder()
+    .setTitle('🏦 Alliance Treasury Updated')
+    .setColor(signed >= 0 ? Colors.Green : Colors.Red)
+    .addFields(
+      {
+        name: 'Change',
+        value: `${emoji} **${resource}**: ${signed >= 0 ? '+' : ''}${signed.toLocaleString()}`,
+        inline: false,
+      },
+      {
+        name: 'New total',
+        value: `${emoji} **${resource}**: ${newVal.toLocaleString()}`,
+        inline: false,
+      }
+    )
+    .setFooter({ text: `Alliance #${alliance.id}` });
+
+  await i.reply({ embeds: [emb], ephemeral: true });
 }
