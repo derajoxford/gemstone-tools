@@ -1,8 +1,7 @@
 // src/commands/registry.ts
-// Keep all command imports in this tiny file instead of editing src/index.ts.
 import * as treasury from './treasury';
 import * as treasury_add from './treasury_add';
-import * as treasury_bulk from './treasury_bulk'; // ← NEW
+import * as treasury_bulk from './treasury_bulk';
 
 export type CommandModule = {
   data?: { name?: string; toJSON?: () => any };
@@ -12,13 +11,12 @@ export type CommandModule = {
 export const commandModules: CommandModule[] = [
   treasury,
   treasury_add,
-  treasury_bulk, // ← NEW
+  treasury_bulk,
 ].filter((m) => m?.data && m?.execute);
 
-// Helpers the index uses:
 export const extraCommandsJSON = commandModules
-  .filter((m) => m.data?.toJSON)
-  .map((m) => m.data!.toJSON());
+  .map((m) => m.data?.toJSON?.())
+  .filter(Boolean) as any[];
 
 export function findCommandByName(name: string) {
   return commandModules.find((m) => m.data?.name === name);
