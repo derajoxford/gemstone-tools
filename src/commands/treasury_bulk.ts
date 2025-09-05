@@ -1,95 +1,96 @@
 // src/commands/treasury_bulk.ts
 import {
-  SlashCommandBuilder,
-  PermissionFlagsBits,
-  ChatInputCommandInteraction,
-  EmbedBuilder,
-  Colors,
+  SlashCommandBuilder, Colors, EmbedBuilder, PermissionFlagsBits,
+  ChatInputCommandInteraction
 } from 'discord.js';
 import { PrismaClient } from '@prisma/client';
 import { RES_EMOJI, ORDER } from '../lib/emojis.js';
+import { getAllianceByGuild } from '../utils/alliance.js'; // used by your other commands
+import { addToTreasury, getAllianceTreasury } from '../utils/treasury';
 
 const prisma = new PrismaClient();
 
+const RES_SET = new Set(ORDER); // valid resource keys
+
+function fmtAdjLine(k: string, v: number) {
+  const e = (RES_EMOJI as any)[k] || '';
+  const sign = v >= 0 ? '+' : '−';
+  return `${e} **${k}**: ${sign}${Math.abs(v).toLocaleString()}`;
+}
+
 export const data = new SlashCommandBuilder()
   .setName('treasury_bulk')
-  .setDescription('Adjust multiple treasury resources in one go.')
+  .setDescription('Adjust multiple resources in the alliance treasury using JSON')
   .addStringOption(o =>
-    o
-      .setName('op')
-      .setDescription('add or subtract')
-      .setRequired(true)
-      .addChoices({ name: 'add', value: 'add' }, { name: 'subtract', value: 'subtract' })
-  )
-  .addStringOption(o =>
-    o
-      .setName('changes')
-      .setDescription('Comma-separated pairs, e.g. "money:100000, steel:250, gasoline:10"')
+    o.setName('payload')
+      .setDescription('e.g. {"money":1000000,"steel":500,"munitions":-10}')
       .setRequired(true)
   )
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
 
 export async function execute(i: ChatInputCommandInteraction) {
-  await i.deferReply({ ephemeral: true });
-
-  const alliance = await prisma.alliance.findFirst({
-    where: { guildId: i.guildId ?? '' },
-  });
+  // require alliance link
+  const alliance = await getAllianceByGuild(i.guildId || '');
   if (!alliance) {
-    return i.editReply('No alliance linked here. Run **/setup_alliance** first.');
+    return i.reply({ content: 'This server is not linked yet. Run **/setup_alliance** first.', ephemeral: true });
   }
 
-  const op = i.options.getString('op', true) as 'add' | 'subtract';
-  const raw = i.options.getString('changes', true);
+  // parse and validate
+  let raw: any;
+  try {
+    raw = JSON.parse(i.options.getString('payload', true));
+  } catch {
+    return i.reply({ content: 'Invalid JSON. Example: `{"money":1000000,"steel":500,"munitions":-10}`', ephemeral: true });
+  }
+  if (typeof raw !== 'object' || Array.isArray(raw) || raw === null) {
+    return i.reply({ content: 'Payload must be a JSON object of {resource:number}.', ephemeral: true });
+  }
 
-  const allowed = new Set<string>(ORDER as string[]);
-  const deltas: Record<string, number> = {};
-
-  for (const part of raw.split(',').map(s => s.trim()).filter(Boolean)) {
-    const m = part.match(/^([a-z_]+)\s*[:=]\s*(-?\d+(?:\.\d+)?)$/i);
-    if (!m) {
-      return i.editReply(`Couldn't parse \`${part}\`. Use \`resource:amount\` (comma-separated).`);
+  const adjustments: Record<string, number> = {};
+  for (const [k0, v0] of Object.entries(raw)) {
+    const k = String(k0).toLowerCase();
+    const n = Number(v0);
+    if (!RES_SET.has(k as any)) {
+      return i.reply({ content: `Unknown resource: \`${k}\`.`, ephemeral: true });
     }
-    const key = m[1].toLowerCase();
-    if (!allowed.has(key)) {
-      return i.editReply(`Unknown resource: \`${key}\`.`);
-    }
-    const amt = Number(m[2]);
-    if (!Number.isFinite(amt) || amt <= 0) {
-      return i.editReply(`Invalid amount for \`${key}\`: \`${m[2]}\`.`);
-    }
-    deltas[key] = (deltas[key] || 0) + (op === 'subtract' ? -amt : amt);
+    if (!Number.isFinite(n) || n === 0) continue; // ignore zeros; require finite
+    adjustments[k] = n;
+  }
+  if (!Object.keys(adjustments).length) {
+    return i.reply({ content: 'Nothing to change. Provide non-zero amounts.', ephemeral: true });
   }
 
-  if (!Object.keys(deltas).length) {
-    return i.editReply('No valid changes provided.');
+  // apply adjustments (positive => add, negative => subtract)
+  const results: Array<{ k: string; delta: number }> = [];
+  for (const [k, delta] of Object.entries(adjustments)) {
+    const op = delta >= 0 ? 'add' : 'subtract';
+    await addToTreasury(alliance.id, k as any, op as any, Math.abs(delta));
+    results.push({ k, delta });
   }
 
-  const row = await prisma.allianceTreasury.findUnique({
-    where: { allianceId: alliance.id },
-  });
-  const balances: Record<string, number> = { ...(row?.balances as any || {}) };
-
-  const lines: string[] = [];
-  for (const [k, delta] of Object.entries(deltas)) {
-    const before = Number(balances[k] || 0);
-    const after = Math.max(0, before + delta);
-    balances[k] = after;
-    const prettyDelta = `${delta >= 0 ? '+' : ''}${delta.toLocaleString()}`;
-    lines.push(`${RES_EMOJI[k as any] ?? ''} **${k}**: ${before.toLocaleString()} → ${after.toLocaleString()} (${prettyDelta})`);
-  }
-
-  await prisma.allianceTreasury.upsert({
-    where: { allianceId: alliance.id },
-    update: { balances },
-    create: { allianceId: alliance.id, balances },
-  });
+  // fetch new totals to show a nice summary
+  const t = await getAllianceTreasury(alliance.id);
+  const totalsLine =
+    ORDER.map(k => {
+      const v = Number((t.balances as any)[k] || 0);
+      return v ? `${(RES_EMOJI as any)[k] || ''} **${k}**: ${v.toLocaleString()}` : undefined;
+    }).filter(Boolean).join(' · ') || '—';
 
   const embed = new EmbedBuilder()
-    .setTitle('🏦 Alliance Treasury — Bulk Update')
-    .setDescription(lines.join('\n'))
-    .setFooter({ text: `Alliance #${alliance.id} • ${op}` })
-    .setColor(op === 'add' ? Colors.Green : Colors.Red);
+    .setTitle(`🏦 Alliance Treasury — #${alliance.id}`)
+    .setColor(Colors.Blurple)
+    .addFields(
+      {
+        name: 'Applied',
+        value: results.map(r => fmtAdjLine(r.k, r.delta)).join(' · '),
+        inline: false,
+      },
+      {
+        name: 'New totals',
+        value: totalsLine,
+        inline: false,
+      }
+    );
 
-  return i.editReply({ embeds: [embed] });
+  await i.reply({ embeds: [embed] });
 }
