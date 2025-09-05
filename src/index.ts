@@ -13,12 +13,7 @@ import { PrismaClient, WithdrawStatus } from '@prisma/client';
 import { seal, open } from './lib/crypto.js';
 import { RES_EMOJI, ORDER } from './lib/emojis.js';
 import { fetchBankrecs } from './lib/pnw.js';
-import { extraCommandsJSON, findCommandByName } from './commands/registry';
-import { buildCommandsFinal, tryExecuteRegistry } from './commands/registry_runtime';
-
-// Import external command modules (one time only)
-import * as treasury from './commands/treasury';
-import * as treasury_add from './commands/treasury_add';
+import { extraCommandsJSON as registryCommandsJSON, findCommandByName } from './commands/registry';
 
 const log = pino({ level: process.env.LOG_LEVEL || 'info' });
 const prisma = new PrismaClient();
@@ -102,19 +97,18 @@ const baseCommands = [
 // Convert to JSON for registration
 const baseCommandsJSON = baseCommands.map(c => c.toJSON());
 
-// Pull in external modules' .data as JSON
-const extraCommandsJSON = [treasury, treasury_add]
-  .filter((m: any) => m?.data?.toJSON)
-  .map((m: any) => m.data.toJSON());
-
-// Combine + de-duplicate by name (prevents Discord 50035 duplicate-name error)
+// --- combine base + registry (dedupe by name) ---
 const commands = (() => {
   const seen = new Set<string>();
-  return [...baseCommandsJSON, ...extraCommandsJSON].filter((c: any) => {
-    if (seen.has(c.name)) return false;
-    seen.add(c.name);
-    return true;
-  });
+  const out: any[] = [];
+  for (const c of [...baseCommandsJSON, ...registryCommandsJSON]) {
+    const name = (c as any)?.name;
+    if (!name) continue;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    out.push(c as any);
+  }
+  return out;
 })();
 
 async function register() {
@@ -130,7 +124,14 @@ async function register() {
       await rest.put(Routes.applicationCommands(appId), { body: commands });
       log.info('Global slash commands registered');
     }
-  } catch (e) { log.error(e); }
+  } catch (e: any) {
+    // Quiet down super-noisy validation dumps while still surfacing the issue
+    if (e?.code === 50035) {
+      log.warn({ err: e?.message }, 'Slash command registration validation error (50035)');
+    } else {
+      log.error({ err: e }, 'Slash command registration failed');
+    }
+  }
 }
 
 client.once('ready', async () => {
@@ -171,13 +172,15 @@ client.on('interactionCreate', async (i: Interaction) => {
       if (i.commandName === 'withdraw_set') return handleWithdrawSet(i);
       if (i.commandName === 'safekeeping_edit') return handleSafekeepingStart(i);
 
-      // Wire new commands exactly once
-      if (i.commandName === 'treasury') return (treasury as any).execute(i);
-      if (i.commandName === 'treasury_add') return (treasury_add as any).execute(i);
-
+      // Generic fallback: executes any command module registered via ./commands/registry
+      {
+        const m = findCommandByName(i.commandName);
+        if (m && typeof (m as any).execute === 'function') {
+          return (m as any).execute(i as any);
+        }
+      }
     } else if (i.isModalSubmit()) {
       if (i.customId.startsWith('wd:modal:')) return handleWithdrawPagedModal(i as any);
-      // Removed legacy handleWithdrawModalSubmit (not defined)
       if (i.customId.startsWith('alliancekeys:')) return handleAllianceModal(i as any);
       if (i.customId.startsWith('sk:modal:')) return handleSafekeepingModalSubmit(i as any);
 
