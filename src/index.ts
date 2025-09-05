@@ -13,7 +13,7 @@ import { PrismaClient, WithdrawStatus } from '@prisma/client';
 import { seal, open } from './lib/crypto.js';
 import { RES_EMOJI, ORDER } from './lib/emojis.js';
 import { fetchBankrecs } from './lib/pnw.js';
-import { extraCommandsJSON as registryCommandsJSON, findCommandByName } from './commands/registry';
+import { extraCommandsJSON, findCommandByName } from './commands/registry';
 
 const log = pino({ level: process.env.LOG_LEVEL || 'info' });
 const prisma = new PrismaClient();
@@ -97,16 +97,16 @@ const baseCommands = [
 // Convert to JSON for registration
 const baseCommandsJSON = baseCommands.map(c => c.toJSON());
 
-// --- combine base + registry (dedupe by name) ---
+// Combine + de-duplicate by name (base + registry)
 const commands = (() => {
   const seen = new Set<string>();
+  const all = [...baseCommandsJSON, ...extraCommandsJSON];
   const out: any[] = [];
-  for (const c of [...baseCommandsJSON, ...registryCommandsJSON]) {
-    const name = (c as any)?.name;
-    if (!name) continue;
-    if (seen.has(name)) continue;
-    seen.add(name);
-    out.push(c as any);
+  for (const c of all) {
+    if (!c?.name) continue;
+    if (seen.has(c.name)) continue;
+    seen.add(c.name);
+    out.push(c);
   }
   return out;
 })();
@@ -124,14 +124,7 @@ async function register() {
       await rest.put(Routes.applicationCommands(appId), { body: commands });
       log.info('Global slash commands registered');
     }
-  } catch (e: any) {
-    // Quiet down super-noisy validation dumps while still surfacing the issue
-    if (e?.code === 50035) {
-      log.warn({ err: e?.message }, 'Slash command registration validation error (50035)');
-    } else {
-      log.error({ err: e }, 'Slash command registration failed');
-    }
-  }
+  } catch (e) { log.error(e); }
 }
 
 client.once('ready', async () => {
@@ -160,8 +153,6 @@ const skSessions: Map<string, { targetMemberId: number, data: Record<string, num
 client.on('interactionCreate', async (i: Interaction) => {
   try {
     if (i.isChatInputCommand()) {
-      log.info({ cmd: i.commandName, user: (i as any).user?.id }, 'CMD_RCVD');
-
       if (i.commandName === 'setup_alliance') return handleSetupAlliance(i);
       if (i.commandName === 'set_review_channel') return handleSetReviewChannel(i);
       if (i.commandName === 'link_nation') return handleLinkNation(i);
@@ -172,13 +163,14 @@ client.on('interactionCreate', async (i: Interaction) => {
       if (i.commandName === 'withdraw_set') return handleWithdrawSet(i);
       if (i.commandName === 'safekeeping_edit') return handleSafekeepingStart(i);
 
-      // Generic fallback: executes any command module registered via ./commands/registry
+      // Fallback for commands defined in ./commands (registry)
       {
         const m = findCommandByName(i.commandName);
         if (m && typeof (m as any).execute === 'function') {
           return (m as any).execute(i as any);
         }
       }
+
     } else if (i.isModalSubmit()) {
       if (i.customId.startsWith('wd:modal:')) return handleWithdrawPagedModal(i as any);
       if (i.customId.startsWith('alliancekeys:')) return handleAllianceModal(i as any);
@@ -202,6 +194,8 @@ client.on('interactionCreate', async (i: Interaction) => {
 });
 
 // ---------- Slash handlers ----------
+// (UNCHANGED CONTENT FROM HERE DOWN EXCEPT ONE small type tweak in pnwAutoPay)
+
 async function handleSetupAlliance(i: ChatInputCommandInteraction) {
   const allianceId = i.options.getInteger('alliance_id', true);
   const modal = new ModalBuilder().setCustomId(`alliancekeys:${allianceId}`).setTitle('Alliance API Key');
@@ -271,7 +265,7 @@ async function handleBalance(i: ChatInputCommandInteraction) {
   await i.reply({ embeds: [embed], ephemeral: true });
 }
 
-// ---- Withdraw flow (paged: modal pages of ORDER by 5) ----
+// ---- Withdraw flow (paged) ----
 const WD_PAGE_SIZE = 5;
 function wdPageCountAll() { return Math.ceil(ORDER.length / WD_PAGE_SIZE); }
 function wdSliceAll(page: number) { const s = page * WD_PAGE_SIZE; return ORDER.slice(s, s + WD_PAGE_SIZE); }
@@ -603,12 +597,12 @@ async function handleApprovalButton(i: ButtonInteraction) {
   }
 }
 
-// ---- Minimal PnW bankWithdraw helper (POST + headers) ----
+// ---- Minimal PnW bankWithdraw helper ----
 async function pnwAutoPay(opts: {
   apiKey: string; botKey: string; receiverNationId: number;
   payload: Record<string, number>; note?: string;
 }): Promise<boolean> {
-  const fields = Object.entries(opts.payload)
+  const fields: string[] = Object.entries(opts.payload)
     .filter(([, v]) => Number(v) > 0)
     .map(([k, v]) => `${k}:${Number(v)}`);
   if (opts.note) fields.push(`note:${JSON.stringify(opts.note)}`);
@@ -640,7 +634,6 @@ function skPageCountAll() { return Math.ceil(ORDER.length / SK_PAGE_SIZE); }
 function skSliceAll(page: number) { const s = page * SK_PAGE_SIZE; return ORDER.slice(s, s + SK_PAGE_SIZE); }
 
 async function handleSafekeepingStart(i: ChatInputCommandInteraction) {
-  // Immediate ack to avoid timeouts
   await i.deferReply({ ephemeral: true });
 
   const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
@@ -654,12 +647,10 @@ async function handleSafekeepingStart(i: ChatInputCommandInteraction) {
   const member = await prisma.member.findFirst({ where: { allianceId: alliance.id, discordId: target.id }, include: { balance: true } });
   if (!member) return i.editReply({ content: 'That user is not linked in this alliance.' });
 
-  // Ensure a safekeeping row exists
   if (!member.balance) {
     await prisma.safekeeping.create({ data: { memberId: member.id } });
   }
 
-  // start/clear session for this admin
   skSessions.set(i.user.id, { targetMemberId: member.id, data: {}, createdAt: Date.now() });
 
   const embed = new EmbedBuilder()
@@ -686,12 +677,10 @@ async function handleSafekeepingOpenPaged(i: any) {
     return i.reply({ content: 'Session expired. Run /safekeeping_edit again.', ephemeral: true });
   }
 
-  // Show a modal for this page
   return skOpenModalPaged(i as ButtonInteraction, memberId, page, total);
 }
 
 async function skOpenModalPaged(i: ButtonInteraction, memberId: number, page: number, total: number) {
-  // Load current balance of the target member (not the button clicker)
   const member = await prisma.member.findUnique({ where: { id: memberId }, include: { balance: true } });
   if (!member) return i.reply({ content: 'Member not found.', ephemeral: true });
   const bal: any = member.balance as any || {};
@@ -713,7 +702,6 @@ async function skOpenModalPaged(i: ButtonInteraction, memberId: number, page: nu
 }
 
 async function handleSafekeepingModalSubmit(i: any) {
-  // customId: sk:modal:<memberId>:<page>
   const m = String(i.customId).match(/^sk:modal:(\d+):(\d+)$/);
   if (!m) return;
   const memberId = Number(m[1]);
@@ -737,7 +725,6 @@ async function handleSafekeepingModalSubmit(i: any) {
   }
   skSessions.set(i.user.id, sess);
 
-  // Build navigation + Done
   const btns: ButtonBuilder[] = [];
   if (page > 0) btns.push(new ButtonBuilder().setCustomId(`sk:open:${memberId}:${page - 1}`).setStyle(ButtonStyle.Secondary).setLabel(`◀ Prev (${page}/${total})`));
   btns.push(new ButtonBuilder().setCustomId(`sk:open:${memberId}:${page}`).setStyle(ButtonStyle.Primary).setLabel(`Open Page ${page + 1}/${total}`));
@@ -756,7 +743,6 @@ async function handleSafekeepingDone(i: any) {
   const sess = skSessions.get(i.user.id);
   if (!sess) return i.reply({ content: 'Session expired. Run /safekeeping_edit again.', ephemeral: true });
 
-  // Apply absolute sets for provided keys only
   const target = await prisma.member.findUnique({ where: { id: sess.targetMemberId }, include: { balance: true } });
   if (!target) return i.reply({ content: 'Target member not found.', ephemeral: true });
 
@@ -863,7 +849,6 @@ cron.schedule('*/2 * * * *', async () => {
               create: { memberId: member.id },
             });
 
-            // DM with FULL breakdown
             try {
               const user = await client.users.fetch(member.discordId);
               const lines: string[] = [];
