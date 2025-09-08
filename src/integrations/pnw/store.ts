@@ -5,32 +5,49 @@ import { encryptToString } from "../../utils/secret";
 const prisma = new PrismaClient();
 
 /**
- * Save (or update) an alliance's PnW API key, encrypted at rest.
- * Assumes a composite unique on (allianceId, provider) named `allianceId_provider`.
- * If your schema uses a different unique name, we’ll adjust the `where` in Step 2.
+ * Store (or update) an alliance's PnW API key, encrypted at rest.
+ * Your AllianceKey schema uses:
+ *   - encryptedApiKey: Bytes
+ *   - nonceApi: Bytes
+ *   - addedBy: String
+ * There is no "provider" column and allianceId is not unique.
  */
 export async function saveAlliancePnwKey(params: {
   allianceId: number;
   apiKey: string;
   actorDiscordId?: string;
 }) {
-  const provider = "pnw";
-  const encrypted = encryptToString(params.apiKey);
+  // Encrypt with AES-GCM. Our helper returns base64 of [IV(12)][TAG(16)][CIPHERTEXT].
+  const packedB64 = encryptToString(params.apiKey);
+  const packed = Buffer.from(packedB64, "base64");
+  const iv = packed.subarray(0, 12); // store the IV separately in nonceApi
 
-  const row = await prisma.allianceKey.upsert({
-    // If this throws about an unknown unique, tell me the error and we’ll tweak this shape.
-    where: { allianceId_provider: { allianceId: params.allianceId, provider } } as any,
-    create: {
-      allianceId: params.allianceId,
-      provider,
-      key: encrypted,
-      // createdByDiscordId: params.actorDiscordId ?? null, // uncomment if you have these columns
-    } as any,
-    update: {
-      key: encrypted,
-      // updatedByDiscordId: params.actorDiscordId ?? null,
-    } as any,
+  // Find existing row by allianceId; if found, update by id
+  const existing = await prisma.allianceKey.findFirst({
+    where: { allianceId: params.allianceId },
   });
 
-  return { id: row.id, allianceId: row.allianceId, provider: row.provider };
+  if (existing) {
+    const row = await prisma.allianceKey.update({
+      where: { id: existing.id },
+      data: {
+        encryptedApiKey: packed,
+        nonceApi: iv,
+        // If you track updater, uncomment the next line and ensure the column exists:
+        // addedBy: params.actorDiscordId ?? existing.addedBy,
+      } as any,
+    });
+    return { id: row.id, allianceId: row.allianceId };
+  }
+
+  // Otherwise create a new row
+  const row = await prisma.allianceKey.create({
+    data: {
+      allianceId: params.allianceId,
+      encryptedApiKey: packed,
+      nonceApi: iv,
+      addedBy: params.actorDiscordId ?? "discord",
+    } as any,
+  });
+  return { id: row.id, allianceId: row.allianceId };
 }
