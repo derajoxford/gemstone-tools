@@ -5,7 +5,6 @@ import {
 } from 'discord.js';
 import { PrismaClient } from '@prisma/client';
 import { RES_EMOJI, ORDER } from '../lib/emojis.js';
-import { addToTreasury, getTreasury } from '../utils/treasury';
 
 const prisma = new PrismaClient();
 const RES_SET = new Set(ORDER as readonly string[]);
@@ -36,7 +35,7 @@ export async function execute(i: ChatInputCommandInteraction) {
     return i.editReply({ content: 'This server is not linked. Run **/setup_alliance** first.' });
   }
 
-  // Parse payload
+  // Parse & validate payload
   const raw = i.options.getString('payload', true);
   let payload: Record<string, number>;
   try {
@@ -48,29 +47,40 @@ export async function execute(i: ChatInputCommandInteraction) {
     return i.editReply({ content: 'Payload must be a JSON object of {resource:number}.' });
   }
 
-  // Clean & validate entries
-  const adj: Record<string, number> = {};
+  const deltas: Record<string, number> = {};
   for (const [k0, v0] of Object.entries(payload)) {
     const k = String(k0).toLowerCase();
-    if (!RES_SET.has(k)) {
-      return i.editReply({ content: `Unknown resource: **${k}**.` });
-    }
+    if (!RES_SET.has(k)) return i.editReply({ content: `Unknown resource: **${k}**.` });
     const n = Number(v0);
     if (!Number.isFinite(n) || n === 0) continue; // ignore zeros/bad
-    adj[k] = n;
+    deltas[k] = n;
   }
-  const entries = Object.entries(adj);
+  const entries = Object.entries(deltas);
   if (!entries.length) return i.editReply({ content: 'Nothing to adjust.' });
 
-  // Apply changes (3-arg signature)
-  for (const [k, delta] of entries) {
-    await addToTreasury(alliance.id, k as any, delta);
-  }
+  // Apply changes atomically
+  const updated = await prisma.$transaction(async (tx) => {
+    // ensure row exists
+    const current =
+      (await tx.allianceTreasury.findUnique({ where: { allianceId: alliance.id } })) ??
+      (await tx.allianceTreasury.create({ data: { allianceId: alliance.id, balances: {} } }));
 
-  // Show result
-  const t = await getTreasury(alliance.id);
-  const balances = (t?.balances ?? {}) as Record<string, number>;
+    const balances: Record<string, number> = { ...(current.balances as any || {}) };
+    for (const [k, delta] of entries) {
+      const prev = Number(balances[k] || 0);
+      const next = prev + Number(delta);
+      balances[k] = Number.isFinite(next) ? next : prev;
+    }
+
+    return tx.allianceTreasury.update({
+      where: { allianceId: alliance.id },
+      data: { balances },
+    });
+  });
+
+  // Render nice embed
   const changes = entries.map(([k, d]) => fmtChange(k, d)).join(' · ');
+  const balances = (updated.balances as any) as Record<string, number>;
   const lines = ORDER.map(k => {
     const v = Number(balances[k] || 0);
     const e = (RES_EMOJI as any)[k] || '';
