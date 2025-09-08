@@ -20,58 +20,80 @@ export const data = new SlashCommandBuilder()
   .setName('treasury_bulk')
   .setDescription('Adjust multiple resources in the alliance treasury using JSON')
   .addStringOption(o =>
-    o.setName('payload')
-      .setDescription('e.g. {"money":1000000,"steel":500,"munitions":-10}')
+    o
+      .setName('payload')
+      .setDescription('e.g. {"money": 1000000, "steel": 500, "munitions": -10}')
       .setRequired(true)
   )
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
 
 export async function execute(i: ChatInputCommandInteraction) {
-  const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
-  if (!alliance) {
-    return i.reply({ content: 'This server is not linked yet. Run **/setup_alliance** first.', ephemeral: true });
+  // Permissions guard
+  if (!i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+    return i.reply({ content: 'You need Manage Server to use this.', ephemeral: true });
   }
 
-  let raw: any;
+  // Alliance for this guild
+  const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
+  if (!alliance) {
+    return i.reply({ content: 'This server is not linked yet. Run /setup_alliance first.', ephemeral: true });
+  }
+
+  // Parse JSON payload
+  let body: Record<string, unknown>;
   try {
-    raw = JSON.parse(i.options.getString('payload', true));
+    body = JSON.parse(i.options.getString('payload', true));
   } catch {
     return i.reply({ content: 'Invalid JSON. Example: `{"money":1000000,"steel":500,"munitions":-10}`', ephemeral: true });
   }
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
-    return i.reply({ content: 'Payload must be a JSON object of {resource:number}.', ephemeral: true });
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return i.reply({ content: 'Payload must be a JSON object of resource→amount.', ephemeral: true });
   }
 
-  const adjustments: Record<string, number> = {};
-  for (const [k0, v0] of Object.entries(raw)) {
-    const k = String(k0).toLowerCase();
-    const n = Number(v0);
-    if (!RES_SET.has(k as any)) return i.reply({ content: `Unknown resource: \`${k}\`.`, ephemeral: true });
-    if (!Number.isFinite(n) || n === 0) continue;
-    adjustments[k] = n; // positive add, negative subtract
-  }
-  if (!Object.keys(adjustments).length) {
-    return i.reply({ content: 'Nothing to change. Provide non-zero amounts.', ephemeral: true });
+  // Collect adjustments
+  const deltas: Array<[string, number]> = [];
+  const unknown: string[] = [];
+  const nonNums: string[] = [];
+
+  for (const [k, v] of Object.entries(body)) {
+    if (!RES_SET.has(k)) { unknown.push(k); continue; }
+    const n = Number(v);
+    if (!Number.isFinite(n) || n === 0) { nonNums.push(k); continue; }
+    deltas.push([k, n]); // positive = add, negative = subtract
   }
 
-  for (const [k, delta] of Object.entries(adjustments)) {
-    await addToTreasury(alliance.id, k as any, delta); // 3-arg signature: id, resource, +/-delta
+  if (!deltas.length) {
+    const warn = [
+      unknown.length ? `Unknown keys: ${unknown.join(', ')}` : '',
+      nonNums.length ? `Invalid/zero amounts: ${nonNums.join(', ')}` : ''
+    ].filter(Boolean).join('\n');
+    return i.reply({ content: warn || 'Nothing to change.', ephemeral: true });
   }
 
-  const t = await getTreasury(alliance.id);
-  const totalsLine =
-    ORDER.map(k => {
-      const v = Number((t.balances as any)[k] || 0);
+  // Apply adjustments
+  for (const [k, delta] of deltas) {
+    await addToTreasury(prisma, alliance.id, k as any, delta); // prisma-first signature
+  }
+
+  // Show results
+  const t = await getTreasury(prisma, alliance.id); // prisma-first signature
+  const adjLines = deltas.map(([k, v]) => fmtAdjLine(k, v)).join(' · ');
+
+  const totals = ORDER
+    .map((k) => {
+      const v = Number((t as any)[k] || 0);
       return v ? `${(RES_EMOJI as any)[k] || ''} **${k}**: ${v.toLocaleString()}` : undefined;
-    }).filter(Boolean).join(' · ') || '—';
+    })
+    .filter(Boolean)
+    .join(' · ') || '—';
 
   const embed = new EmbedBuilder()
     .setTitle(`🏦 Alliance Treasury — #${alliance.id}`)
-    .setColor(Colors.Blurple)
     .addFields(
-      { name: 'Applied', value: Object.entries(adjustments).map(([k, v]) => fmtAdjLine(k, v)).join(' · '), inline: false },
-      { name: 'New totals', value: totalsLine, inline: false },
-    );
+      { name: 'Adjustments Applied', value: adjLines, inline: false },
+      { name: 'New Totals', value: totals, inline: false },
+    )
+    .setColor(Colors.Blurple);
 
-  await i.reply({ embeds: [embed] });
+  return i.reply({ embeds: [embed], ephemeral: true });
 }
