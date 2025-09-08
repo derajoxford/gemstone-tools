@@ -1,6 +1,6 @@
 // src/integrations/pnw/store.ts
 import { PrismaClient } from "@prisma/client";
-import { encryptToString } from "../../utils/secret";
+import { encryptToString, decryptFromString } from "../../utils/secret";
 
 const prisma = new PrismaClient();
 
@@ -20,7 +20,7 @@ export async function saveAlliancePnwKey(params: {
   // Encrypt with AES-GCM. Our helper returns base64 of [IV(12)][TAG(16)][CIPHERTEXT].
   const packedB64 = encryptToString(params.apiKey);
   const packed = Buffer.from(packedB64, "base64");
-  const iv = packed.subarray(0, 12); // store the IV separately in nonceApi
+  const iv = packed.subarray(0, 12); // store the IV separately in nonceApi (optional)
 
   // Find existing row by allianceId; if found, update by id
   const existing = await prisma.allianceKey.findFirst({
@@ -33,8 +33,7 @@ export async function saveAlliancePnwKey(params: {
       data: {
         encryptedApiKey: packed,
         nonceApi: iv,
-        // If you track updater, uncomment the next line and ensure the column exists:
-        // addedBy: params.actorDiscordId ?? existing.addedBy,
+        // addedBy: params.actorDiscordId ?? existing.addedBy, // uncomment if desired and column exists
       } as any,
     });
     return { id: row.id, allianceId: row.allianceId };
@@ -50,4 +49,16 @@ export async function saveAlliancePnwKey(params: {
     } as any,
   });
   return { id: row.id, allianceId: row.allianceId };
+}
+
+/**
+ * Retrieve and decrypt the alliance's PnW API key.
+ * Returns null if not found.
+ */
+export async function getAlliancePnwKey(allianceId: number): Promise<string | null> {
+  const row = await prisma.allianceKey.findFirst({ where: { allianceId } });
+  if (!row?.encryptedApiKey) return null;
+  // We stored raw bytes; convert back to base64 for the decrypt helper.
+  const packedB64 = Buffer.from(row.encryptedApiKey as any).toString("base64");
+  return decryptFromString(packedB64);
 }
