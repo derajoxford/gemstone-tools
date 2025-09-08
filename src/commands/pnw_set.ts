@@ -57,7 +57,6 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     const lines: string[] = [];
     lines.push("✅ **Alliance linked to PnW key.**");
     lines.push(`Alliance ID: \`${saved.allianceId}\``);
-    lines.push(`Provider: \`${saved.provider}\``);
     lines.push("");
     lines.push(`Validation: preview returned \`${preview.count}\` tax-related bank record(s) in the recent window.`);
 
