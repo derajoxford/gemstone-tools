@@ -4,6 +4,7 @@ import * as treasury_add from './treasury_add';
 import * as treasury_bulk from './treasury_bulk';
 import * as pnw_preview from './pnw_preview';
 import * as pnw_set from './pnw_set';
+import * as pnw_preview_stored from './pnw_preview_stored';
 
 export type CommandModule = {
   data?: { name?: string; toJSON?: () => any };
@@ -16,6 +17,7 @@ export const commandModules: CommandModule[] = [
   treasury_bulk,
   pnw_preview,
   pnw_set,
+  pnw_preview_stored,
 ].filter((m) => m?.data && m?.execute);
 
 export const extraCommandsJSON = commandModules
