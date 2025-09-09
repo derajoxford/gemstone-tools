@@ -3,9 +3,7 @@ import { pnwQuery } from "./query";
 import { getAllianceReadKey } from "./store";
 import { addToTreasury } from "../../utils/treasury";
 
-/**
- * --- TYPES ---
- */
+/** --- TYPES --- */
 export type ResourceDelta = Record<string, number>;
 
 export type PreviewArgs = {
@@ -39,54 +37,47 @@ export type ApplyResult = {
   mode: "apply" | "noop";
 };
 
-/**
- * --- HELPERS ---
- * Fetch recent bank records for the alliance, newest-first.
- * NOTE: PnW GraphQL returns a paginator for `alliances`, so we read from `.data[0]`.
- * Also, `alliances` expects `ids: [Int]`, not a single `id: Int`.
- */
+/** --- HELPERS --- */
 async function fetchBankrecsSince(apiKey: string, allianceId: number, sinceId?: number | null) {
+  // PnW GraphQL:
+  // - alliances(id: Int!) returns a list of Alliance (not a paginator)
+  // - bankrecs(after: Int, limit: Int, orderBy?: Enum) returns a list (no ".data")
   const query = `
-    query AllianceBankrecs($ids: [Int!]!, $after: Int) {
-      alliances(ids: $ids, first: 1) {
-        data {
+    query AllianceBankrecs($id: Int!, $after: Int, $limit: Int) {
+      alliances(id: $id) {
+        id
+        bankrecs(after: $after, limit: $limit) {
           id
-          bankrecs(after_id: $after, sort: "id", order: "DESC", first: 100) {
-            data {
-              id
-              note
-              type
-              sender_type
-              receiver_type
-              money
-              food
-              munitions
-              gasoline
-              steel
-              aluminum
-              oil
-              uranium
-              bauxite
-              coal
-              iron
-              lead
-              created_at
-            }
-          }
+          note
+          type
+          sender_type
+          receiver_type
+          money
+          food
+          munitions
+          gasoline
+          steel
+          aluminum
+          oil
+          uranium
+          bauxite
+          coal
+          iron
+          lead
+          date
         }
       }
     }
   ` as const;
 
-  const variables = { ids: [Number(allianceId)], after: sinceId ?? null };
+  const variables = { id: Number(allianceId), after: sinceId ?? null, limit: 100 };
   const data: any = await pnwQuery<any>(apiKey, query, variables);
 
-  // Path: alliances (paginator) -> data[0] (Alliance) -> bankrecs (paginator) -> data[] (records)
-  const recs =
-    data?.alliances?.data?.[0]?.bankrecs?.data ??
-    [];
+  // alliances returns an array; pick the first
+  const alliance = Array.isArray(data?.alliances) ? data?.alliances[0] : data?.alliances;
+  const recs: any[] = Array.isArray(alliance?.bankrecs) ? alliance.bankrecs : [];
 
-  // Filter to tax-related credits. Adjust if your schema exposes a specific flag/type.
+  // Filter to tax-related credits. Adjust if your API exposes a dedicated discriminator.
   const taxy = recs.filter((r: any) => {
     const t = (r?.type ?? "").toString().toLowerCase();
     const note = (r?.note ?? "").toString();
@@ -121,28 +112,19 @@ function sumDelta(recs: any[]): PreviewResult {
   return { count: recs.length, newestId, delta };
 }
 
-/**
- * --- PUBLIC API (manual-key) ---
- * Used by /pnw_set to validate a user-entered key BEFORE we store it.
- */
+/** --- PUBLIC (manual-key) --- */
 export async function previewAllianceTaxCredits(args: PreviewArgs): Promise<PreviewResult> {
   const recs = await fetchBankrecsSince(args.apiKey, args.allianceId, args.sinceId ?? null);
   return sumDelta(recs);
 }
 
-/**
- * --- PUBLIC API (stored-key wrappers) ---
- * These NEVER use env fallbacks; they require the per-alliance stored key.
- */
+/** --- PUBLIC (stored-key wrappers) --- */
 export async function previewAllianceTaxCreditsStored(allianceId: number, sinceId?: number | null) {
   const apiKey = await getAllianceReadKey(allianceId); // throws if missing/undecryptable
   return previewAllianceTaxCredits({ apiKey, allianceId, sinceId: sinceId ?? null });
 }
 
-/**
- * Apply: fetch tax records after lastSeenId, compute delta, and (optionally) add to treasury.
- * Returns what it did, plus newestId so callers can advance a cursor.
- */
+/** Apply previewed delta to treasury (optionally) and return summary */
 export async function applyAllianceTaxCreditsStored(
   args: ApplyArgsStored
 ): Promise<ApplyResult> {
