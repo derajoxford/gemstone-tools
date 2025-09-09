@@ -73,3 +73,9 @@ export async function readPnwApplyLogs(limit = 50): Promise<PnwApplyLogEntry[]> 
   const list = await readJSON<PnwApplyLogEntry[]>(LOG_FILE, []);
   return list.slice(-limit);
 }
+
+// Alias used by /pnw_logs command
+export async function getPnwLogs(limit = 50) {
+  return readPnwApplyLogs(limit);
+}
+
