@@ -4,23 +4,25 @@ import {
   ChatInputCommandInteraction,
   PermissionFlagsBits,
 } from "discord.js";
-import { getAllianceTaxIds, setAllianceTaxIds, clearAllianceTaxIds } from "../utils/pnw_cursor";
+import { getPnwTaxIds, setPnwTaxIds, clearAllianceTaxIds } from "../utils/pnw_cursor";
 import { getAllianceReadKey } from "../integrations/pnw/store";
 import { pnwQuery } from "../integrations/pnw/query";
 
 // -------- helpers --------
 function parseIdList(s: string): number[] {
-  return s
-    .split(/[\s,]+/)
-    .map((t) => t.trim())
-    .filter(Boolean)
-    .map((t) => Number(t))
-    .filter((n) => Number.isInteger(n) && n >= 0);
+  const uniq = new Set(
+    s
+      .split(/[\s,]+/)
+      .map((t) => t.trim())
+      .filter(Boolean)
+      .map((t) => Number(t))
+      .filter((n) => Number.isInteger(n) && n >= 0),
+  );
+  return [...uniq].sort((a, b) => a - b);
 }
 
 async function sniffTaxIdsUsingStoredKey(allianceId: number, lookbackLimit = 250) {
-  // We only need tax_id values; keep the query minimal to reduce fragility.
-  // NOTE: Different PnW schema versions exist; this variant avoids after/DateTime args.
+  // Lean query: we only need tax_id
   const query = `
     query SniffTaxIds($id: Int!, $limit: Int!) {
       alliances(id: $id) {
@@ -43,10 +45,9 @@ async function sniffTaxIdsUsingStoredKey(allianceId: number, lookbackLimit = 250
     if (!tid) continue;
     counts.set(tid, (counts.get(tid) ?? 0) + 1);
   }
-  // Sort by frequency desc
   return [...counts.entries()]
     .sort((a, b) => b[1] - a[1])
-    .map(([id, n]) => ({ id, count: n }));
+    .map(([id, count]) => ({ id, count }));
 }
 
 function fmtList(nums: number[]) {
@@ -108,7 +109,6 @@ export const data = new SlashCommandBuilder()
         o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
       ),
   )
-  // only members who can manage guild can change filters
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .setDMPermission(false);
 
@@ -143,7 +143,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     }
 
     if (sub === "get") {
-      const ids = await getAllianceTaxIds(allianceId);
+      const ids = await getPnwTaxIds(allianceId);
       await interaction.editReply(
         `Stored tax_id filter for **${allianceId}**: ${fmtList(ids ?? [])}`,
       );
@@ -157,7 +157,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
         await interaction.editReply("Please provide at least one integer tax_id.");
         return;
       }
-      await setAllianceTaxIds(allianceId, ids);
+      await setPnwTaxIds(allianceId, ids);
       await interaction.editReply(
         `Saved tax_id filter for **${allianceId}**: ${fmtList(ids)}\n` +
           "Future previews/apply will only count bankrecs whose `tax_id` is in this list.",
