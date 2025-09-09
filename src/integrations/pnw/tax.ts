@@ -3,14 +3,13 @@ import { pnwQuery } from "./query";
 import { getAllianceReadKey } from "./store";
 import { addToTreasury } from "../../utils/treasury";
 
-/** --- TYPES --- */
+// ----- Types -----
 export type ResourceDelta = Record<string, number>;
 
 export type PreviewArgs = {
   apiKey: string;
   allianceId: number;
-  /** Optional lower cursor (exclusive): only records with id > sinceId are considered */
-  sinceId?: number | null;
+  sinceId?: number | null; // exclusive
 };
 
 export type PreviewResult = {
@@ -21,9 +20,7 @@ export type PreviewResult = {
 
 export type ApplyArgsStored = {
   allianceId: number;
-  /** Optional lower cursor (exclusive) */
-  lastSeenId?: number | null;
-  /** If false, just preview and do not add to treasury */
+  lastSeenId?: number | null; // exclusive
   confirm?: boolean;
 };
 
@@ -37,24 +34,40 @@ export type ApplyResult = {
   mode: "apply" | "noop";
 };
 
-/** --- HELPERS --- */
-async function fetchBankrecsSince(
-  apiKey: string,
-  allianceId: number,
-  sinceId?: number | null
-) {
-  // alliances(id: [Int]) -> { data { id bankrecs(...) { ... } } }
-  // bankrecs accepts "or_id: [Int]" (list). We OMIT the arg when sinceId is not provided.
+// ----- Internal helpers -----
+type Bankrec = {
+  id: number;
+  note?: string | null;
+  stype?: string | null; // sender type
+  rtype?: string | null; // receiver type
+  tax_id?: number | null;
+  money?: number; food?: number; munitions?: number; gasoline?: number; steel?: number; aluminum?: number;
+  oil?: number; uranium?: number; bauxite?: number; coal?: number; iron?: number; lead?: number;
+  date?: string;
+};
+
+function isTaxCredit(r: Bankrec): boolean {
+  if (r.tax_id != null) return true;                                     // explicit flag when present
+  if ((r.rtype ?? "").toLowerCase() === "alliance" &&
+      (r.stype ?? "").toLowerCase() === "nation") return true;            // nation -> alliance deposits
+  if (/\btax\b/i.test(String(r.note ?? ""))) return true;                 // textual fallback
+  return false;
+}
+
+async function fetchBankrecsSince(apiKey: string, allianceId: number, sinceId?: number | null) {
+  // Keep the query simple and broad; paginate client-side if needed.
   const query = `
-    query AllianceBankrecs($ids: [Int], $or_id: [Int], $limit: Int) {
+    query AllianceBankrecs($ids: [Int], $limit: Int) {
       alliances(id: $ids) {
         data {
           id
-          bankrecs(or_id: $or_id, limit: $limit) {
+          bankrecs(limit: $limit) {
             id
+            date
             note
             stype
             rtype
+            tax_id
             money
             food
             munitions
@@ -67,47 +80,40 @@ async function fetchBankrecsSince(
             coal
             iron
             lead
-            date
           }
         }
       }
     }
   ` as const;
 
-  const variables: Record<string, unknown> = {
-    ids: [Number(allianceId)],
-    limit: 100,
-    ...(sinceId != null ? { or_id: [Number(sinceId)] } : {}), // ← omit when not provided
-  };
+  const data = await pnwQuery<any>(apiKey, query, { ids: [allianceId], limit: 250 });
+  const all: Bankrec[] = data?.alliances?.data?.[0]?.bankrecs ?? [];
 
-  const data = await pnwQuery<any>(apiKey, query, variables);
+  // newest first
+  all.sort((a, b) => (b.id ?? 0) - (a.id ?? 0));
 
-  const alliance = Array.isArray(data?.alliances?.data) ? data.alliances.data[0] : null;
-  const recs: any[] = Array.isArray(alliance?.bankrecs) ? alliance.bankrecs : [];
+  // apply cursor client-side (exclusive)
+  const afterCursor = sinceId != null ? all.filter(r => (r.id ?? 0) > Number(sinceId)) : all;
 
-  // Heuristic: tax deposits usually include "tax" in the note.
-  const taxy = recs.filter((r: any) => /\btax\b/i.test(String(r?.note ?? "")));
+  // keep only tax-like credits to the alliance
+  const taxy = afterCursor.filter(isTaxCredit);
 
   return taxy;
 }
 
-function sumDelta(recs: any[]): PreviewResult {
+function sumDelta(recs: Bankrec[]): PreviewResult {
   let newestId: number | null = null;
   const delta: ResourceDelta = {};
+  const fields = [
+    "money","food","munitions","gasoline","steel","aluminum",
+    "oil","uranium","bauxite","coal","iron","lead",
+  ] as const;
 
   for (const r of recs) {
-    const rid = Number(r?.id ?? 0);
-    if (Number.isFinite(rid) && (newestId === null || rid > newestId)) {
-      newestId = rid;
-    }
-
-    const fields = [
-      "money", "food", "munitions", "gasoline", "steel", "aluminum",
-      "oil", "uranium", "bauxite", "coal", "iron", "lead",
-    ] as const;
-
+    const rid = Number(r.id ?? 0);
+    if (Number.isFinite(rid) && (newestId === null || rid > newestId)) newestId = rid;
     for (const f of fields) {
-      const v = Number(r?.[f] ?? 0);
+      const v = Number((r as any)[f] ?? 0);
       if (!v) continue;
       delta[f] = (delta[f] ?? 0) + v;
     }
@@ -116,27 +122,21 @@ function sumDelta(recs: any[]): PreviewResult {
   return { count: recs.length, newestId, delta };
 }
 
-/** --- PUBLIC (manual-key) --- */
+// ----- Public API (manual key) -----
 export async function previewAllianceTaxCredits(args: PreviewArgs): Promise<PreviewResult> {
   const recs = await fetchBankrecsSince(args.apiKey, args.allianceId, args.sinceId ?? null);
   return sumDelta(recs);
 }
 
-/** --- PUBLIC (stored-key wrappers) --- */
-export async function previewAllianceTaxCreditsStored(
-  allianceId: number,
-  sinceId?: number | null
-) {
-  const apiKey = await getAllianceReadKey(allianceId); // throws if missing/undecryptable
+// ----- Public API (stored key wrappers) -----
+export async function previewAllianceTaxCreditsStored(allianceId: number, sinceId?: number | null) {
+  const apiKey = await getAllianceReadKey(allianceId);
   return previewAllianceTaxCredits({ apiKey, allianceId, sinceId: sinceId ?? null });
 }
 
-/** Apply previewed delta to treasury (optionally) and return summary */
-export async function applyAllianceTaxCreditsStored(
-  args: ApplyArgsStored
-): Promise<ApplyResult> {
+export async function applyAllianceTaxCreditsStored(args: ApplyArgsStored): Promise<ApplyResult> {
   const { allianceId, lastSeenId = null, confirm = true } = args;
-  const apiKey = await getAllianceReadKey(allianceId); // throws if missing/undecryptable
+  const apiKey = await getAllianceReadKey(allianceId);
 
   const preview = await previewAllianceTaxCredits({ apiKey, allianceId, sinceId: lastSeenId });
   const applied = confirm && preview.count > 0 && Object.keys(preview.delta).length > 0;
