@@ -4,29 +4,38 @@ import {
   ChatInputCommandInteraction,
   PermissionFlagsBits,
 } from "discord.js";
-import { getAllianceTaxIds, setPnwTaxIds, clearAllianceTaxIds } from "../utils/pnw_cursor";
 import { getAllianceReadKey } from "../integrations/pnw/store";
 import { pnwQuery } from "../integrations/pnw/query";
+import {
+  getAllowedTaxIds,
+  setAllowedTaxIds,
+  clearAllowedTaxIds,
+} from "../utils/pnw_tax_ids";
 
 // -------- helpers --------
 function parseIdList(s: string): number[] {
-  const uniq = new Set(
-    s
-      .split(/[\s,]+/)
-      .map((t) => t.trim())
-      .filter(Boolean)
-      .map((t) => Number(t))
-      .filter((n) => Number.isInteger(n) && n >= 0),
-  );
-  return [...uniq].sort((a, b) => a - b);
+  return s
+    .split(/[\s,]+/)
+    .map((t) => t.trim())
+    .filter(Boolean)
+    .map((t) => Number(t))
+    .filter((n) => Number.isInteger(n) && n >= 0);
+}
+
+function pickAllianceNode(node: any): any | null {
+  // Some schemas return an array for alliances(id: X), others a single object.
+  if (!node) return null;
+  if (Array.isArray(node)) return node[0] ?? null;
+  return node;
 }
 
 async function sniffTaxIdsUsingStoredKey(allianceId: number, lookbackLimit = 250) {
+  // Keep the query minimal & schema-friendly: no "ids", no after/or_id.
   const query = `
     query SniffTaxIds($id: Int!, $limit: Int!) {
       alliances(id: $id) {
         id
-        bankrecs(limit: $limit) {
+        bankrecs(limit: $limit, orderBy: "id desc") {
           id
           tax_id
         }
@@ -37,7 +46,8 @@ async function sniffTaxIdsUsingStoredKey(allianceId: number, lookbackLimit = 250
   const apiKey = await getAllianceReadKey(allianceId);
   const data: any = await pnwQuery(apiKey, query, { id: allianceId, limit: lookbackLimit });
 
-  const recs: any[] = data?.alliances?.[0]?.bankrecs ?? [];
+  const alliancesNode = pickAllianceNode(data?.alliances);
+  const recs: any[] = alliancesNode?.bankrecs ?? [];
   const counts = new Map<number, number>();
   for (const r of recs) {
     const tid = Number(r?.tax_id ?? 0);
@@ -55,7 +65,7 @@ function fmtList(nums: number[]) {
 
 async function replyError(interaction: ChatInputCommandInteraction, err: unknown) {
   const msg = err instanceof Error ? err.message : String(err);
-  await interaction.editReply(`❌ ${msg}`);
+  try { await interaction.editReply(`❌ ${msg}`); } catch {}
   console.error("[/pnw_tax_ids] error:", err);
 }
 
@@ -71,11 +81,7 @@ export const data = new SlashCommandBuilder()
         o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
       )
       .addIntegerOption((o) =>
-        o
-          .setName("limit")
-          .setDescription("Bank records to scan (default 250)")
-          .setMinValue(50)
-          .setMaxValue(500),
+        o.setName("limit").setDescription("Bank records to scan (default 250)").setMinValue(50).setMaxValue(500),
       ),
   )
   .addSubcommand((s) =>
@@ -94,10 +100,7 @@ export const data = new SlashCommandBuilder()
         o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
       )
       .addStringOption((o) =>
-        o
-          .setName("ids")
-          .setDescription("Comma/space separated tax IDs (e.g. 12, 34 56)")
-          .setRequired(true),
+        o.setName("ids").setDescription("Comma/space separated tax IDs (e.g. 12, 34 56)").setRequired(true),
       ),
   )
   .addSubcommand((s) =>
@@ -134,7 +137,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
           `**Detected tax_id values:**`,
           lines,
           "",
-          "You can store a filter with:",
+          "Store a filter with:",
           `\`/pnw_tax_ids set alliance_id:${allianceId} ids:<list from above>\``,
         ].join("\n"),
       );
@@ -142,7 +145,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     }
 
     if (sub === "get") {
-      const ids = await getAllianceTaxIds(allianceId);
+      const ids = await getAllowedTaxIds(allianceId);
       await interaction.editReply(
         `Stored tax_id filter for **${allianceId}**: ${fmtList(ids ?? [])}`,
       );
@@ -156,7 +159,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
         await interaction.editReply("Please provide at least one integer tax_id.");
         return;
       }
-      await setPnwTaxIds(allianceId, ids);
+      await setAllowedTaxIds(allianceId, ids);
       await interaction.editReply(
         `Saved tax_id filter for **${allianceId}**: ${fmtList(ids)}\n` +
           "Future previews/apply will only count bankrecs whose `tax_id` is in this list.",
@@ -165,7 +168,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     }
 
     if (sub === "clear") {
-      await clearAllianceTaxIds(allianceId);
+      await clearAllowedTaxIds(allianceId);
       await interaction.editReply(`Cleared stored tax_id filter for **${allianceId}**.`);
       return;
     }
