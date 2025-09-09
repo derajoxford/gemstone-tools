@@ -1,8 +1,8 @@
 // scripts/pnw_apply_all.ts
-// Apply PnW taxes for ALL alliances that have a stored PnW key (provider:'pnw').
+// Apply PnW taxes for ALL alliances that have a stored AllianceKey row.
 // Uses auto-cursor per alliance and records logs. Safe to run hourly.
 // Usage:
-//   npx tsx scripts/pnw_apply_all.ts          (preview only)
+//   npx tsx scripts/pnw_apply_all.ts           (preview only)
 //   npx tsx scripts/pnw_apply_all.ts --confirm (apply + save cursor + log)
 
 import { PrismaClient } from "@prisma/client";
@@ -22,8 +22,8 @@ const prisma = new PrismaClient();
 (async () => {
   const { confirm } = parseArgs();
 
+  // NOTE: no `provider` column in your schema — fetch ALL AllianceKey rows.
   const keys = await prisma.allianceKey.findMany({
-    where: { provider: "pnw" },
     select: { allianceId: true },
   });
 
