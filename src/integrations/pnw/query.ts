@@ -1,41 +1,56 @@
 // src/integrations/pnw/query.ts
 /**
- * Minimal Politics & War GraphQL client.
- * Call: pnwQuery(apiKey, query, variables?)
- *
- * We deliberately bypass any legacy wrappers so arg order is unambiguous.
+ * Thin GraphQL client for Politics & War.
+ * - Sends key via ?api_key=...
+ * - Drops null/undefined variables (some resolvers 500 on nulls)
+ * - Surfaces GraphQL error messages clearly
  */
-const BASE = "https://api.politicsandwar.com/graphql";
 
-export async function pnwQuery<T = any>(
+type GraphQLErrorItem = { message: string; path?: (string | number)[]; extensions?: any };
+type GraphQLResponse<T> = { data?: T; errors?: GraphQLErrorItem[] };
+
+function cleanVars(input?: Record<string, unknown>) {
+  if (!input) return undefined;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(input)) {
+    if (v === null || v === undefined) continue;
+    out[k] = v;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+export async function pnwQuery<T>(
   apiKey: string,
   query: string,
   variables?: Record<string, unknown>
 ): Promise<T> {
-  if (!apiKey) {
-    throw new Error("Missing PnW apiKey");
-  }
+  const url = `https://api.politicsandwar.com/graphql?api_key=${encodeURIComponent(apiKey)}`;
 
-  const url = `${BASE}?api_key=${encodeURIComponent(apiKey)}`;
-  const res = await fetch(url, {
+  const resp = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ query, variables }),
+    body: JSON.stringify({
+      query,
+      variables: cleanVars(variables),
+    }),
   });
 
-  // Network / HTTP error
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`PnW HTTP ${res.status} ${res.statusText}${text ? ` — ${text}` : ""}`);
+  const text = await resp.text();
+  let parsed: GraphQLResponse<T>;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error(`PnW GraphQL returned non-JSON (status ${resp.status}): ${text}`);
   }
 
-  const json = await res.json().catch(() => ({} as any));
-
-  // GraphQL errors
-  if (json?.errors?.length) {
-    const msg = json.errors.map((e: any) => e?.message || "GraphQL error").join("; ");
-    throw new Error(msg);
+  if (!resp.ok || (parsed.errors && parsed.errors.length)) {
+    const msgs = (parsed.errors || []).map(e => e.message).join(" | ");
+    throw new Error(`PnW GraphQL error (status ${resp.status}): ${msgs || text}`);
   }
 
-  return json?.data as T;
+  if (!parsed.data) {
+    throw new Error(`PnW GraphQL: empty 'data' (status ${resp.status})`);
+  }
+
+  return parsed.data;
 }
