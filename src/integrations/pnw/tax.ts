@@ -43,10 +43,12 @@ async function fetchBankrecsSince(
   allianceId: number,
   sinceId?: number | null
 ) {
-  // alliances returns an AlliancePaginator; read from `.data`
-  // For ID-based pagination use `or_id` (NOT `after`, which wants a DateTime).
+  // NOTE:
+  // - alliances argument name is "id" but type is [Int] (list)
+  // - bankrecs ID-based pagination uses "or_id: [Int]"
+  // - bankrec fields: stype/rtype; timestamp is "date"
   const query = `
-    query AllianceBankrecs($ids: [Int], $or_id: Int, $limit: Int) {
+    query AllianceBankrecs($ids: [Int], $or_id: [Int], $limit: Int) {
       alliances(id: $ids) {
         data {
           id
@@ -76,17 +78,16 @@ async function fetchBankrecsSince(
 
   const variables = {
     ids: [Number(allianceId)],
-    or_id: sinceId ?? null,
+    or_id: sinceId != null ? [Number(sinceId)] : null, // <-- list, not Int
     limit: 100,
   };
 
   const data: any = await pnwQuery<any>(apiKey, query, variables);
 
-  // alliances is a paginator -> { data: [Alliance, ...] }
   const alliance = Array.isArray(data?.alliances?.data) ? data.alliances.data[0] : null;
   const recs: any[] = Array.isArray(alliance?.bankrecs) ? alliance.bankrecs : [];
 
-  // Filter to tax-related credits. Most reliable signal is the note including "tax".
+  // Heuristic: tax deposits usually include "tax" in the note.
   const taxy = recs.filter((r: any) => /\btax\b/i.test(String(r?.note ?? "")));
 
   return taxy;
