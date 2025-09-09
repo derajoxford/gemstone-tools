@@ -2,7 +2,7 @@
 // Apply PnW taxes for ALL alliances that have a stored AllianceKey row.
 // Uses auto-cursor per alliance and records logs. Safe to run hourly.
 // Usage:
-//   npx tsx scripts/pnw_apply_all.ts           (preview only)
+//   npx tsx scripts/pnw_apply_all.ts           (preview only; still logs a heartbeat)
 //   npx tsx scripts/pnw_apply_all.ts --confirm (apply + save cursor + log)
 
 import { PrismaClient } from "@prisma/client";
@@ -22,7 +22,7 @@ const prisma = new PrismaClient();
 (async () => {
   const { confirm } = parseArgs();
 
-  // NOTE: no `provider` column in your schema — fetch ALL AllianceKey rows.
+  // NOTE: your schema has no `provider` column—fetch all AllianceKey rows
   const keys = await prisma.allianceKey.findMany({
     select: { allianceId: true },
   });
@@ -43,6 +43,16 @@ const prisma = new PrismaClient();
     try {
       const apiKey = await getAlliancePnwKey(allianceId);
       if (!apiKey) {
+        // Still log a heartbeat for visibility: “no stored key”
+        await appendPnwApplyLog(allianceId, {
+          ts: new Date().toISOString(),
+          actorId: "systemd",
+          actorTag: "systemd",
+          fromCursor: null,
+          toCursor: null,
+          records: 0,
+          delta: {}, // will render as "_no deltas_" in /pnw_logs
+        });
         summary.push({
           allianceId,
           lastSeenId: null,
@@ -65,9 +75,10 @@ const prisma = new PrismaClient();
       const nonZeroDelta: Record<string, number> = {};
       for (const [k, v] of Object.entries(preview.delta)) if (v) nonZeroDelta[k] = v;
 
-      const shouldApply = confirm && Object.keys(nonZeroDelta).length > 0;
+      const willApply = confirm && Object.keys(nonZeroDelta).length > 0;
 
-      if (shouldApply) {
+      if (willApply) {
+        // Apply and advance cursor
         await addToTreasury(allianceId, preview.delta as Record<string, number>, {
           source: "pnw",
           kind: "tax",
@@ -78,6 +89,7 @@ const prisma = new PrismaClient();
           await setPnwCursor(allianceId, preview.newestId);
         }
 
+        // Log the successful apply
         await appendPnwApplyLog(allianceId, {
           ts: new Date().toISOString(),
           actorId: "systemd",
@@ -87,6 +99,17 @@ const prisma = new PrismaClient();
           records: preview.count,
           delta: nonZeroDelta,
         });
+      } else {
+        // Heartbeat log: either preview mode or nothing to apply
+        await appendPnwApplyLog(allianceId, {
+          ts: new Date().toISOString(),
+          actorId: "systemd",
+          actorTag: confirm ? "systemd/no-op" : "systemd/preview",
+          fromCursor: storedCursor ?? null,
+          toCursor: preview.newestId ?? null,
+          records: preview.count,
+          delta: {}, // keep logs terse; deltas are zero or not applied
+        });
       }
 
       summary.push({
@@ -95,9 +118,23 @@ const prisma = new PrismaClient();
         newestId: preview.newestId ?? null,
         records: preview.count,
         delta: nonZeroDelta,
-        applied: shouldApply,
+        applied: willApply,
       });
     } catch (err: any) {
+      // Log the error as a heartbeat with zero delta
+      try {
+        await appendPnwApplyLog(allianceId, {
+          ts: new Date().toISOString(),
+          actorId: "systemd",
+          actorTag: "systemd/error",
+          fromCursor: null,
+          toCursor: null,
+          records: 0,
+          delta: {},
+        });
+      } catch {
+        // ignore secondary logging errors
+      }
       summary.push({
         allianceId,
         lastSeenId: null,
@@ -107,7 +144,6 @@ const prisma = new PrismaClient();
         applied: false,
         error: err?.message ?? String(err),
       });
-      // continue to next alliance
     }
   }
 
