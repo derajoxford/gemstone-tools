@@ -1,3 +1,4 @@
+// src/commands/pnw_apply.ts
 import {
   SlashCommandBuilder,
   PermissionFlagsBits,
@@ -7,43 +8,31 @@ import {
 import { getAlliancePnwKey } from "../integrations/pnw/store";
 import { previewAllianceTaxCredits } from "../integrations/pnw/tax";
 import { addToTreasury } from "../utils/treasury";
+import { getPnwCursor, setPnwCursor, appendPnwApplyLog } from "../utils/pnw_cursor";
 
 const RESOURCE_ORDER = [
-  "money",
-  "food",
-  "munitions",
-  "gasoline",
-  "aluminum",
-  "steel",
-  "oil",
-  "uranium",
-  "bauxite",
-  "coal",
-  "iron",
-  "lead",
+  "money","food","munitions","gasoline","aluminum","steel",
+  "oil","uranium","bauxite","coal","iron","lead",
 ] as const;
 
 function fmtNumber(n: number, opts?: { money?: boolean }) {
-  if (opts?.money) {
-    return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  }
-  return Math.round(n).toLocaleString();
+  return (opts?.money
+    ? n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+    : Math.round(n).toLocaleString()
+  );
 }
 
 export const data = new SlashCommandBuilder()
   .setName("pnw_apply")
-  .setDescription("Apply PnW tax credits to the Alliance Treasury (uses stored key).")
+  .setDescription("Apply PnW tax credits to the Alliance Treasury (auto-cursor & logs).")
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .addIntegerOption((opt) =>
-    opt
-      .setName("alliance_id")
-      .setDescription("PnW Alliance ID (numeric).")
-      .setRequired(true)
+    opt.setName("alliance_id").setDescription("PnW Alliance ID (numeric).").setRequired(true)
   )
   .addIntegerOption((opt) =>
     opt
       .setName("last_seen_id")
-      .setDescription("Only include bankrecs with id > this value (optional, for idempotency).")
+      .setDescription("Override: only include bankrecs with id > this value. Defaults to stored cursor.")
       .setRequired(false)
   )
   .addBooleanOption((opt) =>
@@ -57,51 +46,55 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   await interaction.deferReply({ ephemeral: true });
 
   const allianceId = interaction.options.getInteger("alliance_id", true);
-  const lastSeenIdVal = interaction.options.getInteger("last_seen_id", false);
+  const lastSeenIdOverride = interaction.options.getInteger("last_seen_id", false);
   const confirm = interaction.options.getBoolean("confirm", false) ?? false;
-  const lastSeenId = typeof lastSeenIdVal === "number" ? lastSeenIdVal : undefined;
 
   try {
     const apiKey = await getAlliancePnwKey(allianceId!);
     if (!apiKey) {
-      await interaction.editReply(
-        "No stored PnW key for this alliance. Use `/pnw_set` first to link and store one."
-      );
+      await interaction.editReply("No stored PnW key for this alliance. Use `/pnw_set` first.");
       return;
     }
 
-    // Compute strict tax delta (incoming to alliance, tax_id != null, > last_seen_id if provided)
+    // Auto-cursor unless user overrides
+    const storedCursor = await getPnwCursor(allianceId!);
+    const lastSeenId = typeof lastSeenIdOverride === "number" ? lastSeenIdOverride : storedCursor;
+
     const preview = await previewAllianceTaxCredits({
       apiKey,
       allianceId: allianceId!,
       lastSeenId,
     });
 
-    // Build a pretty embed
+    // Pretty embed
     const embed = new EmbedBuilder()
       .setTitle(confirm ? "PnW Tax Apply (Stored Key)" : "PnW Tax Apply — PREVIEW (Stored Key)")
       .setColor(confirm ? 0x0984e3 : 0xf9a825)
       .setDescription(
         [
           `**Alliance ID:** \`${allianceId}\``,
-          lastSeenId != null ? `**Filter:** bankrecs with \`id > ${lastSeenId}\`` : "",
+          lastSeenId != null
+            ? `**Cursor (using ${typeof lastSeenIdOverride === "number" ? "override" : "stored"})**: \`id > ${lastSeenId}\``
+            : "**Cursor:** _none_ (all available in recent window)",
           `**Records counted:** \`${preview.count}\``,
-          `**Newest bankrec id (cursor):** \`${preview.newestId ?? "none"}\``,
+          `**Newest bankrec id (next cursor):** \`${preview.newestId ?? "none"}\``,
           "",
-          "_This sums **incoming tax bank records** (to this alliance) from PnW’s recent window._",
-          "_This is **not** your current alliance bank balance._",
+          "_This sums **incoming tax bank records** (to this alliance). This is **not** your current bank balance._",
         ]
           .filter(Boolean)
           .join("\n")
       );
 
     // Delta field
+    const nonZeroDelta: Record<string, number> = {};
     const lines: string[] = [];
     for (const key of RESOURCE_ORDER) {
       const v = (preview.delta as any)[key] ?? 0;
       if (!v) continue;
+      nonZeroDelta[key] = v;
       lines.push(`• **${key}**: +${fmtNumber(v, { money: key === "money" })}`);
     }
+
     embed.addFields(
       lines.length
         ? [{ name: "Tax delta (sum)", value: lines.join("\n"), inline: false }]
@@ -112,26 +105,40 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       embed.addFields([{ name: "Warnings", value: preview.warnings.map((w) => `• ${w}`).join("\n") }]);
     }
 
-    // If not confirmed or nothing to apply, just show the preview with next-step hint.
+    // If not confirmed or nothing to apply, show preview only
     if (!confirm || lines.length === 0) {
       embed.setFooter({
         text:
           preview.newestId != null
-            ? `Preview only. To apply, rerun with confirm:true and last_seen_id:${lastSeenId ?? 0} (will apply up to ${preview.newestId}).`
+            ? `Preview only. If confirmed, cursor would be saved as ${preview.newestId}, and a log entry recorded.`
             : `Preview only. No new records to apply.`,
       });
       await interaction.editReply({ embeds: [embed] });
       return;
     }
 
-    // Apply: credit to Alliance Treasury via existing addToTreasury utility
-    const delta = preview.delta as Record<string, number>;
-    // Note: addToTreasury signature is tolerant; extra metadata is ignored if not supported.
-    await addToTreasury(allianceId!, delta, {
+    // Apply: credit to treasury
+    await addToTreasury(allianceId!, preview.delta as Record<string, number>, {
       source: "pnw",
       kind: "tax",
-      note: `Applied via /pnw_apply by ${interaction.user.tag} (${interaction.user.id}); cursor=${preview.newestId ?? "none"}`,
+      note: `Applied via /pnw_apply by ${interaction.user.tag} (${interaction.user.id}); fromCursor=${lastSeenId ?? "none"} toCursor=${preview.newestId ?? "none"}`,
     } as any);
+
+    // Persist new cursor (if any)
+    if (typeof preview.newestId === "number") {
+      await setPnwCursor(allianceId!, preview.newestId);
+    }
+
+    // Append log entry (always on confirm)
+    await appendPnwApplyLog(allianceId!, {
+      ts: new Date().toISOString(),
+      actorId: interaction.user.id,
+      actorTag: interaction.user.tag,
+      fromCursor: lastSeenId ?? null,
+      toCursor: preview.newestId ?? null,
+      records: preview.count,
+      delta: nonZeroDelta,
+    });
 
     embed.setColor(0x00b894);
     embed.addFields([
@@ -139,18 +146,17 @@ export async function execute(interaction: ChatInputCommandInteraction) {
         name: "Applied",
         value:
           preview.newestId != null
-            ? `✅ Credited to treasury. **Next cursor:** \`${preview.newestId}\`\nRerun later with \`last_seen_id:${preview.newestId}\` to avoid duplicates.`
-            : "✅ Credited to treasury.",
+            ? `✅ Credited to treasury. **Next cursor saved:** \`${preview.newestId}\`.\nLog recorded under _meta.pnw.logs.`
+            : "✅ Credited to treasury. Log recorded.",
         inline: false,
       },
     ]);
-    embed.setFooter({ text: "Tip: we’ll persist a cursor and add a timer next so this runs automatically." });
 
     await interaction.editReply({ embeds: [embed] });
   } catch (err: any) {
     await interaction.editReply(
       "Failed to apply PnW tax credits: " + (err?.message ?? String(err)) +
-      "\nIf this persists, try previewing with `/pnw_preview_stored` first."
+      "\nTry a preview first with `/pnw_preview_stored`."
     );
   }
 }
