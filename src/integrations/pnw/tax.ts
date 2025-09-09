@@ -1,89 +1,166 @@
 // src/integrations/pnw/tax.ts
-import { fetchAllianceBankrecs, type PnwBankrec } from "./client";
+import { pnwQuery } from "./client"; // whatever your client export is called
+import { getAllianceReadKey } from "./store";
+import { addToTreasury } from "../../utils/treasury";
+import { computeTreasuryDelta } from "../../utils/treasury_delta";
 
-type Resource =
-  | "money" | "food" | "munitions" | "gasoline" | "aluminum" | "steel"
-  | "coal" | "oil" | "uranium" | "iron" | "bauxite" | "lead";
+/**
+ * --- TYPES ---
+ */
+export type ResourceDelta = Record<string, number>;
 
-const RESOURCES: Resource[] = [
-  "money","food","munitions","gasoline","aluminum","steel",
-  "coal","oil","uranium","iron","bauxite","lead",
-];
-
-export type TaxPreview = {
-  count: number;            // number of bankrecs considered after filters
-  newestId: number | null;  // max id from the filtered set (cursor)
-  delta: Record<Resource, number>;
-  previewLines: string[];   // formatted "+resource: amount"
-  warnings: string[];
-};
-
-function isIncomingToAlliance(rec: PnwBankrec, allianceId: number): boolean {
-  return rec.receiver_type === 2 && rec.receiver_id === allianceId;
-}
-
-function positivePart(n: number): number {
-  return n > 0 ? n : 0;
-}
-
-export async function previewAllianceTaxCredits(params: {
+export type PreviewArgs = {
   apiKey: string;
   allianceId: number;
-  lastSeenId?: number;
-}): Promise<TaxPreview> {
-  const { apiKey, allianceId, lastSeenId } = params;
-  const bankrecs = await fetchAllianceBankrecs(apiKey, allianceId);
+  /** Optional lower cursor (exclusive): only records with id > sinceId are considered */
+  sinceId?: number | null;
+};
 
-  // Strict filters:
-  //  1) tax_id present (tax record),
-  //  2) incoming to this alliance (receiver_type == 2 and receiver_id == allianceId),
-  //  3) respects lastSeenId cursor when provided.
-  let recs = bankrecs.filter((r) => r.tax_id != null && isIncomingToAlliance(r, allianceId));
-  if (typeof lastSeenId === "number") {
-    recs = recs.filter((r) => r.id > lastSeenId);
-  }
+export type PreviewResult = {
+  count: number;
+  newestId: number | null;
+  delta: ResourceDelta;
+};
 
-  const newestId = recs.length ? Math.max(...recs.map((r) => r.id)) : null;
+export type ApplyArgsStored = {
+  allianceId: number;
+  /** Optional lower cursor (exclusive) */
+  lastSeenId?: number | null;
+  /** If false, just preview and do not add to treasury */
+  confirm?: boolean;
+};
 
-  const delta: Record<Resource, number> = Object.fromEntries(RESOURCES.map((k) => [k, 0])) as any;
+export type ApplyResult = {
+  allianceId: number;
+  lastSeenId: number | null;
+  newestId: number | null;
+  records: number;
+  delta: ResourceDelta;
+  applied: boolean;
+  mode: "apply" | "noop";
+};
+
+/**
+ * --- HELPERS ---
+ * We query recent bank records and filter to "tax-related" rows.
+ * Keep these simple so we can reuse for preview/apply.
+ */
+async function fetchBankrecsSince(apiKey: string, allianceId: number, sinceId?: number | null) {
+  // Minimal GraphQL; adjust fields to match your schema.
+  // We pull newest-first and page a bit; callers will sum/filter.
+  const query = `
+    query AllianceBankrecs($id: Int!, $after: Int) {
+      alliances(id: $id) {
+        id
+        bankrecs(after_id: $after, sort: "id", order: "DESC", first: 100) {
+          id
+          note
+          type
+          sender_type
+          receiver_type
+          money
+          food
+          munitions
+          gasoline
+          steel
+          aluminum
+          oil
+          uranium
+          bauxite
+          coal
+          iron
+          lead
+          created_at
+        }
+      }
+    }
+  ` as const;
+
+  const vars: any = { id: allianceId, after: sinceId ?? null };
+  const data: any = await pnwQuery(apiKey, query, vars);
+
+  const list =
+    data?.alliances?.[0]?.bankrecs?.filter((r: any) =>
+      // Heuristic: all automatic *tax* deposits that credit the alliance
+      // Tune this condition if your API exposes a dedicated "TAX" type.
+      (r?.type?.toLowerCase?.() ?? "").includes("tax") ||
+      /\btax\b/i.test(r?.note ?? "")
+    ) ?? [];
+
+  return list;
+}
+
+function sumDelta(recs: any[]): PreviewResult {
+  let newestId: number | null = null;
+  const delta: ResourceDelta = {};
 
   for (const r of recs) {
-    // Sum only the positive portion (incoming to the alliance)
-    delta.money     += positivePart(Number(r.money)     || 0);
-    delta.food      += positivePart(Number(r.food)      || 0);
-    delta.munitions += positivePart(Number(r.munitions) || 0);
-    delta.gasoline  += positivePart(Number(r.gasoline)  || 0);
-    delta.aluminum  += positivePart(Number(r.aluminum)  || 0);
-    delta.steel     += positivePart(Number(r.steel)     || 0);
-    delta.coal      += positivePart(Number(r.coal)      || 0);
-    delta.oil       += positivePart(Number(r.oil)       || 0);
-    delta.uranium   += positivePart(Number(r.uranium)   || 0);
-    delta.iron      += positivePart(Number(r.iron)      || 0);
-    delta.bauxite   += positivePart(Number(r.bauxite)   || 0);
-    delta.lead      += positivePart(Number(r.lead)      || 0);
+    if (typeof r.id === "number") {
+      if (newestId === null || r.id > newestId) newestId = r.id;
+    }
+    // Positive amounts represent credit to alliance
+    const resFields = [
+      "money","food","munitions","gasoline","steel","aluminum",
+      "oil","uranium","bauxite","coal","iron","lead",
+    ] as const;
+
+    for (const f of resFields) {
+      const v = Number(r[f] ?? 0);
+      if (!v) continue;
+      delta[f] = (delta[f] ?? 0) + v;
+    }
   }
 
-  const previewLines: string[] = [];
-  const moneyFmt = (n: number) => n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  const unitFmt  = (n: number) => Math.round(n).toLocaleString();
+  return { count: recs.length, newestId, delta };
+}
 
-  if (delta.money)     previewLines.push(`+money: ${moneyFmt(delta.money)}`);
-  if (delta.food)      previewLines.push(`+food: ${unitFmt(delta.food)}`);
-  if (delta.munitions) previewLines.push(`+munitions: ${unitFmt(delta.munitions)}`);
-  if (delta.gasoline)  previewLines.push(`+gasoline: ${unitFmt(delta.gasoline)}`);
-  if (delta.aluminum)  previewLines.push(`+aluminum: ${unitFmt(delta.aluminum)}`);
-  if (delta.steel)     previewLines.push(`+steel: ${unitFmt(delta.steel)}`);
-  if (delta.oil)       previewLines.push(`+oil: ${unitFmt(delta.oil)}`);
-  if (delta.uranium)   previewLines.push(`+uranium: ${unitFmt(delta.uranium)}`);
-  if (delta.bauxite)   previewLines.push(`+bauxite: ${unitFmt(delta.bauxite)}`);
-  if (delta.coal)      previewLines.push(`+coal: ${unitFmt(delta.coal)}`);
-  if (delta.iron)      previewLines.push(`+iron: ${unitFmt(delta.iron)}`);
-  if (delta.lead)      previewLines.push(`+lead: ${unitFmt(delta.lead)}`);
+/**
+ * --- PUBLIC API (manual-key) ---
+ * Used by /pnw_set to validate a user-entered key BEFORE we store it.
+ */
+export async function previewAllianceTaxCredits(args: PreviewArgs): Promise<PreviewResult> {
+  const recs = await fetchBankrecsSince(args.apiKey, args.allianceId, args.sinceId ?? null);
+  return sumDelta(recs);
+}
 
-  const warnings: string[] = [];
-  if (!recs.length) {
-    warnings.push("No incoming tax records found. If you just created a bracket, remember taxes post at turn change.");
+/**
+ * --- PUBLIC API (stored-key wrappers) ---
+ * These NEVER use env fallbacks; they require the per-alliance stored key.
+ */
+
+export async function previewAllianceTaxCreditsStored(allianceId: number, sinceId?: number | null) {
+  const apiKey = await getAllianceReadKey(allianceId); // throws if missing/undecryptable
+  return previewAllianceTaxCredits({ apiKey, allianceId, sinceId: sinceId ?? null });
+}
+
+/**
+ * Apply: fetch tax records after lastSeenId, compute delta, and (optionally) add to treasury.
+ * Returns what it did, plus newestId so callers can advance a cursor.
+ */
+export async function applyAllianceTaxCreditsStored(
+  args: ApplyArgsStored
+): Promise<ApplyResult> {
+  const { allianceId, lastSeenId = null, confirm = true } = args;
+  const apiKey = await getAllianceReadKey(allianceId); // throws if missing/undecryptable
+
+  const preview = await previewAllianceTaxCredits({ apiKey, allianceId, sinceId: lastSeenId });
+  const applied = confirm && preview.count > 0 && Object.keys(preview.delta).length > 0;
+
+  if (applied) {
+    // Reuse your existing treasury utility (creates/updates AllianceTreasury JSON balances).
+    await addToTreasury(allianceId, preview.delta, {
+      source: "pnw_tax",
+      meta: { lastSeenId, newestId: preview.newestId },
+    });
   }
 
-  return { count: recs.length, newestId, delta, previewLines, warnings };
+  return {
+    allianceId,
+    lastSeenId,
+    newestId: preview.newestId,
+    records: preview.count,
+    delta: preview.delta,
+    applied,
+    mode: applied ? "apply" : "noop",
+  };
 }
