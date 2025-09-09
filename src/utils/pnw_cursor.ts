@@ -138,4 +138,38 @@ export async function getPnwLogs(limit = 20): Promise<PnwApplyLogEntry[]> {
 
   return [];
 }
+// --- Summary channel storage (file-backed) ---
+import { promises as _fs } from "node:fs";
+import _path from "node:path";
+
+const _SUMMARY_DIR = _path.join(process.cwd(), "storage");
+const _SUMMARY_FILE = _path.join(_SUMMARY_DIR, "pnw-summary-channels.json");
+
+async function _loadSummaryMap(): Promise<Record<string, string>> {
+  try {
+    const raw = await _fs.readFile(_SUMMARY_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    return typeof parsed === "object" && parsed ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+async function _saveSummaryMap(map: Record<string, string>) {
+  await _fs.mkdir(_SUMMARY_DIR, { recursive: true });
+  await _fs.writeFile(_SUMMARY_FILE, JSON.stringify(map, null, 2), "utf8");
+}
+
+/** Return the stored Discord channel id to post PnW summaries for a given guild. */
+export async function getPnwSummaryChannel(guildId: string): Promise<string | null> {
+  const map = await _loadSummaryMap();
+  return map[guildId] ?? null;
+}
+
+/** Persist (or update) the summary channel id for a guild. */
+export async function setPnwSummaryChannel(guildId: string, channelId: string): Promise<void> {
+  const map = await _loadSummaryMap();
+  map[guildId] = channelId;
+  await _saveSummaryMap(map);
+}
 
