@@ -2,6 +2,7 @@
 import { pnwQuery } from "./query";
 import { getAllianceReadKey } from "./store";
 import { addToTreasury } from "../../utils/treasury";
+import { getAllowedTaxIds } from "../../utils/pnw_tax_ids";
 
 // ----- Types -----
 export type ResourceDelta = Record<string, number>;
@@ -47,15 +48,17 @@ type Bankrec = {
 };
 
 function isTaxCredit(r: Bankrec): boolean {
-  if (r.tax_id != null) return true;                                     // explicit flag when present
-  if ((r.rtype ?? "").toLowerCase() === "alliance" &&
-      (r.stype ?? "").toLowerCase() === "nation") return true;            // nation -> alliance deposits
-  if (/\btax\b/i.test(String(r.note ?? ""))) return true;                 // textual fallback
-  return false;
+  if (r.tax_id == null) return false;
+  const recvAlliance = (r.rtype ?? "").toLowerCase() === "alliance";
+  const sendNation   = (r.stype ?? "").toLowerCase() === "nation";
+  return recvAlliance && sendNation;
 }
 
-async function fetchBankrecsSince(apiKey: string, allianceId: number, sinceId?: number | null) {
-  // Keep the query simple and broad; paginate client-side if needed.
+async function fetchBankrecsSince(
+  apiKey: string,
+  allianceId: number,
+  sinceId?: number | null
+) {
   const query = `
     query AllianceBankrecs($ids: [Int], $limit: Int) {
       alliances(id: $ids) {
@@ -92,13 +95,18 @@ async function fetchBankrecsSince(apiKey: string, allianceId: number, sinceId?: 
   // newest first
   all.sort((a, b) => (b.id ?? 0) - (a.id ?? 0));
 
-  // apply cursor client-side (exclusive)
+  // cursor (exclusive)
   const afterCursor = sinceId != null ? all.filter(r => (r.id ?? 0) > Number(sinceId)) : all;
 
-  // keep only tax-like credits to the alliance
-  const taxy = afterCursor.filter(isTaxCredit);
+  // tax rows only
+  const taxOnly = afterCursor.filter(isTaxCredit);
 
-  return taxy;
+  // apply optional allowlist of tax IDs (multi-tier support)
+  const allow = await getAllowedTaxIds(allianceId);
+  if (allow.length === 0) return taxOnly;
+
+  const allowSet = new Set(allow.map(Number));
+  return taxOnly.filter(r => r.tax_id != null && allowSet.has(Number(r.tax_id)));
 }
 
 function sumDelta(recs: Bankrec[]): PreviewResult {
@@ -114,8 +122,7 @@ function sumDelta(recs: Bankrec[]): PreviewResult {
     if (Number.isFinite(rid) && (newestId === null || rid > newestId)) newestId = rid;
     for (const f of fields) {
       const v = Number((r as any)[f] ?? 0);
-      if (!v) continue;
-      delta[f] = (delta[f] ?? 0) + v;
+      if (v > 0) delta[f] = (delta[f] ?? 0) + v; // credits only
     }
   }
 
