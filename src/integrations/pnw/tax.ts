@@ -1,7 +1,7 @@
 // src/integrations/pnw/tax.ts
+import { pnwQuery } from "./query";            // use the wrapper, NOT ./client
 import { getAllianceReadKey } from "./store";
 import { addToTreasury } from "../../utils/treasury";
-import { pnwQuery } from "./query";
 import { getAllowedTaxIds } from "../../utils/pnw_tax_ids";
 
 export type ResourceDelta = Record<string, number>;
@@ -9,7 +9,8 @@ export type ResourceDelta = Record<string, number>;
 export type PreviewArgs = {
   apiKey: string;
   allianceId: number;
-  sinceId?: number | null; // only count bankrecs with id > sinceId
+  sinceId?: number | null;
+  allowedTaxIds?: number[];  // optional explicit filter
 };
 
 export type PreviewResult = {
@@ -20,8 +21,8 @@ export type PreviewResult = {
 
 export type ApplyArgsStored = {
   allianceId: number;
-  lastSeenId?: number | null; // exclusive lower bound
-  confirm?: boolean; // if false, preview only
+  lastSeenId?: number | null;
+  confirm?: boolean;
 };
 
 export type ApplyResult = {
@@ -34,71 +35,66 @@ export type ApplyResult = {
   mode: "apply" | "noop";
 };
 
-const RESOURCE_FIELDS = [
-  "money",
-  "food",
-  "munitions",
-  "gasoline",
-  "steel",
-  "aluminum",
-  "oil",
-  "uranium",
-  "bauxite",
-  "coal",
-  "iron",
-  "lead",
-] as const;
+function pickAllianceNode(node: any): any | null {
+  if (!node) return null;
+  if (Array.isArray(node)) return node[0] ?? null;
+  return node;
+}
 
-type Bankrec = {
-  id: number;
-  tax_id?: number | null;
-} & { [K in (typeof RESOURCE_FIELDS)[number]]?: number | null };
-
-async function fetchLatestBankrecs(
+// Pull newest-first (orderBy desc); we’ll do sinceId filtering client-side.
+async function fetchBankrecsChunk(
   apiKey: string,
   allianceId: number,
-  limit = 250,
-): Promise<Bankrec[]> {
-  // Use alliances(ids:[Int]) paginator → data[0].bankrecs
+  limit = 500
+): Promise<any[]> {
   const query = `
-    query AllianceBankrecs($ids: [Int!], $limit: Int!) {
-      alliances(ids: $ids) {
-        data {
+    query AllianceBankrecs($id: Int!, $limit: Int!) {
+      alliances(id: $id) {
+        id
+        bankrecs(limit: $limit, orderBy: "id desc") {
           id
-          bankrecs(limit: $limit) {
-            id
-            tax_id
-            money
-            food
-            munitions
-            gasoline
-            steel
-            aluminum
-            oil
-            uranium
-            bauxite
-            coal
-            iron
-            lead
-          }
+          date
+          note
+          stype
+          rtype
+          tax_id
+          money
+          food
+          munitions
+          gasoline
+          steel
+          aluminum
+          oil
+          uranium
+          bauxite
+          coal
+          iron
+          lead
         }
       }
     }
   ` as const;
 
-  const data: any = await pnwQuery(apiKey, query, { ids: [allianceId], limit });
-  return (data?.alliances?.data?.[0]?.bankrecs ?? []) as Bankrec[];
+  const data: any = await pnwQuery(apiKey, query, { id: allianceId, limit });
+  const alliancesNode = pickAllianceNode(data?.alliances);
+  const recs: any[] = alliancesNode?.bankrecs ?? [];
+  return recs;
 }
 
-function sumDelta(recs: Bankrec[]): PreviewResult {
+function sumDelta(recs: any[]): PreviewResult {
   let newestId: number | null = null;
   const delta: ResourceDelta = {};
 
   for (const r of recs) {
-    if (typeof r.id === "number") {
-      if (newestId === null || r.id > newestId) newestId = r.id;
-    }
-    for (const f of RESOURCE_FIELDS) {
+    const idNum = Number(r?.id ?? 0);
+    if (idNum && (newestId === null || idNum > newestId)) newestId = idNum;
+
+    const resFields = [
+      "money","food","munitions","gasoline","steel","aluminum",
+      "oil","uranium","bauxite","coal","iron","lead",
+    ] as const;
+
+    for (const f of resFields) {
       const v = Number(r[f] ?? 0);
       if (!v) continue;
       delta[f] = (delta[f] ?? 0) + v;
@@ -108,48 +104,54 @@ function sumDelta(recs: Bankrec[]): PreviewResult {
   return { count: recs.length, newestId, delta };
 }
 
-/** Manual-key preview */
 export async function previewAllianceTaxCredits(args: PreviewArgs): Promise<PreviewResult> {
-  const { apiKey, allianceId, sinceId = null } = args;
+  const { apiKey, allianceId, sinceId = null, allowedTaxIds } = args;
 
-  // Pull a recent window, then filter + aggregate locally to avoid schema drift on args like after/or_id
-  const recs = await fetchLatestBankrecs(apiKey, allianceId, 250);
+  const recs = await fetchBankrecsChunk(apiKey, allianceId, 500);
 
-  // Only tax records: if a whitelist is configured, honor it; otherwise require tax_id > 0
-  const allowed = await getAllowedTaxIds(allianceId);
+  // Only credit-to-alliance rows & only tax records.
   const filtered = recs.filter((r) => {
-    if (sinceId && r.id <= sinceId) return false;
-    const tid = Number(r.tax_id ?? 0);
-    if (!tid) return false;
-    return allowed.length ? allowed.includes(tid) : tid > 0;
+    const tid = Number(r?.tax_id ?? 0);
+    const creditToAlliance =
+      (r?.rtype?.toLowerCase?.() === "alliance") || (r?.receiver_type?.toLowerCase?.() === "alliance");
+    const isTax =
+      (allowedTaxIds && allowedTaxIds.length > 0) ? allowedTaxIds.includes(tid) : tid > 0;
+
+    const idOk = sinceId ? Number(r?.id ?? 0) > Number(sinceId) : true;
+    return creditToAlliance && isTax && idOk;
   });
 
   return sumDelta(filtered);
 }
 
-/** Stored-key wrapper: preview */
-export async function previewAllianceTaxCreditsStored(
-  allianceId: number,
-  sinceId?: number | null,
-) {
+// ---- Stored-key wrappers ----
+
+export async function previewAllianceTaxCreditsStored(allianceId: number, sinceId?: number | null) {
   const apiKey = await getAllianceReadKey(allianceId);
-  return previewAllianceTaxCredits({ apiKey, allianceId, sinceId: sinceId ?? null });
+  const allowed = await getAllowedTaxIds(allianceId); // may be empty
+  return previewAllianceTaxCredits({ apiKey, allianceId, sinceId: sinceId ?? null, allowedTaxIds: allowed });
 }
 
-/** Stored-key wrapper: apply */
 export async function applyAllianceTaxCreditsStored(
-  args: ApplyArgsStored,
+  args: ApplyArgsStored
 ): Promise<ApplyResult> {
   const { allianceId, lastSeenId = null, confirm = true } = args;
   const apiKey = await getAllianceReadKey(allianceId);
+  const allowed = await getAllowedTaxIds(allianceId);
 
-  const preview = await previewAllianceTaxCredits({ apiKey, allianceId, sinceId: lastSeenId });
+  const preview = await previewAllianceTaxCredits({
+    apiKey,
+    allianceId,
+    sinceId: lastSeenId,
+    allowedTaxIds: allowed,
+  });
+
   const applied = confirm && preview.count > 0 && Object.keys(preview.delta).length > 0;
 
   if (applied) {
     await addToTreasury(allianceId, preview.delta, {
       source: "pnw_tax",
-      meta: { lastSeenId, newestId: preview.newestId },
+      meta: { lastSeenId, newestId: preview.newestId, allowedTaxIds: allowed },
     });
   }
 
