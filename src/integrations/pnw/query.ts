@@ -1,52 +1,37 @@
 // src/integrations/pnw/query.ts
-import https from "node:https";
+// A resilient wrapper that finds a callable in ./client by several names
+// and falls back to the first exported function if needed.
+import * as client from "./client";
 
-type Params = { apiKey: string; query: string; variables?: Record<string, any> };
+function resolvePnW(): (apiKey: string, query: string, variables?: any) => Promise<any> {
+  const candidates = [
+    (client as any).pnwQuery,
+    (client as any).default,
+    (client as any).query,
+    (client as any).request,
+    (client as any).graphql,
+    (client as any).graphQL,
+    (client as any).gql,
+  ].filter(Boolean);
 
-/** Flexible call signature: pnwQuery(params) OR pnwQuery(apiKey, query, variables) */
-export function pnwQuery<T>(params: Params): Promise<T>;
-export function pnwQuery<T>(apiKey: string, query: string, variables?: Record<string, any>): Promise<T>;
-export function pnwQuery<T>(
-  a: string | Params,
-  b?: string,
-  c?: Record<string, any>
-): Promise<T> {
-  const { apiKey, query, variables } =
-    typeof a === "string" ? { apiKey: a, query: b!, variables: c } : a;
-
-  const body = JSON.stringify({ query, variables });
-
-  return new Promise<T>((resolve, reject) => {
-    const req = https.request(
-      {
-        hostname: "api.politicsandwar.com",
-        path: `/graphql?api_key=${encodeURIComponent(apiKey)}`,
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(body),
-        },
-      },
-      (res) => {
-        let data = "";
-        res.on("data", (c) => (data += c));
-        res.on("end", () => {
-          try {
-            const parsed = JSON.parse(data);
-            if (parsed?.errors?.length) {
-              return reject(new Error(parsed.errors.map((e: any) => e.message).join("; ")));
-            }
-            resolve(parsed.data as T);
-          } catch (err) {
-            reject(err);
-          }
-        });
+  // If none of the common names exist, try the first exported function
+  if (!candidates.length) {
+    for (const v of Object.values(client)) {
+      if (typeof v === "function") {
+        candidates.push(v);
+        break;
       }
-    );
-    req.on("error", reject);
-    req.write(body);
-    req.end();
-  });
+    }
+  }
+
+  const fn = candidates.find((f) => typeof f === "function");
+  if (!fn) {
+    throw new Error("PnW client export not found (looking for pnwQuery/default/etc).");
+  }
+  return fn as any;
 }
 
-export default pnwQuery;
+export async function pnwQuery(apiKey: string, query: string, variables?: any) {
+  const fn = resolvePnW();
+  return fn(apiKey, query, variables);
+}
