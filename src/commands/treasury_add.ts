@@ -6,8 +6,6 @@ import {
 } from "discord.js";
 import { getAllianceReadKey } from "../integrations/pnw/store";
 import { pnwQuery } from "../integrations/pnw/query";
-
-// Use the JSON-backed store (not prisma) for tax_id lists
 import {
   getAllowedTaxIds,
   setAllowedTaxIds,
@@ -25,8 +23,6 @@ function parseIdList(s: string): number[] {
 }
 
 async function sniffTaxIdsUsingStoredKey(allianceId: number, lookbackLimit = 250) {
-  // Most-stable PnW schema form: alliances(ids:[Int]) -> AlliancePaginator -> data[]
-  // Keep arguments minimal to avoid schema variant pitfalls.
   const query = `
     query SniffTaxIds($ids: [Int!], $limit: Int!) {
       alliances(ids: $ids) {
@@ -62,9 +58,7 @@ function fmtList(nums: number[]) {
 
 async function replyError(interaction: ChatInputCommandInteraction, err: unknown) {
   const msg = err instanceof Error ? err.message : String(err);
-  try {
-    await interaction.editReply(`❌ ${msg}`);
-  } catch {}
+  try { await interaction.editReply(`❌ ${msg}`); } catch {}
   console.error("[/pnw_tax_ids] error:", err);
 }
 
@@ -80,11 +74,7 @@ export const data = new SlashCommandBuilder()
         o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
       )
       .addIntegerOption((o) =>
-        o
-          .setName("limit")
-          .setDescription("Bank records to scan (default 250)")
-          .setMinValue(50)
-          .setMaxValue(500),
+        o.setName("limit").setDescription("Bank records to scan (default 250)").setMinValue(50).setMaxValue(500),
       ),
   )
   .addSubcommand((s) =>
@@ -103,10 +93,7 @@ export const data = new SlashCommandBuilder()
         o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
       )
       .addStringOption((o) =>
-        o
-          .setName("ids")
-          .setDescription("Comma/space separated tax IDs (e.g. 12, 34 56)")
-          .setRequired(true),
+        o.setName("ids").setDescription("Comma/space separated tax IDs (e.g. 12, 34 56)").setRequired(true),
       ),
   )
   .addSubcommand((s) =>
