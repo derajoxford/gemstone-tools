@@ -38,19 +38,23 @@ export type ApplyResult = {
 };
 
 /** --- HELPERS --- */
-async function fetchBankrecsSince(apiKey: string, allianceId: number, sinceId?: number | null) {
-  // NOTE: alliances returns an AlliancePaginator; read from `.data`
+async function fetchBankrecsSince(
+  apiKey: string,
+  allianceId: number,
+  sinceId?: number | null
+) {
+  // alliances returns an AlliancePaginator; read from `.data`
+  // For ID-based pagination use `or_id` (NOT `after`, which wants a DateTime).
   const query = `
-    query AllianceBankrecs($ids: [Int], $after: Int, $limit: Int) {
+    query AllianceBankrecs($ids: [Int], $or_id: Int, $limit: Int) {
       alliances(id: $ids) {
         data {
           id
-          bankrecs(after: $after, limit: $limit) {
+          bankrecs(or_id: $or_id, limit: $limit) {
             id
             note
-            type
-            sender_type
-            receiver_type
+            stype
+            rtype
             money
             food
             munitions
@@ -72,23 +76,18 @@ async function fetchBankrecsSince(apiKey: string, allianceId: number, sinceId?: 
 
   const variables = {
     ids: [Number(allianceId)],
-    after: sinceId ?? null,
+    or_id: sinceId ?? null,
     limit: 100,
   };
 
   const data: any = await pnwQuery<any>(apiKey, query, variables);
 
   // alliances is a paginator -> { data: [Alliance, ...] }
-  const list = Array.isArray(data?.alliances?.data) ? data.alliances.data : [];
-  const alliance = list[0];
+  const alliance = Array.isArray(data?.alliances?.data) ? data.alliances.data[0] : null;
   const recs: any[] = Array.isArray(alliance?.bankrecs) ? alliance.bankrecs : [];
 
-  // Filter to tax-related credits. Adjust if your API exposes a dedicated discriminator.
-  const taxy = recs.filter((r: any) => {
-    const t = (r?.type ?? "").toString().toLowerCase();
-    const note = (r?.note ?? "").toString();
-    return t.includes("tax") || /\btax\b/i.test(note);
-  });
+  // Filter to tax-related credits. Most reliable signal is the note including "tax".
+  const taxy = recs.filter((r: any) => /\btax\b/i.test(String(r?.note ?? "")));
 
   return taxy;
 }
@@ -125,7 +124,10 @@ export async function previewAllianceTaxCredits(args: PreviewArgs): Promise<Prev
 }
 
 /** --- PUBLIC (stored-key wrappers) --- */
-export async function previewAllianceTaxCreditsStored(allianceId: number, sinceId?: number | null) {
+export async function previewAllianceTaxCreditsStored(
+  allianceId: number,
+  sinceId?: number | null
+) {
   const apiKey = await getAllianceReadKey(allianceId); // throws if missing/undecryptable
   return previewAllianceTaxCredits({ apiKey, allianceId, sinceId: sinceId ?? null });
 }
