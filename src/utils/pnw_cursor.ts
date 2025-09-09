@@ -1,98 +1,48 @@
 // src/utils/pnw_cursor.ts
-import { PrismaClient } from "@prisma/client";
+import { promises as fs } from "node:fs";
+import path from "node:path";
 
-const prisma = new PrismaClient();
+const DATA_DIR = path.resolve(process.cwd(), ".data");
+const CURSORS_FILE = path.join(DATA_DIR, "pnw_cursors.json");
 
-export type PnwApplyLogEntry = {
-  ts: string;               // ISO timestamp
-  actorId: string;          // Discord user id
-  actorTag?: string;        // "name#1234" at apply time
-  fromCursor?: number | null;
-  toCursor?: number | null;
-  records: number;          // records counted/applied
-  delta: Record<string, number>; // non-zero deltas applied
-};
+type MapShape = Record<string, number>; // allianceId -> lastSeen bankrec id
 
-type Json = any;
-
-async function getBalancesObj(allianceId: number): Promise<Json> {
-  const row = await prisma.allianceTreasury.findUnique({ where: { allianceId } });
-  const b = (row?.balances ?? {}) as Json;
-  return typeof b === "object" && b !== null ? b : {};
-}
-
-async function saveBalancesObj(allianceId: number, balances: Json): Promise<void> {
-  const exists = await prisma.allianceTreasury.findUnique({ where: { allianceId } });
-  if (exists) {
-    await prisma.allianceTreasury.update({ where: { allianceId }, data: { balances } });
-  } else {
-    await prisma.allianceTreasury.create({ data: { allianceId, balances } });
+async function readMap(): Promise<MapShape> {
+  try {
+    const buf = await fs.readFile(CURSORS_FILE);
+    return JSON.parse(buf.toString()) as MapShape;
+  } catch {
+    return {};
   }
 }
 
-/** Read stored PnW cursor from balances._meta.pnw.cursor */
-export async function getPnwCursor(allianceId: number): Promise<number | undefined> {
-  const balances = await getBalancesObj(allianceId);
-  const cur = balances?._meta?.pnw?.cursor;
-  return typeof cur === "number" ? cur : undefined;
+async function writeMap(m: MapShape): Promise<void> {
+  await fs.mkdir(DATA_DIR, { recursive: true });
+  await fs.writeFile(CURSORS_FILE, JSON.stringify(m, null, 2));
 }
 
-/** Write PnW cursor to balances._meta.pnw.cursor (creates row if needed) */
-export async function setPnwCursor(allianceId: number, cursor: number | undefined): Promise<void> {
-  const balances = await getBalancesObj(allianceId);
-  const next = {
-    ...balances,
-    _meta: {
-      ...(balances._meta ?? {}),
-      pnw: { ...(balances._meta?.pnw ?? {}), cursor },
-    },
-  };
-  await saveBalancesObj(allianceId, next);
+/** Returns the last-seen bankrec id for this alliance, or null if none */
+export async function getAllianceCursor(allianceId: number): Promise<number | null> {
+  const m = await readMap();
+  const v = m[String(allianceId)];
+  return Number.isFinite(v) ? v : null;
 }
 
-/** Append an apply log entry under balances._meta.pnw.logs (keeps last 100) */
-export async function appendPnwApplyLog(allianceId: number, entry: PnwApplyLogEntry): Promise<void> {
-  const balances = await getBalancesObj(allianceId);
-  const prev: PnwApplyLogEntry[] = (balances?._meta?.pnw?.logs ?? []) as any[];
-  const logs = [...prev, entry];
-  while (logs.length > 100) logs.shift(); // keep last 100
-  const next = {
-    ...balances,
-    _meta: {
-      ...(balances._meta ?? {}),
-      pnw: { ...(balances._meta?.pnw ?? {}), logs },
-    },
-  };
-  await saveBalancesObj(allianceId, next);
+/** Stores the newest bankrec id we’ve processed for this alliance */
+export async function setAllianceCursor(allianceId: number, newestId: number): Promise<void> {
+  if (!Number.isFinite(newestId)) return;
+  const m = await readMap();
+  m[String(allianceId)] = newestId;
+  await writeMap(m);
 }
 
-/** Get the most recent N apply log entries (default 10) */
-export async function getPnwLogs(allianceId: number, limit = 10): Promise<PnwApplyLogEntry[]> {
-  const balances = await getBalancesObj(allianceId);
-  const prev: PnwApplyLogEntry[] = (balances?._meta?.pnw?.logs ?? []) as any[];
-  const slice = prev.slice(Math.max(0, prev.length - Math.min(limit, 50))); // hard cap 50
-  return slice.reverse(); // newest first
+/** Optional helpers used elsewhere */
+export async function clearAllianceCursor(allianceId: number): Promise<void> {
+  const m = await readMap();
+  delete m[String(allianceId)];
+  await writeMap(m);
 }
 
-/** Read the Discord channel id used for hourly summaries */
-export async function getPnwSummaryChannel(allianceId: number): Promise<string | undefined> {
-  const balances = await getBalancesObj(allianceId);
-  const id = balances?._meta?.pnw?.summaryChannelId;
-  return typeof id === "string" && id.length > 0 ? id : undefined;
-}
-
-/** Set/clear the Discord channel id for hourly summaries */
-export async function setPnwSummaryChannel(allianceId: number, channelId?: string): Promise<void> {
-  const balances = await getBalancesObj(allianceId);
-  const next = {
-    ...balances,
-    _meta: {
-      ...(balances._meta ?? {}),
-      pnw: {
-        ...(balances._meta?.pnw ?? {}),
-        summaryChannelId: channelId ?? undefined,
-      },
-    },
-  };
-  await saveBalancesObj(allianceId, next);
+export async function getAllCursors(): Promise<MapShape> {
+  return readMap();
 }
