@@ -1,8 +1,7 @@
 // src/integrations/pnw/tax.ts
-import pnwQuery from "./client";
+import { pnwQuery } from "./query";          // <- use the standalone GraphQL client
 import { getAllianceReadKey } from "./store";
 import { addToTreasury } from "../../utils/treasury";
-import { computeTreasuryDelta } from "../../utils/treasury_delta";
 
 /**
  * --- TYPES ---
@@ -46,8 +45,7 @@ export type ApplyResult = {
  * Keep these simple so we can reuse for preview/apply.
  */
 async function fetchBankrecsSince(apiKey: string, allianceId: number, sinceId?: number | null) {
-  // Minimal GraphQL; adjust fields to match your schema.
-  // We pull newest-first and page a bit; callers will sum/filter.
+  // Minimal GraphQL; tweak fields/filters if your schema differs.
   const query = `
     query AllianceBankrecs($id: Int!, $after: Int) {
       alliances(id: $id) {
@@ -81,8 +79,7 @@ async function fetchBankrecsSince(apiKey: string, allianceId: number, sinceId?: 
 
   const list =
     data?.alliances?.[0]?.bankrecs?.filter((r: any) =>
-      // Heuristic: all automatic *tax* deposits that credit the alliance
-      // Tune this condition if your API exposes a dedicated "TAX" type.
+      // Heuristic: automatic tax deposits that credit the alliance
       (r?.type?.toLowerCase?.() ?? "").includes("tax") ||
       /\btax\b/i.test(r?.note ?? "")
     ) ?? [];
@@ -127,7 +124,6 @@ export async function previewAllianceTaxCredits(args: PreviewArgs): Promise<Prev
  * --- PUBLIC API (stored-key wrappers) ---
  * These NEVER use env fallbacks; they require the per-alliance stored key.
  */
-
 export async function previewAllianceTaxCreditsStored(allianceId: number, sinceId?: number | null) {
   const apiKey = await getAllianceReadKey(allianceId); // throws if missing/undecryptable
   return previewAllianceTaxCredits({ apiKey, allianceId, sinceId: sinceId ?? null });
