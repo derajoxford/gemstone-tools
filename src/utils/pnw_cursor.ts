@@ -1,57 +1,75 @@
 // src/utils/pnw_cursor.ts
-import { promises as fs } from "node:fs";
-import { join } from "node:path";
+import { promises as fs } from "fs";
+import path from "path";
 
-const DATA_DIR = join(process.cwd(), "data");
-const CURSORS = join(DATA_DIR, "pnw_cursors.json");
-const LOGFILE = join(DATA_DIR, "pnw_apply.log");
+const DATA_DIR = path.join(process.cwd(), ".data");
+const CURSORS_FILE = path.join(DATA_DIR, "pnw_cursors.json");
+const LOG_FILE = path.join(DATA_DIR, "pnw_apply_log.json");
+const MAX_LOG_ENTRIES = 500;
 
 type CursorMap = Record<string, number | null>;
-type LogEntry = {
-  ts: string;
+type ResourceDelta = Record<string, number>;
+
+export type PnwApplyLogEntry = {
+  ts: string;                // ISO timestamp
   allianceId: number;
-  action: "noop" | "apply" | "error";
   lastSeenId: number | null;
   newestId: number | null;
   records: number;
-  delta?: Record<string, number>;
-  note?: string;
+  delta: ResourceDelta;
+  applied: boolean;
+  mode: "apply" | "noop";
 };
+
+// ---- tiny JSON helpers ------------------------------------------------------
 
 async function ensureDir() {
   await fs.mkdir(DATA_DIR, { recursive: true });
 }
 
-async function readCursors(): Promise<CursorMap> {
+async function readJSON<T>(file: string, fallback: T): Promise<T> {
   try {
-    const raw = await fs.readFile(CURSORS, "utf8");
-    return JSON.parse(raw) as CursorMap;
+    const buf = await fs.readFile(file);
+    return JSON.parse(buf.toString()) as T;
   } catch {
-    return {};
+    return fallback;
   }
 }
 
-async function writeCursors(map: CursorMap) {
+async function writeJSON(file: string, data: any) {
   await ensureDir();
-  await fs.writeFile(CURSORS, JSON.stringify(map, null, 2), "utf8");
+  const tmp = file + ".tmp";
+  await fs.writeFile(tmp, JSON.stringify(data, null, 2));
+  await fs.rename(tmp, file);
 }
 
-/** Get the last seen bankrec id for an alliance (or null if none) */
+// ---- public API used by /pnw_apply -----------------------------------------
+
+/** Read the saved cursor for an alliance (last applied bankrec id). */
 export async function getPnwCursor(allianceId: number): Promise<number | null> {
-  const map = await readCursors();
-  return map[String(allianceId)] ?? null;
+  const map = await readJSON<CursorMap>(CURSORS_FILE, {});
+  const k = String(allianceId);
+  return (k in map) ? (map[k] ?? null) : null;
 }
 
-/** Update the last seen bankrec id for an alliance */
-export async function setPnwCursor(allianceId: number, id: number | null): Promise<void> {
-  const map = await readCursors();
-  map[String(allianceId)] = id ?? null;
-  await writeCursors(map);
+/** Persist/advance the cursor for an alliance. */
+export async function setPnwCursor(allianceId: number, newestId: number | null): Promise<void> {
+  const map = await readJSON<CursorMap>(CURSORS_FILE, {});
+  map[String(allianceId)] = newestId ?? null;
+  await writeJSON(CURSORS_FILE, map);
 }
 
-/** Append a small JSON log line for observability */
-export async function appendPnwApplyLog(entry: LogEntry): Promise<void> {
-  await ensureDir();
-  const line = JSON.stringify(entry) + "\n";
-  await fs.appendFile(LOGFILE, line, "utf8");
+/** Append an apply log entry and keep only the latest MAX_LOG_ENTRIES. */
+export async function appendPnwApplyLog(entry: PnwApplyLogEntry): Promise<void> {
+  const list = await readJSON<PnwApplyLogEntry[]>(LOG_FILE, []);
+  list.push({ ...entry, ts: new Date().toISOString() });
+  if (list.length > MAX_LOG_ENTRIES) list.splice(0, list.length - MAX_LOG_ENTRIES);
+  await writeJSON(LOG_FILE, list);
+}
+
+// ---- optional helpers (if you later add a /pnw_logs command) ----------------
+
+export async function readPnwApplyLogs(limit = 50): Promise<PnwApplyLogEntry[]> {
+  const list = await readJSON<PnwApplyLogEntry[]>(LOG_FILE, []);
+  return list.slice(-limit);
 }
