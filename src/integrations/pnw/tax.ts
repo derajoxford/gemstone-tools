@@ -1,5 +1,5 @@
 // src/integrations/pnw/tax.ts
-import { pnwQuery } from "./client"; // whatever your client export is called
+import pnwQuery from "./client";
 import { getAllianceReadKey } from "./store";
 import { addToTreasury } from "../../utils/treasury";
 import { computeTreasuryDelta } from "../../utils/treasury_delta";
