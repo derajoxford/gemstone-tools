@@ -35,11 +35,9 @@ async function readKV(key: string): Promise<any | null> {
   }
   if (!row) return null;
 
-  // Prefer JSON-ish fields
   if (row.json !== undefined && row.json !== null) return row.json;
   if (row.valueJson !== undefined && row.valueJson !== null) return row.valueJson;
 
-  // String/opaque fields
   if (row.value !== undefined && row.value !== null) {
     if (typeof row.value === "string") {
       try { return JSON.parse(row.value); } catch { return row.value; }
@@ -66,10 +64,10 @@ async function writeKV(key: string, val: any): Promise<void> {
 
   const existing =
     typeof T.findFirst === "function" ? await T.findFirst({ where: { key } }) : null;
+
   const where = existing?.id !== undefined ? { id: existing.id } : { key };
   const hasExisting = !!existing;
 
-  // Try common column names for JSON/opaque storage
   const candidates = [
     { field: "json", value: val },
     { field: "valueJson", value: val },
