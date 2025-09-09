@@ -1,8 +1,7 @@
 // scripts/pnw_apply_all.ts
 // Apply PnW tax credits for ALL alliances that have a stored PnW key.
-// Self-contained: previews via integrations/pnw/tax, applies by updating AllianceTreasury,
-// and posts an embed to the alliance's configured summary channel.
-// Includes a wide (7d, configurable) fallback if the normal pass finds 0 records.
+// Resilient to different export names in src/utils/pnw_cursor.ts.
+// If cursor helpers are missing, the job previews only (no confirm) to avoid double counting.
 
 import "dotenv/config";
 import { prisma } from "../src/db";
@@ -11,19 +10,15 @@ import pino from "pino";
 
 import {
   previewAllianceTaxCredits,
-  // NOTE: we intentionally do NOT import applyAllianceTaxCredits here.
 } from "../src/integrations/pnw/tax";
 
-import {
-  getAllianceCursor,
-  setAllianceCursor,
-  getPnwSummaryChannel,
-} from "../src/utils/pnw_cursor";
+// IMPORTANT: import the whole module, then pick what exists
+import * as PnwCursor from "../src/utils/pnw_cursor";
 
 const log = pino({ level: process.env.LOG_LEVEL || "info" });
 
 const WIDE_LOOKBACK_HOURS = Number(process.env.PNW_TAX_WIDE_LOOKBACK_HOURS || 24 * 7); // default 7d
-const CONFIRM = process.argv.includes("--confirm") || process.env.PNW_APPLY_CONFIRM === "1";
+const CLI_CONFIRM = process.argv.includes("--confirm") || process.env.PNW_APPLY_CONFIRM === "1";
 
 type Delta = Record<string, number>;
 
@@ -37,6 +32,16 @@ type RunResult = {
   mode: "normal" | "wide" | "noop";
 };
 
+// Resolve possibly-different export names from utils/pnw_cursor
+const getAllianceCursor: undefined | ((id: number) => Promise<number | null>) =
+  (PnwCursor as any).getAllianceCursor || (PnwCursor as any).getPnwCursor || (PnwCursor as any).getCursor || undefined;
+
+const setAllianceCursor: undefined | ((id: number, cur: number) => Promise<void>) =
+  (PnwCursor as any).setAllianceCursor || (PnwCursor as any).setPnwCursor || (PnwCursor as any).setCursor || undefined;
+
+const getPnwSummaryChannel: undefined | ((id: number) => Promise<string | null>) =
+  (PnwCursor as any).getPnwSummaryChannel || (PnwCursor as any).getSummaryChannel || undefined;
+
 function formatDelta(delta: Delta): string[] {
   const keys = Object.keys(delta).sort();
   if (!keys.length) return [];
@@ -48,7 +53,6 @@ function formatDelta(delta: Delta): string[] {
 }
 
 async function applyDeltaToTreasury(allianceId: number, delta: Delta) {
-  // Merge deltas into AllianceTreasury.balances JSON
   const current = await prisma.allianceTreasury.findUnique({
     where: { allianceId },
   });
@@ -92,6 +96,7 @@ function buildEmbed(res: RunResult) {
 
 async function notify(client: Client, allianceId: number, embed: EmbedBuilder) {
   try {
+    if (!getPnwSummaryChannel) return; // no configured summary helper
     const channelId = await getPnwSummaryChannel(allianceId);
     if (!channelId) return;
     const ch = await client.channels.fetch(channelId);
@@ -109,7 +114,7 @@ async function listAllAlliancesWithKeys(): Promise<number[]> {
   return [...new Set(rows.map((r) => r.allianceId))];
 }
 
-async function runOnce(confirm: boolean) {
+async function runOnce(confirmRequested: boolean) {
   // Minimal Discord client purely for posting embeds
   const botToken = process.env.DISCORD_TOKEN;
   const client = new Client({ intents: [] });
@@ -119,7 +124,9 @@ async function runOnce(confirm: boolean) {
   const results: RunResult[] = [];
 
   for (const allianceId of allianceIds) {
-    const lastSeenId = await getAllianceCursor(allianceId);
+    const haveCursorHelpers = Boolean(getAllianceCursor && setAllianceCursor);
+
+    const lastSeenId = haveCursorHelpers ? await getAllianceCursor!(allianceId) : null;
 
     // Pass 1: normal (cursor or recent-window if no cursor)
     const prev = await previewAllianceTaxCredits({
@@ -149,10 +156,13 @@ async function runOnce(confirm: boolean) {
       }
     }
 
+    // Only allow confirm when we can safely advance the cursor
+    const confirm = confirmRequested && haveCursorHelpers;
+
     let applied = false;
     if (confirm && found > 0) {
       await applyDeltaToTreasury(allianceId, delta);
-      if (newestId != null) await setAllianceCursor(allianceId, newestId);
+      if (newestId != null) await setAllianceCursor!(allianceId, newestId);
       applied = true;
     }
 
@@ -175,12 +185,12 @@ async function runOnce(confirm: boolean) {
   }
 
   if (client.isReady()) await client.destroy();
-  const out = { confirm, alliances: results };
+  const out = { confirm: confirmRequested && Boolean(getAllianceCursor && setAllianceCursor), alliances: results };
   console.log(JSON.stringify(out, null, 2));
   return out;
 }
 
 (async () => {
-  await runOnce(CONFIRM);
+  await runOnce(CLI_CONFIRM);
   process.exit(0);
 })();
