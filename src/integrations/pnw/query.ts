@@ -1,56 +1,39 @@
 // src/integrations/pnw/query.ts
-/**
- * Thin GraphQL client for Politics & War.
- * - Sends key via ?api_key=...
- * - Drops null/undefined variables (some resolvers 500 on nulls)
- * - Surfaces GraphQL error messages clearly
- */
+import https from "https";
 
-type GraphQLErrorItem = { message: string; path?: (string | number)[]; extensions?: any };
-type GraphQLResponse<T> = { data?: T; errors?: GraphQLErrorItem[] };
+type GqlResp = { data?: any; errors?: Array<{ message?: string }> };
 
-function cleanVars(input?: Record<string, unknown>) {
-  if (!input) return undefined;
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(input)) {
-    if (v === null || v === undefined) continue;
-    out[k] = v;
-  }
-  return Object.keys(out).length ? out : undefined;
-}
-
-export async function pnwQuery<T>(
+export async function pnwQuery(
   apiKey: string,
   query: string,
-  variables?: Record<string, unknown>
-): Promise<T> {
+  variables?: Record<string, any>
+): Promise<any> {
+  if (!apiKey) throw new Error("PnW API key missing");
+
+  const body = JSON.stringify({ query, variables: variables ?? {} });
   const url = `https://api.politicsandwar.com/graphql?api_key=${encodeURIComponent(apiKey)}`;
 
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      query,
-      variables: cleanVars(variables),
-    }),
+  const respText: string = await new Promise((resolve, reject) => {
+    const req = https.request(url, { method: "POST", headers: { "Content-Type": "application/json" } }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    });
+    req.on("error", reject);
+    req.write(body);
+    req.end();
   });
 
-  const text = await resp.text();
-  let parsed: GraphQLResponse<T>;
+  let parsed: GqlResp;
   try {
-    parsed = JSON.parse(text);
+    parsed = JSON.parse(respText);
   } catch {
-    throw new Error(`PnW GraphQL returned non-JSON (status ${resp.status}): ${text}`);
+    throw new Error(`PnW GraphQL parse error: ${respText.slice(0, 300)}`);
   }
 
-  if (!resp.ok || (parsed.errors && parsed.errors.length)) {
-    const msgs = (parsed.errors || []).map(e => e.message).join(" | ");
-    throw new Error(`PnW GraphQL error (status ${resp.status}): ${msgs || text}`);
+  if (parsed.errors?.length) {
+    const msg = parsed.errors.map(e => e.message || "unknown").join(" | ");
+    throw new Error(`PnW GraphQL error (status 200): ${msg}`);
   }
-
-  if (!parsed.data) {
-    throw new Error(`PnW GraphQL: empty 'data' (status ${resp.status})`);
-  }
-
   return parsed.data;
 }
