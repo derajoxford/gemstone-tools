@@ -34,20 +34,76 @@ function buildDeltaFromInteraction(i: ChatInputCommandInteraction) {
   };
 }
 
-function pickAllianceNode(node: any): any | null {
-  // PnW can return an array or a single paginated-ish object depending on schema/version.
-  if (!node) return null;
-  if (Array.isArray(node)) return node[0] ?? null;
-  return node;
+function pickAllianceNodeFromAnyShape(data: any): any | null {
+  // Supports both:
+  //  1) alliances(id: [Int]) -> AlliancePaginator -> data: [Alliance]
+  //  2) alliances(id: Int)    -> [Alliance] or Alliance
+  const root = data?.alliances;
+
+  if (!root) return null;
+
+  // Paginator shape
+  if (root && typeof root === "object" && !Array.isArray(root) && Array.isArray(root.data)) {
+    return root.data[0] ?? null;
+  }
+
+  // Array shape
+  if (Array.isArray(root)) {
+    return root[0] ?? null;
+  }
+
+  // Single object shape
+  if (root && typeof root === "object") {
+    return root;
+  }
+
+  return null;
+}
+
+async function run(apiKey: string, query: string, vars: Record<string, any>) {
+  return pnwQuery(apiKey, query, vars);
 }
 
 /**
  * Scan recent bankrecs to count tax_id occurrences.
- * Uses schema-safe arguments: alliances(id: $id), bankrecs(limit: $limit, orderBy: "id desc").
+ * Tries multiple GraphQL shapes to be compatible with PnW variants.
  */
 async function sniffTaxIdsUsingStoredKey(allianceId: number, lookbackLimit = 250) {
-  const query = `
-    query SniffTaxIds($id: Int!, $limit: Int!) {
+  const apiKey = await getAllianceReadKey(allianceId);
+
+  // --- Attempt 1: paginator + orderBy ---
+  const qA = `
+    query Q($ids: [Int!]!, $limit: Int!) {
+      alliances(id: $ids, first: 1) {
+        data {
+          id
+          bankrecs(limit: $limit, orderBy: "id desc") {
+            id
+            tax_id
+          }
+        }
+      }
+    }
+  ` as const;
+
+  // --- Attempt 2: paginator without orderBy ---
+  const qB = `
+    query Q($ids: [Int!]!, $limit: Int!) {
+      alliances(id: $ids, first: 1) {
+        data {
+          id
+          bankrecs(limit: $limit) {
+            id
+            tax_id
+          }
+        }
+      }
+    }
+  ` as const;
+
+  // --- Attempt 3: non-paginator + orderBy ---
+  const qC = `
+    query Q($id: Int!, $limit: Int!) {
       alliances(id: $id) {
         id
         bankrecs(limit: $limit, orderBy: "id desc") {
@@ -58,22 +114,51 @@ async function sniffTaxIdsUsingStoredKey(allianceId: number, lookbackLimit = 250
     }
   ` as const;
 
-  const apiKey = await getAllianceReadKey(allianceId);
-  const data: any = await pnwQuery(apiKey, query, { id: allianceId, limit: lookbackLimit });
+  // --- Attempt 4: non-paginator without orderBy ---
+  const qD = `
+    query Q($id: Int!, $limit: Int!) {
+      alliances(id: $id) {
+        id
+        bankrecs(limit: $limit) {
+          id
+          tax_id
+        }
+      }
+    }
+  ` as const;
 
-  const alliancesNode = pickAllianceNode(data?.alliances);
-  const recs: any[] = alliancesNode?.bankrecs ?? [];
-  const counts = new Map<number, number>();
+  const attempts: Array<{
+    q: string;
+    vars: Record<string, any>;
+    name: string;
+  }> = [
+    { q: qA, vars: { ids: [allianceId], limit: lookbackLimit }, name: "paginator+orderBy" },
+    { q: qB, vars: { ids: [allianceId], limit: lookbackLimit }, name: "paginator" },
+    { q: qC, vars: { id: allianceId, limit: lookbackLimit }, name: "simple+orderBy" },
+    { q: qD, vars: { id: allianceId, limit: lookbackLimit }, name: "simple" },
+  ];
 
-  for (const r of recs) {
-    const tid = Number(r?.tax_id ?? 0);
-    if (!Number.isFinite(tid) || tid <= 0) continue;
-    counts.set(tid, (counts.get(tid) ?? 0) + 1);
+  let lastErr: unknown = null;
+  for (const att of attempts) {
+    try {
+      const data: any = await run(apiKey, att.q, att.vars);
+      const node = pickAllianceNodeFromAnyShape(data);
+      const recs: any[] = node?.bankrecs ?? [];
+      const counts = new Map<number, number>();
+      for (const r of recs) {
+        const tid = Number(r?.tax_id ?? 0);
+        if (!Number.isFinite(tid) || tid <= 0) continue;
+        counts.set(tid, (counts.get(tid) ?? 0) + 1);
+      }
+      return [...counts.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([id, count]) => ({ id, count }));
+    } catch (err) {
+      lastErr = err;
+      // try next shape
+    }
   }
-
-  return [...counts.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .map(([id, count]) => ({ id, count }));
+  throw lastErr ?? new Error("Unable to query PnW bankrecs for sniffing tax_id.");
 }
 
 async function replyError(interaction: ChatInputCommandInteraction, err: unknown) {
@@ -151,10 +236,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
         .join("\n");
 
       await interaction.editReply(
-        [
-          `✅ Added to treasury for **${allianceId}**:`,
-          pretty || "(no-op?)",
-        ].join("\n"),
+        [`✅ Added to treasury for **${allianceId}**:`, pretty || "(no-op?)"].join("\n"),
       );
       return;
     }
