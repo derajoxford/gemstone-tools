@@ -8,6 +8,7 @@ import * as pnw_preview_stored from './pnw_preview_stored';
 import * as pnw_apply from './pnw_apply';
 import * as pnw_cursor from './pnw_cursor';
 import * as pnw_logs from './pnw_logs';
+import * as pnw_summary_channel from './pnw_summary_channel';
 
 export type CommandModule = {
   data?: { name?: string; toJSON?: () => any };
@@ -24,6 +25,7 @@ export const commandModules: CommandModule[] = [
   pnw_apply,
   pnw_cursor,
   pnw_logs,
+  pnw_summary_channel,
 ].filter((m) => m?.data && m?.execute);
 
 export const extraCommandsJSON = commandModules
