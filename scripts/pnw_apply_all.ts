@@ -1,44 +1,73 @@
 // scripts/pnw_apply_all.ts
 // Apply PnW tax credits for ALL alliances that have a stored PnW key.
-// Adds a *wide* fallback: if a normal pass finds 0 records, re-scan last 7 days.
+// Self-contained: previews via integrations/pnw/tax, applies by updating AllianceTreasury,
+// and posts an embed to the alliance's configured summary channel.
+// Includes a wide (7d, configurable) fallback if the normal pass finds 0 records.
 
 import "dotenv/config";
 import { prisma } from "../src/db";
-import { getAllianceCursor, setAllianceCursor, getPnwSummaryChannel } from "../src/utils/pnw_cursor";
-import {
-  previewAllianceTaxCredits,
-  applyAllianceTaxCredits,
-  formatDeltaForEmbed,
-} from "../src/integrations/pnw/tax";
 import { Client, EmbedBuilder, TextBasedChannel } from "discord.js";
 import pino from "pino";
 
+import {
+  previewAllianceTaxCredits,
+  // NOTE: we intentionally do NOT import applyAllianceTaxCredits here.
+} from "../src/integrations/pnw/tax";
+
+import {
+  getAllianceCursor,
+  setAllianceCursor,
+  getPnwSummaryChannel,
+} from "../src/utils/pnw_cursor";
+
 const log = pino({ level: process.env.LOG_LEVEL || "info" });
 
-const WIDE_LOOKBACK_HOURS = Number(process.env.PNW_TAX_WIDE_LOOKBACK_HOURS || 24 * 7); // 7d
-const NORMAL_MODE = "normal";
-const WIDE_MODE = "wide";
+const WIDE_LOOKBACK_HOURS = Number(process.env.PNW_TAX_WIDE_LOOKBACK_HOURS || 24 * 7); // default 7d
+const CONFIRM = process.argv.includes("--confirm") || process.env.PNW_APPLY_CONFIRM === "1";
+
+type Delta = Record<string, number>;
 
 type RunResult = {
   allianceId: number;
   lastSeenId: number | null;
   newestId: number | null;
   records: number;
-  delta: Record<string, number>;
+  delta: Delta;
   applied: boolean;
-  mode: "normal" | "wide";
+  mode: "normal" | "wide" | "noop";
 };
 
-async function listAllAlliancesWithKeys(): Promise<number[]> {
-  // We only store a single provider now; just grab all alliance IDs present
-  const rows = await prisma.allianceKey.findMany({
-    select: { allianceId: true },
+function formatDelta(delta: Delta): string[] {
+  const keys = Object.keys(delta).sort();
+  if (!keys.length) return [];
+  return keys.map((k) => {
+    const v = delta[k];
+    const sign = v >= 0 ? "+" : "";
+    return `\`${k}\`: ${sign}${v}`;
   });
-  return [...new Set(rows.map((r) => r.allianceId))];
+}
+
+async function applyDeltaToTreasury(allianceId: number, delta: Delta) {
+  // Merge deltas into AllianceTreasury.balances JSON
+  const current = await prisma.allianceTreasury.findUnique({
+    where: { allianceId },
+  });
+
+  const balances: Record<string, number> = { ...(current?.balances as any) };
+  for (const [k, v] of Object.entries(delta)) {
+    if (!Number.isFinite(v as number)) continue;
+    balances[k] = (Number(balances[k]) || 0) + Number(v);
+  }
+
+  await prisma.allianceTreasury.upsert({
+    where: { allianceId },
+    create: { allianceId, balances },
+    update: { balances },
+  });
 }
 
 function buildEmbed(res: RunResult) {
-  const fmt = (v: any) => (v ?? "none");
+  const fmt = (v: any) => (v == null ? "none" : String(v));
   const e = new EmbedBuilder()
     .setTitle("PnW Tax Apply — Hourly")
     .setColor(res.records > 0 ? 0x2ecc71 : 0x95a5a6)
@@ -46,17 +75,13 @@ function buildEmbed(res: RunResult) {
       { name: "Alliance ID", value: `\`${res.allianceId}\``, inline: false },
       { name: "Mode", value: `\`${res.mode}\``, inline: true },
       { name: "Records", value: `\`${res.records}\``, inline: true },
-      {
-        name: "Cursor",
-        value: `\`${fmt(res.lastSeenId)}\`  →  \`${fmt(res.newestId)}\``,
-        inline: false,
-      },
+      { name: "Cursor", value: `\`${fmt(res.lastSeenId)}\`  →  \`${fmt(res.newestId)}\``, inline: false },
     )
     .setTimestamp(new Date());
 
-  if (res.records > 0) {
-    const lines = formatDeltaForEmbed(res.delta);
-    e.addFields({ name: "Delta", value: lines.length ? lines.join("\n") : "_none_", inline: false });
+  const lines = formatDelta(res.delta);
+  if (res.records > 0 && lines.length) {
+    e.addFields({ name: "Delta", value: lines.join("\n"), inline: false });
     e.setFooter({ text: res.applied ? "Applied (logged)" : "Preview only (logged)" });
   } else {
     e.addFields({ name: "Delta", value: "_no deltas_", inline: false });
@@ -65,47 +90,49 @@ function buildEmbed(res: RunResult) {
   return e;
 }
 
-async function notify(guildClient: Client, allianceId: number, embed: EmbedBuilder) {
+async function notify(client: Client, allianceId: number, embed: EmbedBuilder) {
   try {
     const channelId = await getPnwSummaryChannel(allianceId);
     if (!channelId) return;
-
-    const ch = await guildClient.channels.fetch(channelId);
+    const ch = await client.channels.fetch(channelId);
     if (!ch) return;
-    // @ts-ignore: text/thread both support send
-    if ("send" in ch && typeof (ch as any).send === "function") {
-      await (ch as TextBasedChannel).send({ embeds: [embed] });
+    if ("send" in (ch as any) && typeof (ch as any).send === "function") {
+      await (ch as unknown as TextBasedChannel).send({ embeds: [embed] });
     }
   } catch (e) {
     log.warn({ err: (e as Error).message, allianceId }, "notify failed");
   }
 }
 
-async function runOnce(confirm: boolean): Promise<{ confirm: boolean; alliances: RunResult[] }> {
-  // Spin up a minimal Discord client for posting embeds (no intents needed for sends)
+async function listAllAlliancesWithKeys(): Promise<number[]> {
+  const rows = await prisma.allianceKey.findMany({ select: { allianceId: true } });
+  return [...new Set(rows.map((r) => r.allianceId))];
+}
+
+async function runOnce(confirm: boolean) {
+  // Minimal Discord client purely for posting embeds
   const botToken = process.env.DISCORD_TOKEN;
   const client = new Client({ intents: [] });
   if (botToken) await client.login(botToken);
 
-  const out: RunResult[] = [];
   const allianceIds = await listAllAlliancesWithKeys();
-  log.info({ allianceIds }, "pnw_apply_all: start");
+  const results: RunResult[] = [];
 
   for (const allianceId of allianceIds) {
-    // 1) Normal pass — use cursor (or recent-window if cursor missing)
     const lastSeenId = await getAllianceCursor(allianceId);
+
+    // Pass 1: normal (cursor or recent-window if no cursor)
     const prev = await previewAllianceTaxCredits({
       allianceId,
       lastSeenId: lastSeenId ?? undefined,
     });
 
-    let mode: "normal" | "wide" = NORMAL_MODE;
+    let mode: RunResult["mode"] = "normal";
     let found = prev.count;
     let newestId = prev.newestId ?? lastSeenId ?? null;
-    let delta = prev.delta;
-    let applied = false;
+    let delta = prev.delta as Delta;
 
-    // 2) Fallback: if *nothing* found, try a wide (7d) scan ignoring the cursor
+    // Pass 2: wide fallback if nothing found
     if (found === 0) {
       const wide = await previewAllianceTaxCredits({
         allianceId,
@@ -113,17 +140,19 @@ async function runOnce(confirm: boolean): Promise<{ confirm: boolean; alliances:
         lookbackHours: WIDE_LOOKBACK_HOURS,
       });
       if (wide.count > 0) {
-        mode = WIDE_MODE;
+        mode = "wide";
         found = wide.count;
         newestId = wide.newestId ?? newestId;
-        delta = wide.delta;
+        delta = wide.delta as Delta;
+      } else {
+        mode = "noop";
       }
     }
 
-    // 3) Apply if we found records
+    let applied = false;
     if (confirm && found > 0) {
-      await applyAllianceTaxCredits({ allianceId, delta });
-      if (newestId) await setAllianceCursor(allianceId, newestId);
+      await applyDeltaToTreasury(allianceId, delta);
+      if (newestId != null) await setAllianceCursor(allianceId, newestId);
       applied = true;
     }
 
@@ -136,27 +165,22 @@ async function runOnce(confirm: boolean): Promise<{ confirm: boolean; alliances:
       applied,
       mode,
     };
-    out.push(res);
+    results.push(res);
 
-    // Notify (per-alliance)
     try {
-      const embed = buildEmbed(res);
-      if (client.isReady()) await notify(client, allianceId, embed);
+      if (client.isReady()) await notify(client, allianceId, buildEmbed(res));
     } catch (e) {
       log.warn({ err: (e as Error).message, allianceId }, "embed/notify error");
     }
   }
 
-  if (botToken && client.isReady()) await client.destroy();
-  log.info({ out }, "pnw_apply_all: done");
-  return { confirm, alliances: out };
+  if (client.isReady()) await client.destroy();
+  const out = { confirm, alliances: results };
+  console.log(JSON.stringify(out, null, 2));
+  return out;
 }
 
-// Entry point
 (async () => {
-  const confirm = process.argv.includes("--confirm") || process.env.PNW_APPLY_CONFIRM === "1";
-  const result = await runOnce(confirm);
-  // Emit machine-readable JSON for systemd logs/tests
-  console.log(JSON.stringify(result, null, 2));
+  await runOnce(CONFIRM);
   process.exit(0);
 })();
