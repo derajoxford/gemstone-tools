@@ -39,42 +39,48 @@ export type ApplyResult = {
 
 /** --- HELPERS --- */
 async function fetchBankrecsSince(apiKey: string, allianceId: number, sinceId?: number | null) {
-  // PnW GraphQL:
-  // - alliances(id: Int!) returns a list of Alliance (not a paginator)
-  // - bankrecs(after: Int, limit: Int, orderBy?: Enum) returns a list (no ".data")
+  // NOTE: alliances returns an AlliancePaginator; read from `.data`
   const query = `
-    query AllianceBankrecs($id: Int!, $after: Int, $limit: Int) {
-      alliances(id: $id) {
-        id
-        bankrecs(after: $after, limit: $limit) {
+    query AllianceBankrecs($ids: [Int], $after: Int, $limit: Int) {
+      alliances(id: $ids) {
+        data {
           id
-          note
-          type
-          sender_type
-          receiver_type
-          money
-          food
-          munitions
-          gasoline
-          steel
-          aluminum
-          oil
-          uranium
-          bauxite
-          coal
-          iron
-          lead
-          date
+          bankrecs(after: $after, limit: $limit) {
+            id
+            note
+            type
+            sender_type
+            receiver_type
+            money
+            food
+            munitions
+            gasoline
+            steel
+            aluminum
+            oil
+            uranium
+            bauxite
+            coal
+            iron
+            lead
+            date
+          }
         }
       }
     }
   ` as const;
 
-  const variables = { id: Number(allianceId), after: sinceId ?? null, limit: 100 };
+  const variables = {
+    ids: [Number(allianceId)],
+    after: sinceId ?? null,
+    limit: 100,
+  };
+
   const data: any = await pnwQuery<any>(apiKey, query, variables);
 
-  // alliances returns an array; pick the first
-  const alliance = Array.isArray(data?.alliances) ? data?.alliances[0] : data?.alliances;
+  // alliances is a paginator -> { data: [Alliance, ...] }
+  const list = Array.isArray(data?.alliances?.data) ? data.alliances.data : [];
+  const alliance = list[0];
   const recs: any[] = Array.isArray(alliance?.bankrecs) ? alliance.bankrecs : [];
 
   // Filter to tax-related credits. Adjust if your API exposes a dedicated discriminator.
@@ -98,8 +104,8 @@ function sumDelta(recs: any[]): PreviewResult {
     }
 
     const fields = [
-      "money","food","munitions","gasoline","steel","aluminum",
-      "oil","uranium","bauxite","coal","iron","lead",
+      "money", "food", "munitions", "gasoline", "steel", "aluminum",
+      "oil", "uranium", "bauxite", "coal", "iron", "lead",
     ] as const;
 
     for (const f of fields) {
