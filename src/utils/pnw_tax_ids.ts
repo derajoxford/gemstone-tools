@@ -1,83 +1,185 @@
-// src/utils/pnw_tax_ids.ts
-import { promises as fs } from "fs";
-import path from "path";
+// src/commands/pnw_tax_ids.ts
+import {
+  SlashCommandBuilder,
+  ChatInputCommandInteraction,
+  PermissionFlagsBits,
+} from "discord.js";
 
-const DATA_DIR = path.join(process.cwd(), "var");
-const FILE = path.join(DATA_DIR, "pnw_tax_ids.json");
+import {
+  getAllowedTaxIds,
+  setAllowedTaxIds,
+  clearAllowedTaxIds,
+} from "../utils/pnw_tax_ids";
 
-type StoreShape = Record<string, number[]>;
+import { getAllianceReadKey } from "../integrations/pnw/store";
+import { pnwQuery } from "../integrations/pnw/query";
 
-async function readStore(): Promise<StoreShape> {
+// -------- helpers --------
+function parseIdList(s: string): number[] {
+  return s
+    .split(/[\s,]+/)
+    .map((t) => t.trim())
+    .filter(Boolean)
+    .map((t) => Number(t))
+    .filter((n) => Number.isInteger(n) && n >= 0);
+}
+
+async function sniffTaxIdsUsingStoredKey(allianceId: number, lookbackLimit = 250) {
+  // IMPORTANT: PnW returns a paginator with a `data` array and requires `id: [Int]`
+  const query = `
+    query SniffTaxIds($id: Int!, $limit: Int!) {
+      alliances(id: [$id]) {
+        data {
+          id
+          bankrecs(limit: $limit) {
+            id
+            tax_id
+          }
+        }
+      }
+    }
+  ` as const;
+
+  const apiKey = await getAllianceReadKey(allianceId);
+  const data: any = await pnwQuery(apiKey, query, { id: allianceId, limit: lookbackLimit });
+
+  const recs: any[] = data?.alliances?.data?.[0]?.bankrecs ?? [];
+  const counts = new Map<number, number>();
+  for (const r of recs) {
+    const tid = Number(r?.tax_id ?? 0);
+    if (!tid) continue;
+    counts.set(tid, (counts.get(tid) ?? 0) + 1);
+  }
+  // Sort by frequency desc
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([id, n]) => ({ id, count: n }));
+}
+
+function fmtList(nums: number[]) {
+  return nums.length ? nums.join(", ") : "—";
+}
+
+async function replyError(interaction: ChatInputCommandInteraction, err: unknown) {
+  const msg = err instanceof Error ? err.message : String(err);
+  await interaction.editReply(`❌ ${msg}`);
+  console.error("[/pnw_tax_ids] error:", err);
+}
+
+// -------- slash command --------
+export const data = new SlashCommandBuilder()
+  .setName("pnw_tax_ids")
+  .setDescription("Manage which PnW tax_id values are treated as tax credits")
+  .addSubcommand((s) =>
+    s
+      .setName("sniff")
+      .setDescription("Scan recent bank records and suggest tax_id values")
+      .addIntegerOption((o) =>
+        o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
+      )
+      .addIntegerOption((o) =>
+        o
+          .setName("limit")
+          .setDescription("Bank records to scan (default 250)")
+          .setMinValue(50)
+          .setMaxValue(500),
+      ),
+  )
+  .addSubcommand((s) =>
+    s
+      .setName("get")
+      .setDescription("Show stored tax_id filter")
+      .addIntegerOption((o) =>
+        o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
+      ),
+  )
+  .addSubcommand((s) =>
+    s
+      .setName("set")
+      .setDescription("Set stored tax_id filter")
+      .addIntegerOption((o) =>
+        o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
+      )
+      .addStringOption((o) =>
+        o
+          .setName("ids")
+          .setDescription("Comma/space separated tax IDs (e.g. 12, 34 56)")
+          .setRequired(true),
+      ),
+  )
+  .addSubcommand((s) =>
+    s
+      .setName("clear")
+      .setDescription("Clear stored tax_id filter")
+      .addIntegerOption((o) =>
+        o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
+      ),
+  )
+  // only members who can manage guild can change filters
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+  .setDMPermission(false);
+
+export async function execute(interaction: ChatInputCommandInteraction) {
+  await interaction.deferReply({ ephemeral: true });
   try {
-    const text = await fs.readFile(FILE, "utf8");
-    const json = JSON.parse(text);
-    return json && typeof json === "object" ? (json as StoreShape) : {};
-  } catch (err: any) {
-    if (err?.code === "ENOENT") return {};
-    throw err;
+    const sub = interaction.options.getSubcommand(true);
+    const allianceId = interaction.options.getInteger("alliance_id", true)!;
+
+    if (sub === "sniff") {
+      const limit = interaction.options.getInteger("limit") ?? 250;
+      const pairs = await sniffTaxIdsUsingStoredKey(allianceId, limit);
+      if (!pairs.length) {
+        await interaction.editReply(
+          `No tax_id values detected in the last ${limit} bank records for alliance **${allianceId}**.`,
+        );
+        return;
+      }
+      const lines = pairs.map((p) => `• \`${p.id}\`  (${p.count} hits)`).join("\n");
+      await interaction.editReply(
+        [
+          `**Alliance:** ${allianceId}`,
+          `**Lookback:** ${limit} records`,
+          `**Detected tax_id values:**`,
+          lines,
+          "",
+          "You can store a filter with:",
+          `\`/pnw_tax_ids set alliance_id:${allianceId} ids:<list from above>\``,
+        ].join("\n"),
+      );
+      return;
+    }
+
+    if (sub === "get") {
+      const ids = await getAllowedTaxIds(allianceId);
+      await interaction.editReply(
+        `Stored tax_id filter for **${allianceId}**: ${fmtList(ids ?? [])}`,
+      );
+      return;
+    }
+
+    if (sub === "set") {
+      const raw = interaction.options.getString("ids", true);
+      const ids = parseIdList(raw);
+      if (!ids.length) {
+        await interaction.editReply("Please provide at least one integer tax_id.");
+        return;
+      }
+      await setAllowedTaxIds(allianceId, ids);
+      await interaction.editReply(
+        `Saved tax_id filter for **${allianceId}**: ${fmtList(ids)}\n` +
+          "Future previews/apply will only count bankrecs whose `tax_id` is in this list.",
+      );
+      return;
+    }
+
+    if (sub === "clear") {
+      await clearAllowedTaxIds(allianceId);
+      await interaction.editReply(`Cleared stored tax_id filter for **${allianceId}**.`);
+      return;
+    }
+
+    await interaction.editReply("Unknown subcommand.");
+  } catch (err) {
+    await replyError(interaction, err);
   }
 }
-
-async function writeStore(data: StoreShape): Promise<void> {
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  await fs.writeFile(FILE, JSON.stringify(data, null, 2), "utf8");
-}
-
-function toCleanIntList(arr: (number | string)[]): number[] {
-  // Keep non-negative integers only; unique + sorted for stable diffs
-  const set = new Set<number>();
-  for (const v of arr) {
-    const n = Number(v);
-    if (Number.isInteger(n) && n >= 0) set.add(n);
-  }
-  return [...set].sort((a, b) => a - b);
-}
-
-// ---------- Primary helpers ----------
-export async function getAllowedTaxIds(allianceId: number): Promise<number[]> {
-  const db = await readStore();
-  return toCleanIntList(db[String(allianceId)] ?? []);
-}
-
-export async function setAllowedTaxIds(
-  allianceId: number,
-  ids: (number | string)[],
-): Promise<void> {
-  const db = await readStore();
-  db[String(allianceId)] = toCleanIntList(ids);
-  await writeStore(db);
-}
-
-export async function addAllowedTaxId(
-  allianceId: number,
-  id: number | string,
-): Promise<void> {
-  const current = await getAllowedTaxIds(allianceId);
-  const next = toCleanIntList([...current, id]);
-  await setAllowedTaxIds(allianceId, next);
-}
-
-export async function removeAllowedTaxId(
-  allianceId: number,
-  id: number | string,
-): Promise<void> {
-  const current = await getAllowedTaxIds(allianceId);
-  const rm = Number(id);
-  const next = current.filter((x) => x !== rm);
-  await setAllowedTaxIds(allianceId, next);
-}
-
-export async function clearAllowedTaxIds(allianceId: number): Promise<void> {
-  const db = await readStore();
-  if (db.hasOwnProperty(String(allianceId))) {
-    db[String(allianceId)] = [];
-    await writeStore(db);
-  }
-}
-
-// ---------- Aliases expected elsewhere ----------
-// (These make this module plug-compatible with existing imports.)
-export const getAllianceTaxIds = getAllowedTaxIds;
-export const getPnwTaxIds = getAllowedTaxIds;
-export const setPnwTaxIds = setAllowedTaxIds;
-export const clearAllianceTaxIds = clearAllowedTaxIds;
