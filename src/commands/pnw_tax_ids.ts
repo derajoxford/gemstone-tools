@@ -4,7 +4,7 @@ import {
   ChatInputCommandInteraction,
   PermissionFlagsBits,
 } from "discord.js";
-import { getPnwTaxIds, setPnwTaxIds, clearAllianceTaxIds } from "../utils/pnw_cursor";
+import { getAllianceTaxIds, setPnwTaxIds, clearAllianceTaxIds } from "../utils/pnw_cursor";
 import { getAllianceReadKey } from "../integrations/pnw/store";
 import { pnwQuery } from "../integrations/pnw/query";
 
@@ -22,7 +22,6 @@ function parseIdList(s: string): number[] {
 }
 
 async function sniffTaxIdsUsingStoredKey(allianceId: number, lookbackLimit = 250) {
-  // Lean query: we only need tax_id
   const query = `
     query SniffTaxIds($id: Int!, $limit: Int!) {
       alliances(id: $id) {
@@ -143,7 +142,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     }
 
     if (sub === "get") {
-      const ids = await getPnwTaxIds(allianceId);
+      const ids = await getAllianceTaxIds(allianceId);
       await interaction.editReply(
         `Stored tax_id filter for **${allianceId}**: ${fmtList(ids ?? [])}`,
       );
