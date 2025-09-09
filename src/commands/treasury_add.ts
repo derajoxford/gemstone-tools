@@ -1,101 +1,186 @@
-// src/commands/treasury_add.ts
+// src/commands/pnw_tax_ids.ts
 import {
   SlashCommandBuilder,
-  PermissionFlagsBits,
   ChatInputCommandInteraction,
-  EmbedBuilder,
-  Colors,
-} from 'discord.js';
-import { PrismaClient } from '@prisma/client';
-import { RES_EMOJI, ORDER } from '../lib/emojis.js';
+  PermissionFlagsBits,
+} from "discord.js";
+import { getAllianceReadKey } from "../integrations/pnw/store";
+import { pnwQuery } from "../integrations/pnw/query";
 
-const prisma = new PrismaClient();
+// Use the JSON-backed store (not prisma) for tax_id lists
+import {
+  getAllowedTaxIds,
+  setAllowedTaxIds,
+  clearAllowedTaxIds,
+} from "../utils/pnw_tax_ids";
 
-/**
- * Required options MUST be declared before optional ones.
- * Order here: resource (required) -> amount (required) -> op (optional).
- */
+// -------- helpers --------
+function parseIdList(s: string): number[] {
+  return s
+    .split(/[\s,]+/)
+    .map((t) => t.trim())
+    .filter(Boolean)
+    .map((t) => Number(t))
+    .filter((n) => Number.isInteger(n) && n >= 0);
+}
+
+async function sniffTaxIdsUsingStoredKey(allianceId: number, lookbackLimit = 250) {
+  // Most-stable PnW schema form: alliances(ids:[Int]) -> AlliancePaginator -> data[]
+  // Keep arguments minimal to avoid schema variant pitfalls.
+  const query = `
+    query SniffTaxIds($ids: [Int!], $limit: Int!) {
+      alliances(ids: $ids) {
+        data {
+          id
+          bankrecs(limit: $limit) {
+            id
+            tax_id
+          }
+        }
+      }
+    }
+  ` as const;
+
+  const apiKey = await getAllianceReadKey(allianceId);
+  const data: any = await pnwQuery(apiKey, query, { ids: [allianceId], limit: lookbackLimit });
+
+  const recs: any[] = data?.alliances?.data?.[0]?.bankrecs ?? [];
+  const counts = new Map<number, number>();
+  for (const r of recs) {
+    const tid = Number(r?.tax_id ?? 0);
+    if (!tid) continue;
+    counts.set(tid, (counts.get(tid) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([id, count]) => ({ id, count }));
+}
+
+function fmtList(nums: number[]) {
+  return nums.length ? nums.join(", ") : "—";
+}
+
+async function replyError(interaction: ChatInputCommandInteraction, err: unknown) {
+  const msg = err instanceof Error ? err.message : String(err);
+  try {
+    await interaction.editReply(`❌ ${msg}`);
+  } catch {}
+  console.error("[/pnw_tax_ids] error:", err);
+}
+
+// -------- slash command --------
 export const data = new SlashCommandBuilder()
-  .setName('treasury_add')
-  .setDescription('Adjust the alliance-wide treasury (add or subtract).')
-  .addStringOption(o =>
-    o
-      .setName('resource')
-      .setDescription('Resource to adjust')
-      .setRequired(true)
-      .addChoices(
-        ...(ORDER as string[]).map((r: string) => ({ name: r, value: r }))
+  .setName("pnw_tax_ids")
+  .setDescription("Manage which PnW tax_id values are treated as tax credits")
+  .addSubcommand((s) =>
+    s
+      .setName("sniff")
+      .setDescription("Scan recent bank records and suggest tax_id values")
+      .addIntegerOption((o) =>
+        o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
       )
+      .addIntegerOption((o) =>
+        o
+          .setName("limit")
+          .setDescription("Bank records to scan (default 250)")
+          .setMinValue(50)
+          .setMaxValue(500),
+      ),
   )
-  .addNumberOption(o =>
-    o
-      .setName('amount')
-      .setDescription('Amount (use positive numbers)')
-      .setRequired(true)
+  .addSubcommand((s) =>
+    s
+      .setName("get")
+      .setDescription("Show stored tax_id filter")
+      .addIntegerOption((o) =>
+        o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
+      ),
   )
-  .addStringOption(o =>
-    o
-      .setName('op')
-      .setDescription('Add or subtract')
-      .setRequired(false)
-      .addChoices({ name: 'add', value: 'add' }, { name: 'subtract', value: 'subtract' })
+  .addSubcommand((s) =>
+    s
+      .setName("set")
+      .setDescription("Set stored tax_id filter")
+      .addIntegerOption((o) =>
+        o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
+      )
+      .addStringOption((o) =>
+        o
+          .setName("ids")
+          .setDescription("Comma/space separated tax IDs (e.g. 12, 34 56)")
+          .setRequired(true),
+      ),
   )
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
+  .addSubcommand((s) =>
+    s
+      .setName("clear")
+      .setDescription("Clear stored tax_id filter")
+      .addIntegerOption((o) =>
+        o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
+      ),
+  )
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+  .setDMPermission(false);
 
-export async function execute(i: ChatInputCommandInteraction) {
-  await i.deferReply({ ephemeral: true });
+export async function execute(interaction: ChatInputCommandInteraction) {
+  await interaction.deferReply({ ephemeral: true });
+  try {
+    const sub = interaction.options.getSubcommand(true);
+    const allianceId = interaction.options.getInteger("alliance_id", true)!;
 
-  // Require Manage Guild just like data.defaultMemberPermissions indicates.
-  if (!i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
-    return i.editReply('You lack permission to use this command.');
+    if (sub === "sniff") {
+      const limit = interaction.options.getInteger("limit") ?? 250;
+      const pairs = await sniffTaxIdsUsingStoredKey(allianceId, limit);
+      if (!pairs.length) {
+        await interaction.editReply(
+          `No tax_id values detected in the last ${limit} bank records for alliance **${allianceId}**.`,
+        );
+        return;
+      }
+      const lines = pairs.map((p) => `• \`${p.id}\`  (${p.count} hits)`).join("\n");
+      await interaction.editReply(
+        [
+          `**Alliance:** ${allianceId}`,
+          `**Lookback:** ${limit} records`,
+          `**Detected tax_id values:**`,
+          lines,
+          "",
+          "Store a filter with:",
+          `\`/pnw_tax_ids set alliance_id:${allianceId} ids:<list from above>\``,
+        ].join("\n"),
+      );
+      return;
+    }
+
+    if (sub === "get") {
+      const ids = await getAllowedTaxIds(allianceId);
+      await interaction.editReply(
+        `Stored tax_id filter for **${allianceId}**: ${fmtList(ids ?? [])}`,
+      );
+      return;
+    }
+
+    if (sub === "set") {
+      const raw = interaction.options.getString("ids", true);
+      const ids = parseIdList(raw);
+      if (!ids.length) {
+        await interaction.editReply("Please provide at least one integer tax_id.");
+        return;
+      }
+      await setAllowedTaxIds(allianceId, ids);
+      await interaction.editReply(
+        `Saved tax_id filter for **${allianceId}**: ${fmtList(ids)}\n` +
+          "Future previews/apply will only count bankrecs whose `tax_id` is in this list.",
+      );
+      return;
+    }
+
+    if (sub === "clear") {
+      await clearAllowedTaxIds(allianceId);
+      await interaction.editReply(`Cleared stored tax_id filter for **${allianceId}**.`);
+      return;
+    }
+
+    await interaction.editReply("Unknown subcommand.");
+  } catch (err) {
+    await replyError(interaction, err);
   }
-
-  const alliance = await prisma.alliance.findFirst({
-    where: { guildId: i.guildId ?? '' },
-  });
-  if (!alliance) {
-    return i.editReply('No alliance linked here. Run **/setup_alliance** first.');
-  }
-
-  const resource = i.options.getString('resource', true);
-  const amount = i.options.getNumber('amount', true)!;
-  const op = (i.options.getString('op') as 'add' | 'subtract' | null) ?? 'add';
-
-  if (!(ORDER as string[]).includes(resource)) {
-    return i.editReply(`Unknown resource: \`${resource}\`.`);
-  }
-  if (!Number.isFinite(amount) || amount <= 0) {
-    return i.editReply('Amount must be a positive number.');
-  }
-
-  const delta = op === 'subtract' ? -amount : amount;
-
-  // Load row and update balances JSON
-  const row = await prisma.allianceTreasury.findUnique({
-    where: { allianceId: alliance.id },
-  });
-  const balances: Record<string, number> = { ...(row?.balances as any || {}) };
-
-  const before = Number(balances[resource] || 0);
-  const after = Math.max(0, before + delta); // never below zero
-  balances[resource] = after;
-
-  await prisma.allianceTreasury.upsert({
-    where: { allianceId: alliance.id },
-    update: { balances },
-    create: { allianceId: alliance.id, balances },
-  });
-
-  const emoji = RES_EMOJI[resource as keyof typeof RES_EMOJI] ?? '';
-  const sign = delta >= 0 ? '+' : '';
-  const embed = new EmbedBuilder()
-    .setTitle('🏦 Alliance Treasury Updated')
-    .setDescription(
-      `${emoji} **${resource}**: ${before.toLocaleString()} → ${after.toLocaleString()} ` +
-      `(${sign}${delta.toLocaleString()})`
-    )
-    .setFooter({ text: `Alliance #${alliance.id}` })
-    .setColor(delta >= 0 ? Colors.Green : Colors.Red);
-
-  return i.editReply({ embeds: [embed] });
 }
