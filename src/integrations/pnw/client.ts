@@ -12,7 +12,16 @@ export type PnwBankrec = {
   date: string;
   note: string | null;
   banker_id: number | null;
+
+  // Directionality & targeting
+  sender_id: number | null;
+  sender_type: number | null;   // 1 = nation, 2 = alliance
+  receiver_id: number | null;
+  receiver_type: number | null; // 1 = nation, 2 = alliance
+
   tax_id: number | null; // present when record is from taxation
+
+  // Resources
   money: number;
   food: number;
   munitions: number;
@@ -62,9 +71,9 @@ function postGraphQL<T>(apiKey: string, body: { query: string; variables?: any }
 }
 
 /**
- * Fetch recent bank records for an alliance.
- * NOTE: PnW returns a paginator object; we must read from `.data`.
- * We sort ascending by id so callers can cursor by "last seen id".
+ * Fetch alliance bank records.
+ * PnW returns a paginator; we extract `.data[0].bankrecs` and sort ascending by id
+ * so callers can cursor by last seen id.
  */
 export async function fetchAllianceBankrecs(apiKey: string, allianceId: number): Promise<PnwBankrec[]> {
   const query = `
@@ -77,6 +86,10 @@ export async function fetchAllianceBankrecs(apiKey: string, allianceId: number):
             date
             note
             banker_id
+            sender_id
+            sender_type
+            receiver_id
+            receiver_type
             tax_id
             money
             food
