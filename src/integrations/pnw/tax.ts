@@ -43,10 +43,8 @@ async function fetchBankrecsSince(
   allianceId: number,
   sinceId?: number | null
 ) {
-  // NOTE:
-  // - alliances argument name is "id" but type is [Int] (list)
-  // - bankrecs ID-based pagination uses "or_id: [Int]"
-  // - bankrec fields: stype/rtype; timestamp is "date"
+  // alliances(id: [Int]) -> { data { id bankrecs(...) { ... } } }
+  // bankrecs accepts "or_id: [Int]" (list). We OMIT the arg when sinceId is not provided.
   const query = `
     query AllianceBankrecs($ids: [Int], $or_id: [Int], $limit: Int) {
       alliances(id: $ids) {
@@ -76,13 +74,13 @@ async function fetchBankrecsSince(
     }
   ` as const;
 
-  const variables = {
+  const variables: Record<string, unknown> = {
     ids: [Number(allianceId)],
-    or_id: sinceId != null ? [Number(sinceId)] : null, // <-- list, not Int
     limit: 100,
+    ...(sinceId != null ? { or_id: [Number(sinceId)] } : {}), // ← omit when not provided
   };
 
-  const data: any = await pnwQuery<any>(apiKey, query, variables);
+  const data = await pnwQuery<any>(apiKey, query, variables);
 
   const alliance = Array.isArray(data?.alliances?.data) ? data.alliances.data[0] : null;
   const recs: any[] = Array.isArray(alliance?.bankrecs) ? alliance.bankrecs : [];
