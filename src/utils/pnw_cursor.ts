@@ -3,17 +3,17 @@ import { PrismaClient } from "@prisma/client";
 
 const prisma = new PrismaClient();
 
-type Json = any;
-
-type PnwApplyLogEntry = {
+export type PnwApplyLogEntry = {
   ts: string;               // ISO timestamp
   actorId: string;          // Discord user id
-  actorTag?: string;        // user tag at time of apply
+  actorTag?: string;        // "name#1234" at apply time
   fromCursor?: number | null;
   toCursor?: number | null;
   records: number;          // records counted/applied
   delta: Record<string, number>; // non-zero deltas applied
 };
+
+type Json = any;
 
 async function getBalancesObj(allianceId: number): Promise<Json> {
   const row = await prisma.allianceTreasury.findUnique({ where: { allianceId } });
@@ -55,8 +55,7 @@ export async function appendPnwApplyLog(allianceId: number, entry: PnwApplyLogEn
   const balances = await getBalancesObj(allianceId);
   const prev: PnwApplyLogEntry[] = (balances?._meta?.pnw?.logs ?? []) as any[];
   const logs = [...prev, entry];
-  // keep last 100
-  while (logs.length > 100) logs.shift();
+  while (logs.length > 100) logs.shift(); // keep last 100
   const next = {
     ...balances,
     _meta: {
@@ -65,4 +64,12 @@ export async function appendPnwApplyLog(allianceId: number, entry: PnwApplyLogEn
     },
   };
   await saveBalancesObj(allianceId, next);
+}
+
+/** Get the most recent N apply log entries (default 10) */
+export async function getPnwLogs(allianceId: number, limit = 10): Promise<PnwApplyLogEntry[]> {
+  const balances = await getBalancesObj(allianceId);
+  const prev: PnwApplyLogEntry[] = (balances?._meta?.pnw?.logs ?? []) as any[];
+  const slice = prev.slice(Math.max(0, prev.length - Math.min(limit, 50))); // hard cap 50
+  return slice.reverse(); // newest first
 }
