@@ -1,5 +1,5 @@
 // src/integrations/pnw/tax.ts
-import { pnwQuery } from "./query";          // <- use the standalone GraphQL client
+import { pnwQuery } from "./query";
 import { getAllianceReadKey } from "./store";
 import { addToTreasury } from "../../utils/treasury";
 
@@ -41,50 +41,59 @@ export type ApplyResult = {
 
 /**
  * --- HELPERS ---
- * We query recent bank records and filter to "tax-related" rows.
- * Keep these simple so we can reuse for preview/apply.
+ * Fetch recent bank records for the alliance, newest-first.
+ * NOTE: PnW GraphQL returns a paginator for `alliances`, so we read from `.data[0]`.
+ * Also, `alliances` expects `ids: [Int]`, not a single `id: Int`.
  */
 async function fetchBankrecsSince(apiKey: string, allianceId: number, sinceId?: number | null) {
-  // Minimal GraphQL; tweak fields/filters if your schema differs.
   const query = `
-    query AllianceBankrecs($id: Int!, $after: Int) {
-      alliances(id: $id) {
-        id
-        bankrecs(after_id: $after, sort: "id", order: "DESC", first: 100) {
+    query AllianceBankrecs($ids: [Int!]!, $after: Int) {
+      alliances(ids: $ids, first: 1) {
+        data {
           id
-          note
-          type
-          sender_type
-          receiver_type
-          money
-          food
-          munitions
-          gasoline
-          steel
-          aluminum
-          oil
-          uranium
-          bauxite
-          coal
-          iron
-          lead
-          created_at
+          bankrecs(after_id: $after, sort: "id", order: "DESC", first: 100) {
+            data {
+              id
+              note
+              type
+              sender_type
+              receiver_type
+              money
+              food
+              munitions
+              gasoline
+              steel
+              aluminum
+              oil
+              uranium
+              bauxite
+              coal
+              iron
+              lead
+              created_at
+            }
+          }
         }
       }
     }
   ` as const;
 
-  const vars: any = { id: allianceId, after: sinceId ?? null };
-  const data: any = await pnwQuery(apiKey, query, vars);
+  const variables = { ids: [Number(allianceId)], after: sinceId ?? null };
+  const data: any = await pnwQuery<any>(apiKey, query, variables);
 
-  const list =
-    data?.alliances?.[0]?.bankrecs?.filter((r: any) =>
-      // Heuristic: automatic tax deposits that credit the alliance
-      (r?.type?.toLowerCase?.() ?? "").includes("tax") ||
-      /\btax\b/i.test(r?.note ?? "")
-    ) ?? [];
+  // Path: alliances (paginator) -> data[0] (Alliance) -> bankrecs (paginator) -> data[] (records)
+  const recs =
+    data?.alliances?.data?.[0]?.bankrecs?.data ??
+    [];
 
-  return list;
+  // Filter to tax-related credits. Adjust if your schema exposes a specific flag/type.
+  const taxy = recs.filter((r: any) => {
+    const t = (r?.type ?? "").toString().toLowerCase();
+    const note = (r?.note ?? "").toString();
+    return t.includes("tax") || /\btax\b/i.test(note);
+  });
+
+  return taxy;
 }
 
 function sumDelta(recs: any[]): PreviewResult {
@@ -92,17 +101,18 @@ function sumDelta(recs: any[]): PreviewResult {
   const delta: ResourceDelta = {};
 
   for (const r of recs) {
-    if (typeof r.id === "number") {
-      if (newestId === null || r.id > newestId) newestId = r.id;
+    const rid = Number(r?.id ?? 0);
+    if (Number.isFinite(rid) && (newestId === null || rid > newestId)) {
+      newestId = rid;
     }
-    // Positive amounts represent credit to alliance
-    const resFields = [
+
+    const fields = [
       "money","food","munitions","gasoline","steel","aluminum",
       "oil","uranium","bauxite","coal","iron","lead",
     ] as const;
 
-    for (const f of resFields) {
-      const v = Number(r[f] ?? 0);
+    for (const f of fields) {
+      const v = Number(r?.[f] ?? 0);
       if (!v) continue;
       delta[f] = (delta[f] ?? 0) + v;
     }
@@ -143,7 +153,6 @@ export async function applyAllianceTaxCreditsStored(
   const applied = confirm && preview.count > 0 && Object.keys(preview.delta).length > 0;
 
   if (applied) {
-    // Reuse your existing treasury utility (creates/updates AllianceTreasury JSON balances).
     await addToTreasury(allianceId, preview.delta, {
       source: "pnw_tax",
       meta: { lastSeenId, newestId: preview.newestId },
