@@ -3,9 +3,34 @@ import {
   SlashCommandBuilder,
   PermissionFlagsBits,
   type ChatInputCommandInteraction,
+  EmbedBuilder,
 } from "discord.js";
 import { getAlliancePnwKey } from "../integrations/pnw/store";
 import { previewAllianceTaxCredits } from "../integrations/pnw/tax";
+
+const RESOURCE_ORDER = [
+  "money",
+  "food",
+  "munitions",
+  "gasoline",
+  "aluminum",
+  "steel",
+  "oil",
+  "uranium",
+  "bauxite",
+  "coal",
+  "iron",
+  "lead",
+] as const;
+
+function fmtNumber(n: number, opts?: { money?: boolean }) {
+  if (opts?.money) {
+    // 2 decimals for money
+    return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+  // integer for units
+  return Math.round(n).toLocaleString();
+}
 
 export const data = new SlashCommandBuilder()
   .setName("pnw_preview_stored")
@@ -20,7 +45,7 @@ export const data = new SlashCommandBuilder()
   .addIntegerOption((opt) =>
     opt
       .setName("last_seen_id")
-      .setDescription("Only count bankrecs with id > this value (optional).")
+      .setDescription("Only include bankrecs with id > this value (optional).")
       .setRequired(false)
   );
 
@@ -46,29 +71,44 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       lastSeenId,
     });
 
+    // Build a clean embed
+    const embed = new EmbedBuilder()
+      .setTitle("PnW Tax Preview (Stored Key)")
+      .setColor(0x00b894)
+      .setDescription(
+        [
+          `**Alliance ID:** \`${allianceId}\``,
+          lastSeenId != null ? `**Filter:** bankrecs with \`id > ${lastSeenId}\`` : "",
+          `**Records counted:** \`${preview.count}\``,
+          `**Newest bankrec id (cursor):** \`${preview.newestId ?? "none"}\``,
+          "",
+          "_Preview sums **incoming tax bank records** (`tax_id != null`, to this alliance) from PnW’s recent window._",
+          "_This is **not** your current alliance bank balance._",
+        ]
+          .filter(Boolean)
+          .join("\n")
+      );
+
+    // Delta field
     const lines: string[] = [];
-    lines.push(`**Alliance ID:** ${allianceId}`);
-    lines.push(`**Records counted:** ${preview.count}`);
-    lines.push(`**Newest bankrec id (cursor):** ${preview.newestId ?? "none"}`);
-    lines.push("");
+    for (const key of RESOURCE_ORDER) {
+      const v = (preview.delta as any)[key] ?? 0;
+      if (!v) continue;
+      lines.push(`• **${key}**: +${fmtNumber(v, { money: key === "money" })}`);
+    }
+    embed.addFields(
+      lines.length
+        ? [{ name: "Tax delta (sum)", value: lines.join("\n"), inline: false }]
+        : [{ name: "Tax delta (sum)", value: "_No positive tax deltas detected._", inline: false }]
+    );
 
-    if (preview.previewLines.length === 0) {
-      lines.push("_No positive tax deltas detected in the recent window._");
-    } else {
-      lines.push("**Tax delta (sum):**");
-      for (const line of preview.previewLines.slice(0, 30)) lines.push(line);
-      if (preview.previewLines.length > 30) {
-        lines.push(`…and ${preview.previewLines.length - 30} more lines`);
-      }
+    if (preview.warnings?.length) {
+      embed.addFields([{ name: "Warnings", value: preview.warnings.map((w) => `• ${w}`).join("\n") }]);
     }
 
-    if (preview.warnings.length) {
-      lines.push("");
-      lines.push("**Warnings:**");
-      for (const w of preview.warnings) lines.push("• " + w);
-    }
+    embed.setFooter({ text: "When ready, /pnw_apply will credit these into your Alliance Treasury." });
 
-    await interaction.editReply(lines.join("\n"));
+    await interaction.editReply({ embeds: [embed] });
   } catch (err: any) {
     await interaction.editReply(
       "Failed to preview via stored key: " + (err?.message ?? String(err)) +
