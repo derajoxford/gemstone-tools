@@ -38,7 +38,7 @@ export async function getPnwCursor(allianceId: number): Promise<number | undefin
 }
 
 /** Write PnW cursor to balances._meta.pnw.cursor (creates row if needed) */
-export async function setPnwCursor(allianceId: number, cursor: number): Promise<void> {
+export async function setPnwCursor(allianceId: number, cursor: number | undefined): Promise<void> {
   const balances = await getBalancesObj(allianceId);
   const next = {
     ...balances,
@@ -72,4 +72,27 @@ export async function getPnwLogs(allianceId: number, limit = 10): Promise<PnwApp
   const prev: PnwApplyLogEntry[] = (balances?._meta?.pnw?.logs ?? []) as any[];
   const slice = prev.slice(Math.max(0, prev.length - Math.min(limit, 50))); // hard cap 50
   return slice.reverse(); // newest first
+}
+
+/** Read the Discord channel id used for hourly summaries */
+export async function getPnwSummaryChannel(allianceId: number): Promise<string | undefined> {
+  const balances = await getBalancesObj(allianceId);
+  const id = balances?._meta?.pnw?.summaryChannelId;
+  return typeof id === "string" && id.length > 0 ? id : undefined;
+}
+
+/** Set/clear the Discord channel id for hourly summaries */
+export async function setPnwSummaryChannel(allianceId: number, channelId?: string): Promise<void> {
+  const balances = await getBalancesObj(allianceId);
+  const next = {
+    ...balances,
+    _meta: {
+      ...(balances._meta ?? {}),
+      pnw: {
+        ...(balances._meta?.pnw ?? {}),
+        summaryChannelId: channelId ?? undefined,
+      },
+    },
+  };
+  await saveBalancesObj(allianceId, next);
 }
