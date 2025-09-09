@@ -78,4 +78,64 @@ export async function readPnwApplyLogs(limit = 50): Promise<PnwApplyLogEntry[]> 
 export async function getPnwLogs(limit = 50) {
   return readPnwApplyLogs(limit);
 }
+// --- Add this at the end of src/utils/pnw_cursor.ts ---
+
+// If not already present in this file:
+export type PnwApplyLogEntry = {
+  ts?: string;                // ISO timestamp
+  allianceId: number;
+  lastSeenId: number | null;
+  newestId: number | null;
+  records: number;
+  delta?: Record<string, number>;
+  applied: boolean;
+  mode: "apply" | "noop";
+  reason?: string;
+};
+
+/**
+ * Best-effort fetch of the most recent apply logs.
+ * 1) If a Prisma model exists (pnwApplyLog), read from it.
+ * 2) Otherwise, try a local JSONL file (storage/pnw-apply.log.ndjson).
+ * 3) Fallback to empty list.
+ */
+export async function getPnwLogs(limit = 20): Promise<PnwApplyLogEntry[]> {
+  try {
+    // @ts-ignore - Optional model; only use if it exists
+    if ((prisma as any)?.pnwApplyLog?.findMany) {
+      const rows = await (prisma as any).pnwApplyLog.findMany({
+        orderBy: { id: "desc" },
+        take: limit,
+      });
+      return rows.map((r: any) => ({
+        ts: r.ts ?? r.createdAt?.toISOString?.() ?? new Date().toISOString(),
+        allianceId: Number(r.allianceId ?? 0),
+        lastSeenId: r.lastSeenId ?? null,
+        newestId: r.newestId ?? null,
+        records: Number(r.records ?? 0),
+        delta: r.delta ?? {},
+        applied: !!r.applied,
+        mode: (r.mode as "apply" | "noop") ?? "noop",
+        reason: r.reason ?? undefined,
+      }));
+    }
+  } catch {
+    // ignore and try file fallback
+  }
+
+  // File fallback (optional)
+  try {
+    const { readFile } = await import("node:fs/promises");
+    const path = `${process.cwd()}/storage/pnw-apply.log.ndjson`;
+    const text = await readFile(path, "utf8").catch(() => "");
+    if (text) {
+      const lines = text.trim().split("\n").slice(-limit);
+      return lines.map((l) => JSON.parse(l));
+    }
+  } catch {
+    // ignore
+  }
+
+  return [];
+}
 
