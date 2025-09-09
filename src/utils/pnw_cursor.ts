@@ -1,99 +1,179 @@
 // src/utils/pnw_cursor.ts
-import { promises as fs } from "node:fs";
-import path from "node:path";
+import { PrismaClient } from "@prisma/client";
+
+const prisma = new PrismaClient();
 
 /**
- * File-backed storage for:
- *  - PnW bankrec cursor per alliance
- *  - Apply logs (/pnw_logs)
- *  - Summary channel per guild (/pnw_summary_channel)
- *
- * Keeps things schema-agnostic and avoids Prisma coupling.
+ * We store small bot state in a simple KV table.
+ * This helper tries a few common model names so we don't have to know your exact Prisma model.
+ * Valid shapes (any of these work):
+ *   - Setting   { id, key, json? | value? }
+ *   - BotSetting{ id, key, json? | value? }
+ *   - Kv        { id, key, json? | value? }
+ *   - KvStore   { id, key, json? | value? }
  */
+function getKVModel(): any {
+  const p = prisma as any;
+  return (
+    p.setting ??
+    p.botSetting ??
+    p.kv ??
+    p.kvStore ??
+    p.Config ??
+    p.config ??
+    null
+  );
+}
 
-const STORAGE_DIR = path.join(process.cwd(), "storage");
-const CURSOR_FILE = path.join(STORAGE_DIR, "pnw-cursor.json");              // { [allianceId]: number }
-const LOG_FILE    = path.join(STORAGE_DIR, "pnw-apply-logs.json");          // PnwApplyLogEntry[]
-const SUMMARY_FILE= path.join(STORAGE_DIR, "pnw-summary-channels.json");    // { [guildId]: channelId }
+async function readKV(key: string): Promise<any | null> {
+  const T = getKVModel();
+  if (!T) throw new Error("KV model not found in Prisma Client.");
 
-type CursorMap = Record<string, number>;
+  // Prefer unique find; fall back to first
+  let row: any = null;
+  try {
+    if (typeof T.findUnique === "function") {
+      row = await T.findUnique({ where: { key } });
+    }
+  } catch {}
+  if (!row && typeof T.findFirst === "function") {
+    row = await T.findFirst({ where: { key } });
+  }
+  if (!row) return null;
 
+  // Try common value fields in order of preference
+  if (row.json !== undefined && row.json !== null) return row.json;
+  if (row.valueJson !== undefined && row.valueJson !== null) return row.valueJson;
+  if (row.value !== undefined && row.value !== null) {
+    // if string, try to parse JSON; else return as-is
+    try {
+      if (typeof row.value === "string") return JSON.parse(row.value);
+      return row.value;
+    } catch {
+      return row.value;
+    }
+  }
+  if (row.data !== undefined && row.data !== null) {
+    try {
+      if (typeof row.data === "string") return JSON.parse(row.data);
+      return row.data;
+    } catch {
+      return row.data;
+    }
+  }
+  return null;
+}
+
+async function writeKV(key: string, val: any): Promise<void> {
+  const T = getKVModel();
+  if (!T) throw new Error("KV model not found in Prisma Client.");
+
+  const existing = typeof T.findFirst === "function" ? await T.findFirst({ where: { key } }) : null;
+  const payload =
+    T.fields?.json || "json" in (existing ?? {}) // detect json field loosely
+      ? { json: val }
+      : T.fields?.value || "value" in (existing ?? {})
+      ? { value: typeof val === "string" ? val : JSON.stringify(val) }
+      : { json: val }; // default to json
+
+  if (existing) {
+    // Prefer update by id when present; else by key
+    const where =
+      existing.id !== undefined
+        ? { id: existing.id }
+        : { key };
+    await T.update({ where, data: { key, ...payload } });
+  } else {
+    await T.create({ data: { key, ...payload } });
+  }
+}
+
+/** -----------------------------
+ *  Keys
+ *  ----------------------------- */
+const CURSOR_KEY = (allianceId: number) => `pnw:cursor:${allianceId}`;
+const LOGS_KEY = `pnw:apply_logs`;
+const SUMMARY_CH_KEY = `pnw:summary_channel`;
+const TAX_IDS_KEY = (allianceId: number) => `pnw:tax_ids:${allianceId}`;
+
+/** -----------------------------
+ *  Types for logs
+ *  ----------------------------- */
 export type PnwApplyLogEntry = {
-  ts: string; // ISO timestamp
+  ts: string; // ISO8601
   allianceId: number;
   lastSeenId: number | null;
   newestId: number | null;
   records: number;
   delta: Record<string, number>;
   applied: boolean;
-  mode: "apply" | "noop" | "error";
-  note?: string;
+  mode: "apply" | "noop";
 };
 
-async function ensureDir() {
-  await fs.mkdir(STORAGE_DIR, { recursive: true });
-}
-
-async function readJson<T>(file: string, fallback: T): Promise<T> {
-  try {
-    const raw = await fs.readFile(file, "utf8");
-    return JSON.parse(raw) as T;
-  } catch {
-    return fallback;
-  }
-}
-
-async function writeJson<T>(file: string, data: T): Promise<void> {
-  await ensureDir();
-  const tmp = file + ".tmp";
-  await fs.writeFile(tmp, JSON.stringify(data, null, 2), "utf8");
-  await fs.rename(tmp, file);
-}
-
-/* -------------------- Cursor helpers -------------------- */
-
+/** -----------------------------
+ *  Cursor helpers
+ *  ----------------------------- */
 export async function getPnwCursor(allianceId: number): Promise<number | null> {
-  const map = await readJson<CursorMap>(CURSOR_FILE, {});
-  const key = String(allianceId);
-  return Object.prototype.hasOwnProperty.call(map, key) ? Number(map[key]) : null;
+  const v = await readKV(CURSOR_KEY(allianceId));
+  if (v === null || v === undefined) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
 }
 
 export async function setPnwCursor(allianceId: number, newestId: number | null): Promise<void> {
-  const map = await readJson<CursorMap>(CURSOR_FILE, {});
-  const key = String(allianceId);
-  if (newestId === null || newestId === undefined) {
-    delete map[key];
-  } else {
-    map[key] = Number(newestId);
-  }
-  await writeJson(CURSOR_FILE, map);
+  await writeKV(CURSOR_KEY(allianceId), newestId ?? null);
 }
 
-/* -------------------- Apply log helpers -------------------- */
-
+/** -----------------------------
+ *  Logs helpers
+ *  ----------------------------- */
 export async function appendPnwApplyLog(entry: PnwApplyLogEntry): Promise<void> {
-  const arr = await readJson<PnwApplyLogEntry[]>(LOG_FILE, []);
-  arr.push({ ...entry, ts: entry.ts ?? new Date().toISOString() });
-  // retain last 1000 only
-  const sliced = arr.slice(-1000);
-  await writeJson(LOG_FILE, sliced);
+  const arr = (await readKV(LOGS_KEY)) ?? [];
+  const list = Array.isArray(arr) ? arr : [];
+  list.push(entry);
+  // Keep last 500 entries to bound storage
+  const trimmed = list.slice(-500);
+  await writeKV(LOGS_KEY, trimmed);
 }
 
 export async function getPnwLogs(limit = 50): Promise<PnwApplyLogEntry[]> {
-  const arr = await readJson<PnwApplyLogEntry[]>(LOG_FILE, []);
-  arr.sort((a, b) => (a.ts < b.ts ? 1 : a.ts > b.ts ? -1 : 0)); // newest first
-  return arr.slice(0, limit);
+  const arr = (await readKV(LOGS_KEY)) ?? [];
+  const list = Array.isArray(arr) ? arr : [];
+  const n = Math.max(1, Math.min(limit, 200));
+  return list.slice(-n);
 }
 
-/* -------------------- Summary channel helpers -------------------- */
-
-export async function getPnwSummaryChannel(guildId: string): Promise<string | null> {
-  const map = await readJson<Record<string, string>>(SUMMARY_FILE, {});
-  return map[guildId] ?? null;
+/** -----------------------------
+ *  Summary channel
+ *  ----------------------------- */
+export async function getPnwSummaryChannel(): Promise<string | null> {
+  const v = await readKV(SUMMARY_CH_KEY);
+  if (v == null) return null;
+  const s = String(v).trim();
+  return s.length ? s : null;
 }
 
-export async function setPnwSummaryChannel(guildId: string, channelId: string): Promise<void> {
-  const map = await readJson<Record<string, string>>(SUMMARY_FILE, {});
-  map[guildId] = channelId;
-  await writeJson(SUMMARY_FILE, map);
+export async function setPnwSummaryChannel(channelId: string | null): Promise<void> {
+  await writeKV(SUMMARY_CH_KEY, channelId ?? null);
+}
+
+/** -----------------------------
+ *  Tax ID list per alliance
+ *  ----------------------------- */
+export async function getAllianceTaxIds(allianceId: number): Promise<number[]> {
+  const v = await readKV(TAX_IDS_KEY(allianceId));
+  if (!v) return [];
+  const arr = Array.isArray(v) ? v : [];
+  return arr
+    .map((x) => Number(x))
+    .filter((n) => Number.isFinite(n));
+}
+
+export async function setPnwTaxIds(allianceId: number, ids: number[]): Promise<void> {
+  const unique = Array.from(new Set(ids.map((x) => Number(x)).filter((n) => Number.isFinite(n))));
+  await writeKV(TAX_IDS_KEY(allianceId), unique);
+}
+
+export async function clearAllianceTaxIds(allianceId: number): Promise<void> {
+  await writeKV(TAX_IDS_KEY(allianceId), []);
 }
