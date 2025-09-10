@@ -1,216 +1,133 @@
 // src/integrations/pnw/tax.ts
 import { pnwQuery } from "./query";
 import { getAllianceReadKey } from "./store";
-import { addToTreasury } from "../../utils/treasury";
-import { getAllowedTaxIds } from "../../utils/pnw_tax_ids";
-import { appendTaxHistory } from "../../utils/pnw_tax_history";
+import { getPnwCursor } from "../../utils/pnw_cursor";
 
 /**
- * --- TYPES ---
+ * Minimal shape we need from PnW bankrecs to detect automated tax deposits.
  */
-export type ResourceDelta = Record<string, number>;
+type Bankrec = {
+  id: number | string;
+  date: string;
+  note?: string | null;
+  sender_type?: number | string | null;
+  receiver_type?: number | string | null;
+  sender_id?: number | string | null;
+  receiver_id?: number | string | null;
 
-export type PreviewArgs = {
-  apiKey: string;
-  allianceId: number;
-  /** Optional: only count records with id > sinceId */
-  sinceId?: number | null;
-  /** Optional: how many recent taxrecs to fetch from API (default 250; API window is 14 days) */
-  limit?: number;
+  money?: number | string | null;
+  food?: number | string | null;
+  coal?: number | string | null;
+  oil?: number | string | null;
+  uranium?: number | string | null;
+  lead?: number | string | null;
+  iron?: number | string | null;
+  bauxite?: number | string | null;
+  gasoline?: number | string | null;
+  munitions?: number | string | null;
+  steel?: number | string | null;
+  aluminum?: number | string | null;
 };
 
-export type PreviewResult = {
-  count: number;
-  newestId: number | null;
-  delta: ResourceDelta;
-};
-
-export type ApplyArgsStored = {
-  allianceId: number;
-  /** Optional lower cursor (exclusive) */
-  lastSeenId?: number | null;
-  /** If false, preview only (no treasury write / history append) */
-  confirm?: boolean;
-  /** Optional fetch cap */
-  limit?: number;
-};
-
-export type ApplyResult = {
-  allianceId: number;
-  lastSeenId: number | null;
-  newestId: number | null;
-  records: number;
-  delta: ResourceDelta;
-  applied: boolean;
-  mode: "apply" | "noop";
-};
-
-/**
- * --- INTERNAL HELPERS ---
- */
-
-const RES_FIELDS = [
-  "money",
-  "food",
-  "munitions",
-  "gasoline",
-  "steel",
-  "aluminum",
-  "oil",
-  "uranium",
-  "bauxite",
-  "coal",
-  "iron",
-  "lead",
+const RES_KEYS = [
+  "money","food","coal","oil","uranium","lead","iron","bauxite","gasoline","munitions","steel","aluminum",
 ] as const;
 
-type TaxRec = {
-  id: number;
-  date?: string | null;
-  note?: string | null;
-  tax_id?: number | null;
-} & { [K in (typeof RES_FIELDS)[number]]?: number | null };
+const toInt = (v: any) => Number.parseInt(String(v ?? 0), 10) || 0;
+const toNum = (v: any) => Number.parseFloat(String(v ?? 0)) || 0;
 
-async function fetchTaxRecs(
-  apiKey: string,
+export type PreviewTaxResult = {
+  allianceId: number;
+  count: number;
+  newestId: number | null;
+  delta: Record<string, number>;
+};
+
+/**
+ * Fetch recent bankrecs for an alliance and filter to “Automated Tax …” records
+ * that are incoming to the alliance (nation -> alliance). We also honor the stored cursor.
+ */
+export async function previewAllianceTaxCreditsStored(
   allianceId: number,
-  limit = 250,
-): Promise<TaxRec[]> {
-  // alliances(id: [Int]) -> { data: [Alliance] } -> taxrecs(limit: Int)
-  const query = `
-    query TaxRecs($ids: [Int!]!, $limit: Int) {
-      alliances(id: $ids, first: 1) {
+  lookbackLimit = 500
+): Promise<PreviewTaxResult> {
+  const apiKey = await getAllianceReadKey(allianceId);
+  if (!apiKey) throw new Error("No stored PnW API key for this alliance.");
+
+  const lastSeen = await getPnwCursor(allianceId); // number | 0
+  const q = `
+    query Bankrecs($ids: [Int]!, $limit: Int!) {
+      alliances(id: $ids) {
         data {
           id
-          taxrecs(limit: $limit) {
+          bankrecs(limit: $limit) {
             id
             date
             note
-            tax_id
+            sender_type
+            receiver_type
+            sender_id
+            receiver_id
             money
             food
-            munitions
-            gasoline
-            steel
-            aluminum
+            coal
             oil
             uranium
-            bauxite
-            coal
-            iron
             lead
+            iron
+            bauxite
+            gasoline
+            munitions
+            steel
+            aluminum
           }
         }
       }
     }
   ` as const;
 
-  const vars = { ids: [allianceId], limit };
-  const data: any = await pnwQuery(apiKey, query, vars);
+  const data: any = await pnwQuery(apiKey, q, { ids: [allianceId], limit: lookbackLimit });
 
-  const list: TaxRec[] =
-    data?.alliances?.data?.[0]?.taxrecs ?? [];
+  // Cope with either alliances -> data -> [Alliance] or older shapes
+  const alliancesArr: any[] =
+    data?.alliances?.data ??
+    data?.alliances ??
+    [];
 
-  // API already returns "Automated Tax" only via taxrecs; no note filtering needed.
-  return list;
-}
+  const al = alliancesArr[0];
+  const recs: Bankrec[] = Array.isArray(al?.bankrecs) ? al.bankrecs : [];
 
-function sumDelta(recs: TaxRec[]): PreviewResult {
-  let newestId: number | null = null;
-  const delta: ResourceDelta = {};
+  // Filter to:
+  //  - Automated Tax notes (prefix match, case-insensitive)
+  //  - incoming to alliance (receiver_type == 2) to be safe
+  //  - strictly greater than stored cursor id
+  const taxRecs = recs.filter((r) => {
+    const note = String(r?.note || "");
+    const isTax = /^Automated Tax\b/i.test(note);
+    const isIncomingToAlliance = toInt(r?.receiver_type) === 2;
+    const idOk = toInt(r?.id) > (toInt(lastSeen) || 0);
+    return isTax && isIncomingToAlliance && idOk;
+  });
 
-  for (const r of recs) {
-    if (typeof r.id === "number") {
-      if (newestId === null || r.id > newestId) newestId = r.id;
+  // Sum positive amounts for the tax deltas
+  const delta: Record<string, number> = {};
+  for (const k of RES_KEYS) delta[k] = 0;
+  for (const r of taxRecs) {
+    for (const k of RES_KEYS) {
+      const v = toNum((r as any)[k]);
+      if (v > 0) delta[k] += v;
     }
-    for (const f of RES_FIELDS) {
-      const v = Number(r[f] ?? 0);
-      if (!v) continue;
-      delta[f] = (delta[f] ?? 0) + v;
-    }
   }
-  return { count: recs.length, newestId, delta };
-}
 
-function applySinceAndFilter(
-  recs: TaxRec[],
-  sinceId: number | null | undefined,
-  allowedTaxIds: number[] | null,
-): TaxRec[] {
-  let out = recs;
-  if (sinceId != null) {
-    out = out.filter((r) => Number(r.id) > Number(sinceId));
-  }
-  if (allowedTaxIds && allowedTaxIds.length) {
-    const allow = new Set(allowedTaxIds.map(Number));
-    out = out.filter((r) => r?.tax_id && allow.has(Number(r.tax_id)));
-  }
-  return out;
-}
-
-/**
- * --- PUBLIC API (manual-key) ---
- * Useful for /pnw_preview (user pastes a key directly).
- */
-export async function previewAllianceTaxCredits(args: PreviewArgs): Promise<PreviewResult> {
-  const { apiKey, allianceId, sinceId = null, limit = 250 } = args;
-  const recs = await fetchTaxRecs(apiKey, allianceId, limit);
-  // Manual-key preview does not apply stored tax_id filtering.
-  const filtered = applySinceAndFilter(recs, sinceId, null);
-  return sumDelta(filtered);
-}
-
-/**
- * --- PUBLIC API (stored-key) ---
- */
-
-export async function previewAllianceTaxCreditsStored(
-  allianceId: number,
-  sinceId?: number | null,
-  limit = 250,
-): Promise<PreviewResult> {
-  const apiKey = await getAllianceReadKey(allianceId); // throws if missing/undecryptable
-  const recs = await fetchTaxRecs(apiKey, allianceId, limit);
-  const allow = await getAllowedTaxIds(allianceId);
-  const filtered = applySinceAndFilter(recs, sinceId ?? null, allow ?? null);
-  return sumDelta(filtered);
-}
-
-/**
- * Apply: fetch tax records after lastSeenId and (optionally) add to treasury.
- * Also persists the processed records into our local long-term history store.
- * Note: saving the cursor & writing an "apply log" is still done by the /pnw_apply command.
- */
-export async function applyAllianceTaxCreditsStored(
-  args: ApplyArgsStored,
-): Promise<ApplyResult> {
-  const { allianceId, lastSeenId = null, confirm = true, limit = 250 } = args;
-  const apiKey = await getAllianceReadKey(allianceId);
-
-  const recs = await fetchTaxRecs(apiKey, allianceId, limit);
-  const allow = await getAllowedTaxIds(allianceId);
-  const filtered = applySinceAndFilter(recs, lastSeenId, allow ?? null);
-
-  const preview = sumDelta(filtered);
-  const applied = confirm && preview.count > 0 && Object.keys(preview.delta).length > 0;
-
-  if (applied) {
-    await addToTreasury(allianceId, preview.delta, {
-      source: "pnw_tax",
-      meta: { lastSeenId, newestId: preview.newestId },
-    });
-
-    // Persist raw records we just applied so data survives the 14-day API window.
-    await appendTaxHistory(allianceId, filtered);
-  }
+  // newestId among the processed tax records
+  const newestId = taxRecs.length
+    ? taxRecs.map((r) => toInt(r.id)).reduce((a, b) => Math.max(a, b), 0)
+    : null;
 
   return {
     allianceId,
-    lastSeenId,
-    newestId: preview.newestId,
-    records: preview.count,
-    delta: preview.delta,
-    applied,
-    mode: applied ? "apply" : "noop",
+    count: taxRecs.length,
+    newestId,
+    delta,
   };
 }
