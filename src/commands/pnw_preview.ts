@@ -4,51 +4,77 @@ import {
   ChatInputCommandInteraction,
   PermissionFlagsBits,
 } from "discord.js";
+import { resourceEmbed } from "../lib/embeds";
 import { previewAllianceTaxCreditsStored } from "../integrations/pnw/tax";
 
-function fmtDelta(delta: Record<string, number> | undefined) {
-  const d = delta ?? {};
-  const keys = Object.keys(d).filter((k) => d[k]);
-  if (!keys.length) return "—";
-  return keys.map((k) => `• ${k}: ${d[k]}`).join("\n");
+type ResourceDelta = Record<string, number>;
+
+function codeBlock(s: string) {
+  return s ? "```\n" + s + "\n```" : "—";
+}
+function formatDelta(delta: ResourceDelta): string {
+  const keys = Object.keys(delta || {});
+  const lines: string[] = [];
+  for (const k of keys) {
+    const v = Number(delta[k] ?? 0);
+    if (!v) continue;
+    const asStr =
+      k === "money"
+        ? v.toLocaleString(undefined, { maximumFractionDigits: 2 })
+        : Math.round(v).toLocaleString();
+    lines.push(`${k.padEnd(10)} +${asStr}`);
+  }
+  return lines.join("\n");
 }
 
 export const data = new SlashCommandBuilder()
   .setName("pnw_preview")
-  .setDescription("Preview alliance tax credits using the stored PnW key")
+  .setDescription("Preview PnW tax credits using the stored key (no apply).")
   .addIntegerOption((o) =>
     o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
   )
   .addIntegerOption((o) =>
     o
-      .setName("since_id")
-      .setDescription("Only consider bankrecs with id > since_id")
-      .setRequired(false),
+      .setName("last_seen")
+      .setDescription("Override cursor: only records with id > last_seen"),
   )
-  // restrict to managers to avoid spam
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .setDMPermission(false);
 
 export async function execute(interaction: ChatInputCommandInteraction) {
   await interaction.deferReply({ ephemeral: true });
+
   try {
     const allianceId = interaction.options.getInteger("alliance_id", true)!;
-    const sinceId = interaction.options.getInteger("since_id") ?? null;
+    const lastSeen = interaction.options.getInteger("last_seen") ?? null;
 
-    const preview = await previewAllianceTaxCreditsStored(allianceId, sinceId);
+    const preview = await previewAllianceTaxCreditsStored(allianceId, lastSeen);
+    const count = preview?.count ?? 0;
+    const newestId = preview?.newestId ?? null;
+    const delta = (preview?.delta ?? {}) as ResourceDelta;
 
-    await interaction.editReply(
-      [
+    const embed = resourceEmbed({
+      title: "PnW Tax Preview (Stored Key)",
+      subtitle: [
         `**Alliance:** ${allianceId}`,
-        `**Records counted:** ${preview.count}`,
-        `**newestId:** ${preview.newestId ?? "—"}`,
-        `**Delta:**`,
-        fmtDelta(preview.delta),
+        `**Cursor:** id > ${lastSeen ?? 0}`,
+        `**Records counted:** ${count}`,
+        `**Newest bankrec id:** ${newestId ?? "—"}`,
       ].join("\n"),
-    );
+      fields: [
+        {
+          name: "Tax delta (sum)",
+          value: codeBlock(formatDelta(delta)),
+        },
+      ],
+      color: 0x5865f2,
+      footer: "Preview only. Use /pnw_apply confirm:true to apply and advance cursor.",
+    });
+
+    await interaction.editReply({ embeds: [embed] });
   } catch (err: any) {
-    const msg = err?.message || String(err);
-    await interaction.editReply(`❌ ${msg}`);
-    console.error("[/pnw_preview] error:", err);
+    await interaction.editReply(
+      `❌ Failed to preview: ${err?.message || String(err)}`,
+    );
   }
 }
