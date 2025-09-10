@@ -6,8 +6,6 @@ import {
 } from "discord.js";
 import { getAllianceReadKey } from "../integrations/pnw/store";
 import { pnwQuery } from "../integrations/pnw/query";
-
-// Local JSON store for allowed tax IDs
 import { getAllowedTaxIds, setAllowedTaxIds } from "../utils/pnw_tax_ids";
 
 // -------- helpers --------
