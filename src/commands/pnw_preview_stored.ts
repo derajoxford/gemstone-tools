@@ -1,8 +1,5 @@
 // src/commands/pnw_preview_stored.ts
-import {
-  SlashCommandBuilder,
-  ChatInputCommandInteraction,
-} from "discord.js";
+import { SlashCommandBuilder, ChatInputCommandInteraction } from "discord.js";
 import { previewAllianceTaxCreditsStored } from "../integrations/pnw/tax";
 import { getAllowedTaxIds } from "../utils/pnw_tax_ids";
 
@@ -35,7 +32,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     await interaction.editReply(
       [
         `**Alliance:** ${allianceId}`,
-        `**Filter tax_id(s):** ${allowed.length ? allowed.join(", ") : "none (heuristic)"}`,
+        `**Filter tax_id(s):** ${allowed.length ? allowed.join(", ") : "none (heuristic tax_id>0)"}`,
         `**Records:** ${res.count}`,
         `**Newest ID:** ${res.newestId ?? "—"}`,
         `**Delta:** ${fmtDelta(res.delta)}`,
@@ -43,7 +40,9 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     );
   } catch (err: any) {
     const msg = err?.message || String(err);
-    await interaction.editReply(`Failed to preview via stored key: ${msg}\nIf this persists, re-link with /pnw_set.`);
+    await interaction.editReply(
+      `Failed to preview via stored key: ${msg}\nIf this persists, re-link with /pnw_set.`,
+    );
     console.error("[/pnw_preview_stored] error:", err);
   }
 }
