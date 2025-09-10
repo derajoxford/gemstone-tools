@@ -4,15 +4,11 @@ import {
   ChatInputCommandInteraction,
   PermissionFlagsBits,
 } from "discord.js";
+import { getAllowedTaxIds, setAllowedTaxIds, clearAllowedTaxIds } from "../utils/pnw_tax_ids";
 import { getAllianceReadKey } from "../integrations/pnw/store";
 import { pnwQuery } from "../integrations/pnw/query";
-import {
-  getAllowedTaxIds,
-  setAllowedTaxIds,
-  clearAllowedTaxIds,
-} from "../utils/pnw_tax_ids";
 
-// -------- helpers --------
+// ---------- helpers ----------
 function parseIdList(s: string): number[] {
   return s
     .split(/[\s,]+/)
@@ -22,20 +18,13 @@ function parseIdList(s: string): number[] {
     .filter((n) => Number.isInteger(n) && n >= 0);
 }
 
-function pickAllianceNode(node: any): any | null {
-  // Some schemas return an array for alliances(id: X), others a single object.
-  if (!node) return null;
-  if (Array.isArray(node)) return node[0] ?? null;
-  return node;
-}
-
 async function sniffTaxIdsUsingStoredKey(allianceId: number, lookbackLimit = 250) {
-  // Keep the query minimal & schema-friendly: no "ids", no after/or_id.
+  // Use the compatible shape (no paginator, no after DateTime)
   const query = `
     query SniffTaxIds($id: Int!, $limit: Int!) {
       alliances(id: $id) {
         id
-        bankrecs(limit: $limit, orderBy: "id desc") {
+        bankrecs(limit: $limit) {
           id
           tax_id
         }
@@ -46,8 +35,7 @@ async function sniffTaxIdsUsingStoredKey(allianceId: number, lookbackLimit = 250
   const apiKey = await getAllianceReadKey(allianceId);
   const data: any = await pnwQuery(apiKey, query, { id: allianceId, limit: lookbackLimit });
 
-  const alliancesNode = pickAllianceNode(data?.alliances);
-  const recs: any[] = alliancesNode?.bankrecs ?? [];
+  const recs: any[] = data?.alliances?.[0]?.bankrecs ?? [];
   const counts = new Map<number, number>();
   for (const r of recs) {
     const tid = Number(r?.tax_id ?? 0);
@@ -65,11 +53,11 @@ function fmtList(nums: number[]) {
 
 async function replyError(interaction: ChatInputCommandInteraction, err: unknown) {
   const msg = err instanceof Error ? err.message : String(err);
-  try { await interaction.editReply(`❌ ${msg}`); } catch {}
+  await interaction.editReply(`❌ ${msg}`);
   console.error("[/pnw_tax_ids] error:", err);
 }
 
-// -------- slash command --------
+// ---------- slash command ----------
 export const data = new SlashCommandBuilder()
   .setName("pnw_tax_ids")
   .setDescription("Manage which PnW tax_id values are treated as tax credits")
@@ -81,7 +69,11 @@ export const data = new SlashCommandBuilder()
         o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
       )
       .addIntegerOption((o) =>
-        o.setName("limit").setDescription("Bank records to scan (default 250)").setMinValue(50).setMaxValue(500),
+        o
+          .setName("limit")
+          .setDescription("Bank records to scan (default 250)")
+          .setMinValue(50)
+          .setMaxValue(500),
       ),
   )
   .addSubcommand((s) =>
@@ -100,7 +92,10 @@ export const data = new SlashCommandBuilder()
         o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
       )
       .addStringOption((o) =>
-        o.setName("ids").setDescription("Comma/space separated tax IDs (e.g. 12, 34 56)").setRequired(true),
+        o
+          .setName("ids")
+          .setDescription("Comma/space separated tax IDs (e.g. 27291 12345)")
+          .setRequired(true),
       ),
   )
   .addSubcommand((s) =>
