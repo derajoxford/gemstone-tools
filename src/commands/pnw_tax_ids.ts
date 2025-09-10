@@ -1,50 +1,106 @@
-// src/commands/pnw_tax_ids.ts
-import {
-  SlashCommandBuilder,
-  ChatInputCommandInteraction,
-  PermissionFlagsBits,
-} from "discord.js";
-import { getAllianceReadKey } from "../integrations/pnw/store";
-import { pnwQuery } from "../integrations/pnw/query";
-import {
-  getAllowedTaxIds,
-  setAllowedTaxIds,
-  clearAllowedTaxId as _clearOne, // optional helper, not used here
-} from "../utils/pnw_tax_ids";
+// src/integrations/pnw/tax.ts
 
-// ---- small utils ----
-function parseIdList(s: string): number[] {
-  return s
-    .split(/[\s,]+/)
-    .map((t) => t.trim())
-    .filter(Boolean)
-    .map((t) => Number(t))
-    .filter((n) => Number.isInteger(n) && n >= 0);
+import { pnwQuery } from "./query";
+import { getAllianceReadKey } from "./store";
+import { addToTreasury } from "../../utils/treasury";
+import { getAllowedTaxIds } from "../../utils/pnw_tax_ids";
+
+/** --- TYPES --- */
+export type ResourceDelta = Record<string, number>;
+
+export type PreviewArgs = {
+  apiKey: string;
+  allianceId: number;
+  /** Optional lower cursor (exclusive): only records with id > sinceId are counted */
+  sinceId?: number | null;
+  /** Optional hard cap on bankrecs pulled (we filter by id client-side) */
+  limit?: number;
+};
+
+export type PreviewResult = {
+  count: number;
+  newestId: number | null;
+  delta: ResourceDelta;
+};
+
+export type ApplyArgsStored = {
+  allianceId: number;
+  /** Optional lower cursor (exclusive) */
+  lastSeenId?: number | null;
+  /** If false, just preview and do not add to treasury */
+  confirm?: boolean;
+};
+
+export type ApplyResult = {
+  allianceId: number;
+  lastSeenId: number | null;
+  newestId: number | null;
+  records: number;
+  delta: ResourceDelta;
+  applied: boolean;
+  mode: "apply" | "noop";
+};
+
+/** --- INTERNAL HELPERS --- */
+
+const RESOURCE_FIELDS = [
+  "money",
+  "food",
+  "munitions",
+  "gasoline",
+  "steel",
+  "aluminum",
+  "oil",
+  "uranium",
+  "bauxite",
+  "coal",
+  "iron",
+  "lead",
+] as const;
+
+type Bankrec = {
+  id: number;
+  tax_id?: number | null;
+  stype?: string | null;
+  rtype?: string | null;
+  note?: string | null;
+  date?: string | null;
+} & Partial<Record<(typeof RESOURCE_FIELDS)[number], number>>;
+
+function isTaxRec(r: Bankrec, allowedIds: number[]): boolean {
+  const tid = Number(r?.tax_id ?? 0);
+  if (allowedIds.length > 0) return allowedIds.includes(tid);
+  // Fallback heuristic when no filter saved (very conservative):
+  // require a tax_id and "nation -> alliance" style credit.
+  const s = (r.stype || "").toLowerCase();
+  const t = (r.rtype || "").toLowerCase();
+  return !!tid && (s === "nation" && t === "alliance");
 }
 
-function fmtList(nums: number[]) {
-  return nums.length ? nums.join(", ") : "—";
+function sumDelta(recs: Bankrec[]): PreviewResult {
+  let newestId: number | null = null;
+  const delta: ResourceDelta = {};
+  for (const r of recs) {
+    if (typeof r.id === "number") {
+      if (newestId === null || r.id > newestId) newestId = r.id;
+    }
+    for (const f of RESOURCE_FIELDS) {
+      const v = Number(r[f] ?? 0);
+      if (!v) continue;
+      delta[f] = (delta[f] ?? 0) + v;
+    }
+  }
+  return { count: recs.length, newestId, delta };
 }
 
-async function replyError(interaction: ChatInputCommandInteraction, err: unknown) {
-  const msg = err instanceof Error ? err.message : String(err);
-  await interaction.editReply(`❌ ${msg}`);
-  console.error("[/pnw_tax_ids] error:", err);
-}
-
-// ---- sniff helper (with schema-safe query + tiny debug dump) ----
-async function sniffTaxIdsUsingStoredKey(
+async function fetchBankrecs(
+  apiKey: string,
   allianceId: number,
-  lookbackLimit = 250,
-): Promise<{
-  counts: { id: number; count: number }[];
-  sample: string[];
-  total: number;
-}> {
-  const apiKey = await getAllianceReadKey(allianceId);
-
+  limit = 500,
+): Promise<Bankrec[]> {
+  // IMPORTANT: alliances(id: [Int!]) returns a paginator => use .data { ... }
   const query = /* GraphQL */ `
-    query SniffTaxIds($ids: [Int!]!, $limit: Int!) {
+    query FetchBankrecs($ids: [Int!]!, $limit: Int!) {
       alliances(id: $ids) {
         data {
           id
@@ -54,155 +110,72 @@ async function sniffTaxIdsUsingStoredKey(
             stype
             rtype
             note
+            date
+            money
+            food
+            munitions
+            gasoline
+            steel
+            aluminum
+            oil
+            uranium
+            bauxite
+            coal
+            iron
+            lead
           }
         }
       }
     }
   `;
-  const vars = { ids: [allianceId], limit: lookbackLimit };
-  const data: any = await pnwQuery(apiKey, query, vars);
+  const data: any = await pnwQuery(apiKey, query, { ids: [allianceId], limit });
+  const recs: Bankrec[] = data?.alliances?.data?.[0]?.bankrecs ?? [];
+  return Array.isArray(recs) ? recs : [];
+}
 
-  const recs: any[] = data?.alliances?.data?.[0]?.bankrecs ?? [];
-  const counts = new Map<number, number>();
-  for (const r of recs) {
-    const tid = Number(r?.tax_id ?? 0);
-    if (!tid) continue;
-    counts.set(tid, (counts.get(tid) ?? 0) + 1);
-  }
+/** --- PUBLIC API (manual key) --- */
+/** Needed by /pnw_preview (imports this symbol). */
+export async function previewAllianceTaxCredits(args: PreviewArgs): Promise<PreviewResult> {
+  const { apiKey, allianceId, sinceId = null, limit = 500 } = args;
+  const allowed = await getAllowedTaxIds(allianceId);
+  const all = await fetchBankrecs(apiKey, allianceId, limit);
+  const filtered = all.filter(
+    (r) => (sinceId == null || r.id > (sinceId as number)) && isTaxRec(r, allowed),
+  );
+  return sumDelta(filtered);
+}
 
-  // build a short debug sample so we can see what's actually coming back
-  const sample: string[] = [];
-  for (const r of recs.slice(0, 10)) {
-    const line =
-      `• ${r.id} | tax_id=${r.tax_id ?? "—"} | stype=${r.stype ?? "—"} | rtype=${r.rtype ?? "—"} | note=${(r.note ?? "").slice(0, 60)}`;
-    sample.push(line);
+/** --- PUBLIC API (stored key wrappers) --- */
+export async function previewAllianceTaxCreditsStored(
+  allianceId: number,
+  sinceId?: number | null,
+  limit = 500,
+): Promise<PreviewResult> {
+  const apiKey = await getAllianceReadKey(allianceId); // throws if missing/undecipherable
+  return previewAllianceTaxCredits({ apiKey, allianceId, sinceId: sinceId ?? null, limit });
+}
+
+export async function applyAllianceTaxCreditsStored(
+  args: ApplyArgsStored,
+): Promise<ApplyResult> {
+  const { allianceId, lastSeenId = null, confirm = true } = args;
+  const preview = await previewAllianceTaxCreditsStored(allianceId, lastSeenId);
+  const applied = confirm && preview.count > 0 && Object.keys(preview.delta).length > 0;
+
+  if (applied) {
+    await addToTreasury(allianceId, preview.delta, {
+      source: "pnw_tax",
+      meta: { lastSeenId, newestId: preview.newestId },
+    });
   }
 
   return {
-    counts: [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([id, count]) => ({ id, count })),
-    sample,
-    total: recs.length,
+    allianceId,
+    lastSeenId,
+    newestId: preview.newestId,
+    records: preview.count,
+    delta: preview.delta,
+    applied,
+    mode: applied ? "apply" : "noop",
   };
-}
-
-// ---- slash command ----
-export const data = new SlashCommandBuilder()
-  .setName("pnw_tax_ids")
-  .setDescription("Manage which PnW tax_id values are treated as tax credits")
-  .addSubcommand((s) =>
-    s
-      .setName("sniff")
-      .setDescription("Scan recent bank records and suggest tax_id values (shows a small debug sample)")
-      .addIntegerOption((o) =>
-        o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
-      )
-      .addIntegerOption((o) =>
-        o
-          .setName("limit")
-          .setDescription("Bank records to scan (default 250)")
-          .setMinValue(50)
-          .setMaxValue(500),
-      ),
-  )
-  .addSubcommand((s) =>
-    s
-      .setName("get")
-      .setDescription("Show stored tax_id filter")
-      .addIntegerOption((o) =>
-        o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
-      ),
-  )
-  .addSubcommand((s) =>
-    s
-      .setName("set")
-      .setDescription("Set stored tax_id filter")
-      .addIntegerOption((o) =>
-        o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
-      )
-      .addStringOption((o) =>
-        o
-          .setName("ids")
-          .setDescription("Comma/space separated tax IDs (e.g. 12, 34 56)")
-          .setRequired(true),
-      ),
-  )
-  .addSubcommand((s) =>
-    s
-      .setName("clear")
-      .setDescription("Clear stored tax_id filter")
-      .addIntegerOption((o) =>
-        o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
-      ),
-  )
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-  .setDMPermission(false);
-
-export async function execute(interaction: ChatInputCommandInteraction) {
-  await interaction.deferReply({ ephemeral: true });
-  try {
-    const sub = interaction.options.getSubcommand(true);
-    const allianceId = interaction.options.getInteger("alliance_id", true)!;
-
-    if (sub === "sniff") {
-      const limit = interaction.options.getInteger("limit") ?? 250;
-      const { counts, sample, total } = await sniffTaxIdsUsingStoredKey(allianceId, limit);
-
-      const lines: string[] = [];
-      lines.push(`**Alliance:** ${allianceId}`);
-      lines.push(`**Lookback:** ${limit} (returned ${total} rows)`);
-      if (counts.length === 0) {
-        lines.push(`No \`tax_id\` values detected.`);
-      } else {
-        lines.push(`**Detected \`tax_id\` values:**`);
-        lines.push(...counts.map((p) => `• \`${p.id}\`  (${p.count} hits)`));
-      }
-
-      // small debug sample (up to 10)
-      lines.push("");
-      lines.push("**Sample (first 10 rows):**");
-      lines.push(...(sample.length ? sample : ["(no rows returned)"]));
-
-      if (counts.length > 0) {
-        lines.push("");
-        lines.push("You can store a filter with:");
-        lines.push(`\`/pnw_tax_ids set alliance_id:${allianceId} ids:<list from above>\``);
-      }
-
-      await interaction.editReply(lines.join("\n"));
-      return;
-    }
-
-    if (sub === "get") {
-      const ids = await getAllowedTaxIds(allianceId);
-      await interaction.editReply(
-        `Stored tax_id filter for **${allianceId}**: ${fmtList(ids ?? [])}`,
-      );
-      return;
-    }
-
-    if (sub === "set") {
-      const raw = interaction.options.getString("ids", true);
-      const ids = parseIdList(raw);
-      if (!ids.length) {
-        await interaction.editReply("Please provide at least one integer tax_id.");
-        return;
-      }
-      await setAllowedTaxIds(allianceId, ids);
-      await interaction.editReply(
-        `Saved tax_id filter for **${allianceId}**: ${fmtList(ids)}\n` +
-          "Future previews/apply will only count bankrecs whose `tax_id` is in this list.",
-      );
-      return;
-    }
-
-    if (sub === "clear") {
-      await setAllowedTaxIds(allianceId, []); // simple clear
-      await interaction.editReply(`Cleared stored tax_id filter for **${allianceId}**.`);
-      return;
-    }
-
-    await interaction.editReply("Unknown subcommand.");
-  } catch (err) {
-    await replyError(interaction, err);
-  }
 }
