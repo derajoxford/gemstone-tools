@@ -1,72 +1,99 @@
 // src/commands/pnw_set.ts
 import {
   SlashCommandBuilder,
+  ChatInputCommandInteraction,
   PermissionFlagsBits,
-  type ChatInputCommandInteraction,
 } from "discord.js";
-import { previewAllianceTaxCredits } from "../integrations/pnw/tax";
-import { saveAlliancePnwKey } from "../integrations/pnw/store";
-import { secretConfigured } from "../utils/secret";
+import { PrismaClient } from "@prisma/client";
+import { seal } from "../lib/crypto";
+import { resourceEmbed } from "../lib/embeds";
+import { previewAllianceTaxCreditsStored } from "../integrations/pnw/tax";
+
+const prisma = new PrismaClient();
+
+type ResourceDelta = Record<string, number>;
+
+function codeBlock(s: string) {
+  return s ? "```\n" + s + "\n```" : "—";
+}
+function formatDelta(delta: ResourceDelta): string {
+  const keys = Object.keys(delta || {});
+  const lines: string[] = [];
+  for (const k of keys) {
+    const v = Number(delta[k] ?? 0);
+    if (!v) continue;
+    const asStr =
+      k === "money"
+        ? v.toLocaleString(undefined, { maximumFractionDigits: 2 })
+        : Math.round(v).toLocaleString();
+    lines.push(`${k.padEnd(10)} +${asStr}`);
+  }
+  return lines.join("\n");
+}
 
 export const data = new SlashCommandBuilder()
   .setName("pnw_set")
-  .setDescription("Link an alliance to a PnW API key (validates and stores encrypted).")
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-  .addStringOption((opt) =>
-    opt
-      .setName("api_key")
-      .setDescription("PnW API key (from your Account page).")
-      .setRequired(true)
+  .setDescription("Link an alliance to a PnW API key (stores encrypted).")
+  .addIntegerOption((o) =>
+    o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
   )
-  .addIntegerOption((opt) =>
-    opt
-      .setName("alliance_id")
-      .setDescription("PnW Alliance ID (numeric).")
-      .setRequired(true)
-  );
+  .addStringOption((o) =>
+    o.setName("api_key").setDescription("PnW API key").setRequired(true),
+  )
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+  .setDMPermission(false);
 
 export async function execute(interaction: ChatInputCommandInteraction) {
   await interaction.deferReply({ ephemeral: true });
 
-  if (!secretConfigured) {
-    await interaction.editReply(
-      "Encryption secret not configured. Ask an admin to set **GT_SECRET** (or **ENCRYPTION_KEY**) in the service env."
-    );
-    return;
-  }
-
-  const apiKey = interaction.options.getString("api_key", true).trim();
-  const allianceId = interaction.options.getInteger("alliance_id", true);
-
-  if (!apiKey || !Number.isFinite(allianceId!) || allianceId! <= 0) {
-    await interaction.editReply("Invalid input. Provide a valid API key and a positive Alliance ID.");
-    return;
-  }
-
   try {
-    // 1) Validate read access by fetching bankrecs (read-only)
-    const preview = await previewAllianceTaxCredits({ apiKey, allianceId: allianceId! });
+    const allianceId = interaction.options.getInteger("alliance_id", true)!;
+    const apiKey = interaction.options.getString("api_key", true)!;
 
-    // 2) Store encrypted
-    const saved = await saveAlliancePnwKey({
-      allianceId: allianceId!,
-      apiKey,
-      actorDiscordId: interaction.user.id,
+    // Save alliance row (if missing)
+    await prisma.alliance.upsert({
+      where: { id: allianceId },
+      update: { guildId: interaction.guildId ?? undefined },
+      create: { id: allianceId, guildId: interaction.guildId ?? undefined },
     });
 
-    const lines: string[] = [];
-    lines.push("✅ **Alliance linked to PnW key.**");
-    lines.push(`Alliance ID: \`${saved.allianceId}\``);
-    lines.push("");
-    lines.push(`Validation: preview returned \`${preview.count}\` tax-related bank record(s) in the recent window.`);
+    // Encrypt + store key
+    const { ciphertext, iv } = seal(apiKey);
+    await prisma.allianceKey.create({
+      data: {
+        allianceId,
+        encryptedApiKey: ciphertext,
+        nonceApi: iv,
+        addedBy: interaction.user.id,
+      },
+    });
 
-    await interaction.editReply(lines.join("\n"));
+    // Validate with a quick preview using stored key
+    let previewText = "Validation skipped.";
+    try {
+      const preview = await previewAllianceTaxCreditsStored(allianceId, null);
+      const count = preview?.count ?? 0;
+      const totalsBlock = formatDelta((preview?.delta ?? {}) as any);
+      previewText =
+        count > 0
+          ? `Validation: preview returned **${count}** tax-related bank record(s) in the recent window.\n` +
+            codeBlock(totalsBlock)
+          : `Validation: no tax-related records visible in the recent window.`;
+    } catch (e: any) {
+      previewText = `Validation failed: ${e?.message || String(e)}`;
+    }
+
+    const embed = resourceEmbed({
+      title: "✅ Alliance linked to PnW key.",
+      subtitle: `**Alliance ID:** ${allianceId}`,
+      fields: [{ name: "Check", value: previewText }],
+      color: 0x2ecc71,
+    });
+
+    await interaction.editReply({ embeds: [embed] });
   } catch (err: any) {
     await interaction.editReply(
-      "Failed to validate/store PnW key: " + (err?.message ?? String(err)) +
-      "\n• Double-check the API key and Alliance ID.\n• Ensure the key has access to alliance bank records."
+      `❌ Failed to save key: ${err?.message || String(err)}`,
     );
   }
 }
-
-export default { data, execute };
