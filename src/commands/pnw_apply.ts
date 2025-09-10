@@ -3,7 +3,6 @@ import {
   SlashCommandBuilder,
   ChatInputCommandInteraction,
   PermissionFlagsBits,
-  EmbedBuilder,
 } from "discord.js";
 
 import { previewAllianceTaxCreditsStored } from "../integrations/pnw/tax";
@@ -23,7 +22,6 @@ function formatDelta(delta: ResourceDelta): string {
   for (const k of keys) {
     const v = Number(delta[k] ?? 0);
     if (!v) continue;
-    // Money can be decimal; others are usually integers in PnW
     const asStr =
       k === "money"
         ? v.toLocaleString(undefined, { maximumFractionDigits: 2 })
@@ -35,20 +33,22 @@ function formatDelta(delta: ResourceDelta): string {
 
 export const data = new SlashCommandBuilder()
   .setName("pnw_apply")
-  .setDescription("Fetch PnW bank *tax* records (stored key), sum deltas, and (optionally) apply to treasury.")
+  .setDescription(
+    "Fetch PnW bank *tax* records (stored key), sum deltas, and (optionally) apply to treasury."
+  )
   .addIntegerOption((o) =>
-    o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
+    o.setName("alliance_id").setDescription("Alliance ID").setRequired(true)
   )
   .addBooleanOption((o) =>
     o
       .setName("confirm")
       .setDescription("If true, credit to treasury and advance cursor")
-      .setRequired(true),
+      .setRequired(true)
   )
   .addIntegerOption((o) =>
     o
       .setName("last_seen")
-      .setDescription("Override cursor: only records with id > last_seen are counted"),
+      .setDescription("Override cursor: only records with id > last_seen are counted")
   )
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .setDMPermission(false);
@@ -62,12 +62,13 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
     const overrideLastSeen = interaction.options.getInteger("last_seen") ?? null;
 
-    // Read stored cursor unless overridden
+    // Read stored cursor unless overridden (used for display + to decide if we should advance)
     const storedCursor = await getPnwCursor(allianceId);
     const lastSeenId = overrideLastSeen ?? (storedCursor ?? 0);
 
-    // Preview recent tax-only bank records using the stored key and our cursor
-    const preview = await previewAllianceTaxCreditsStored(allianceId, lastSeenId || null);
+    // Preview recent tax-only bank records using the stored key.
+    // NOTE: The preview function already applies the cursor internally and returns newestId.
+    const preview = await previewAllianceTaxCreditsStored(allianceId, 500);
     const count = preview?.count ?? 0;
     const newestId = preview?.newestId ?? null;
     const delta = (preview?.delta ?? {}) as ResourceDelta;
@@ -81,11 +82,13 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     if (confirm && count > 0 && hasPositive) {
       // 1) credit to our local treasury store
       await addToTreasury(allianceId, delta);
-      // 2) advance cursor to newestId (if present)
+
+      // 2) advance cursor to newestId (if present and beyond current)
       if (typeof newestId === "number" && newestId > (lastSeenId ?? 0)) {
         await setPnwCursor(allianceId, newestId);
         cursorAdvancedTo = newestId;
       }
+
       // 3) log the apply event
       await appendPnwApplyLog({
         allianceId,
@@ -96,9 +99,10 @@ export async function execute(interaction: ChatInputCommandInteraction) {
         records: count,
         delta,
       } as any);
+
       applied = true;
     } else {
-      // preview-only log (optional but useful)
+      // preview-only log (useful for traceability)
       await appendPnwApplyLog({
         allianceId,
         at: new Date().toISOString(),
@@ -110,7 +114,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       } as any);
     }
 
-    // Build a clean embed response
+    // Build embed response
     const embed = resourceEmbed({
       title: `PnW Tax ${applied ? "Apply" : "Preview"} (Stored Key)`,
       subtitle: [
