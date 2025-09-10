@@ -22,6 +22,7 @@ function formatDelta(delta: ResourceDelta): string {
   for (const k of keys) {
     const v = Number(delta[k] ?? 0);
     if (!v) continue;
+    // Money can be decimal; others are typically integers in PnW
     const asStr =
       k === "money"
         ? v.toLocaleString(undefined, { maximumFractionDigits: 2 })
@@ -59,16 +60,17 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   try {
     const allianceId = interaction.options.getInteger("alliance_id", true)!;
     const confirm = interaction.options.getBoolean("confirm", true) ?? false;
-
     const overrideLastSeen = interaction.options.getInteger("last_seen") ?? null;
 
-    // Read stored cursor unless overridden (used for display + to decide if we should advance)
+    // Read stored cursor unless overridden
     const storedCursor = await getPnwCursor(allianceId);
     const lastSeenId = overrideLastSeen ?? (storedCursor ?? 0);
 
-    // Preview recent tax-only bank records using the stored key.
-    // NOTE: The preview function already applies the cursor internally and returns newestId.
-    const preview = await previewAllianceTaxCreditsStored(allianceId, 500);
+    // Preview recent tax-only bank records using the stored key and our cursor
+    const preview = await previewAllianceTaxCreditsStored(
+      allianceId,
+      lastSeenId || null
+    );
     const count = preview?.count ?? 0;
     const newestId = preview?.newestId ?? null;
     const delta = (preview?.delta ?? {}) as ResourceDelta;
@@ -83,7 +85,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       // 1) credit to our local treasury store
       await addToTreasury(allianceId, delta);
 
-      // 2) advance cursor to newestId (if present and beyond current)
+      // 2) advance cursor to newestId (if present)
       if (typeof newestId === "number" && newestId > (lastSeenId ?? 0)) {
         await setPnwCursor(allianceId, newestId);
         cursorAdvancedTo = newestId;
@@ -102,7 +104,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
       applied = true;
     } else {
-      // preview-only log (useful for traceability)
+      // preview-only log (optional but useful)
       await appendPnwApplyLog({
         allianceId,
         at: new Date().toISOString(),
@@ -114,7 +116,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       } as any);
     }
 
-    // Build embed response
+    // Build a clean embed response
     const embed = resourceEmbed({
       title: `PnW Tax ${applied ? "Apply" : "Preview"} (Stored Key)`,
       subtitle: [
