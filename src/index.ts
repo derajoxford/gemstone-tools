@@ -14,6 +14,7 @@ import { seal, open } from './lib/crypto.js';
 import { RES_EMOJI, ORDER } from './lib/emojis.js';
 import { fetchBankrecs } from './lib/pnw.js';
 import { extraCommandsJSON, findCommandByName } from './commands/registry';
+import { startAutoApply } from "./jobs/pnw_auto_apply";
 
 const log = pino({ level: process.env.LOG_LEVEL || 'info' });
 const prisma = new PrismaClient();
@@ -130,6 +131,9 @@ async function register() {
 client.once('ready', async () => {
   log.info({ tag: client.user?.tag }, 'Gemstone Tools online ✨');
   await register();
+
+  // ✅ Start the hourly auto-apply job (reads PNW_ALLIANCES env or falls back to alliances in DB)
+  startAutoApply(client);
 });
 
 // ---------- Helpers ----------
