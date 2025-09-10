@@ -1,4 +1,3 @@
-// src/commands/pnw_apply.ts
 import {
   SlashCommandBuilder,
   ChatInputCommandInteraction,
@@ -6,23 +5,26 @@ import {
 } from "discord.js";
 
 import { previewAllianceTaxCreditsStored } from "../integrations/pnw/tax";
-import { getPnwCursor, setPnwCursor, appendPnwApplyLog } from "../utils/pnw_cursor";
+import {
+  getPnwCursor,
+  setPnwCursor,
+  appendPnwApplyLog,
+} from "../utils/pnw_cursor";
 import { addToTreasury } from "../utils/treasury_store";
 import { resourceEmbed } from "../lib/embeds";
 
 type ResourceDelta = Record<string, number>;
+const DEFAULT_LIMIT = 600;
 
 function codeBlock(s: string) {
   return s ? "```\n" + s + "\n```" : "—";
 }
-
 function formatDelta(delta: ResourceDelta): string {
   const keys = Object.keys(delta || {});
   const lines: string[] = [];
   for (const k of keys) {
     const v = Number(delta[k] ?? 0);
     if (!v) continue;
-    // Money can be decimal; others are typically integers in PnW
     const asStr =
       k === "money"
         ? v.toLocaleString(undefined, { maximumFractionDigits: 2 })
@@ -38,18 +40,25 @@ export const data = new SlashCommandBuilder()
     "Fetch PnW bank *tax* records (stored key), sum deltas, and (optionally) apply to treasury."
   )
   .addIntegerOption((o) =>
-    o.setName("alliance_id").setDescription("Alliance ID").setRequired(true)
+    o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
   )
   .addBooleanOption((o) =>
     o
       .setName("confirm")
       .setDescription("If true, credit to treasury and advance cursor")
-      .setRequired(true)
+      .setRequired(true),
   )
   .addIntegerOption((o) =>
     o
       .setName("last_seen")
-      .setDescription("Override cursor: only records with id > last_seen are counted")
+      .setDescription("Override cursor: only records with id > last_seen"),
+  )
+  .addIntegerOption((o) =>
+    o
+      .setName("limit")
+      .setDescription("How many recent bankrecs to scan (default 600)")
+      .setMinValue(50)
+      .setMaxValue(1000),
   )
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .setDMPermission(false);
@@ -60,7 +69,9 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   try {
     const allianceId = interaction.options.getInteger("alliance_id", true)!;
     const confirm = interaction.options.getBoolean("confirm", true) ?? false;
+
     const overrideLastSeen = interaction.options.getInteger("last_seen") ?? null;
+    const limit = interaction.options.getInteger("limit") ?? DEFAULT_LIMIT;
 
     // Read stored cursor unless overridden
     const storedCursor = await getPnwCursor(allianceId);
@@ -69,7 +80,8 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     // Preview recent tax-only bank records using the stored key and our cursor
     const preview = await previewAllianceTaxCreditsStored(
       allianceId,
-      lastSeenId || null
+      lastSeenId || null,
+      limit
     );
     const count = preview?.count ?? 0;
     const newestId = preview?.newestId ?? null;
@@ -84,13 +96,11 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     if (confirm && count > 0 && hasPositive) {
       // 1) credit to our local treasury store
       await addToTreasury(allianceId, delta);
-
       // 2) advance cursor to newestId (if present)
       if (typeof newestId === "number" && newestId > (lastSeenId ?? 0)) {
         await setPnwCursor(allianceId, newestId);
         cursorAdvancedTo = newestId;
       }
-
       // 3) log the apply event
       await appendPnwApplyLog({
         allianceId,
@@ -101,7 +111,6 @@ export async function execute(interaction: ChatInputCommandInteraction) {
         records: count,
         delta,
       } as any);
-
       applied = true;
     } else {
       // preview-only log (optional but useful)
@@ -122,6 +131,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       subtitle: [
         `**Alliance:** ${allianceId}`,
         `**Cursor:** id > ${lastSeenId ?? 0}`,
+        `**Scan limit:** ${limit}`,
         `**Records counted:** ${count}`,
         `**Newest bankrec id:** ${newestId ?? "—"}`,
       ].join("\n"),
