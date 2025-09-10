@@ -1,30 +1,40 @@
 // src/integrations/pnw/tax.ts
 import { pnwQuery } from "./query";
 import { getAllianceReadKey } from "./store";
-import { addToTreasury, type Treasury as ResourceDelta } from "../../utils/treasury";
-import { getPnwCursor, setPnwCursor, appendPnwApplyLog } from "../../utils/pnw_cursor";
+import { addToTreasury } from "../../utils/treasury";
+// Optional allow-list support if you later want bracket IDs again.
+// (Safe to keep; if no ids stored, it has no effect)
 import { getAllowedTaxIds } from "../../utils/pnw_tax_ids";
 
-/** ------------ Types ------------ */
+/** --- TYPES --- */
+export type ResourceDelta = Record<string, number>;
+
 export type PreviewArgs = {
   apiKey: string;
   allianceId: number;
-  /** Optional: we ignore it in the query to keep schema-compat, but we still compute newestId to advance later */
+  /** Optional lower cursor (exclusive): only records with id > sinceId are considered */
   sinceId?: number | null;
+  /** How many newest bankrecs to fetch (we filter locally by sinceId). */
+  limit?: number;
 };
 
 export type PreviewResult = {
+  /** Count of matched (tax) records after filtering */
   count: number;
+  /** Highest bankrec id seen among ALL fetched recs (use this to advance the cursor) */
   newestId: number | null;
+  /** Sum of resources for matched (tax) records */
   delta: ResourceDelta;
 };
 
 export type ApplyArgsStored = {
   allianceId: number;
-  /** Optional lower cursor (exclusive) — we still fetch recent window then filter client-side */
+  /** Optional lower cursor (exclusive) */
   lastSeenId?: number | null;
   /** If false, just preview and do not add to treasury */
   confirm?: boolean;
+  /** Fetch window size */
+  limit?: number;
 };
 
 export type ApplyResult = {
@@ -37,211 +47,201 @@ export type ApplyResult = {
   mode: "apply" | "noop";
 };
 
-/** ------------ Internal helpers ------------ */
-
-/**
- * We deliberately DO NOT use server-side cursors/after to avoid schema differences.
- * Strategy: pull the latest N bankrecs and filter client-side by:
- *  - note contains "Automated Tax" (case-insensitive) or "Tax Deposit"/"Auto Tax"
- *  - optional: tax_id is in the configured allowlist
- *  - optional: id > lastSeen
- */
+/** --- CONSTANTS --- */
 const RES_FIELDS = [
-  "money","food","munitions","gasoline","steel","aluminum",
-  "oil","uranium","bauxite","coal","iron","lead",
+  "money",
+  "food",
+  "munitions",
+  "gasoline",
+  "steel",
+  "aluminum",
+  "oil",
+  "uranium",
+  "bauxite",
+  "coal",
+  "iron",
+  "lead",
 ] as const;
 
-type Bankrec = {
-  id?: number;
-  note?: string;
-  stype?: string;
-  rtype?: string;
-  tax_id?: number | null;
-} & { [K in (typeof RES_FIELDS)[number]]?: number | null };
+const DEFAULT_FETCH_LIMIT = 500;
 
-/** Try A: alliances(id: Int!) -> { bankrecs(limit: Int!) } */
-const QUERY_A = `
-  query BankrecsA($id: Int!, $limit: Int!) {
-    alliances(id: $id) {
-      id
-      bankrecs(limit: $limit) {
-        id
-        note
-        stype
-        rtype
-        tax_id
-        money
-        food
-        munitions
-        gasoline
-        steel
-        aluminum
-        oil
-        uranium
-        bauxite
-        coal
-        iron
-        lead
-      }
-    }
-  }
-` as const;
+/** --- HELPERS --- */
 
-/** Try B: alliances(id: [Int]!) -> AlliancePaginator -> data { ... } */
-const QUERY_B = `
-  query BankrecsB($ids: [Int]!, $limit: Int!) {
-    alliances(id: $ids) {
-      data {
-        id
-        bankrecs(limit: $limit) {
+function toInt(x: unknown): number | null {
+  const n = Number(x);
+  return Number.isInteger(n) ? n : null;
+}
+
+function isAutomatedTax(note: unknown): boolean {
+  return /automated\s*tax/i.test(String(note ?? ""));
+}
+
+/**
+ * We fetch newest-N bankrecs and filter in JS:
+ *  - id > sinceId (if provided)
+ *  - receiver type is the alliance (rtype === "alliance")
+ *  - note contains "Automated Tax"
+ *  - (optional) tax_id in allow-list, if one is stored for the alliance
+ */
+async function fetchTaxRecs(
+  apiKey: string,
+  allianceId: number,
+  sinceId: number | null,
+  limit: number,
+): Promise<{ all: any[]; matched: any[]; newestId: number | null }> {
+  const query = /* GraphQL */ `
+    query AllianceBankrecs($ids: [Int], $limit: Int!) {
+      alliances(id: $ids) {
+        data {
           id
-          note
-          stype
-          rtype
-          tax_id
-          money
-          food
-          munitions
-          gasoline
-          steel
-          aluminum
-          oil
-          uranium
-          bauxite
-          coal
-          iron
-          lead
+          bankrecs(limit: $limit) {
+            id
+            date
+            note
+            stype
+            rtype
+            money
+            food
+            munitions
+            gasoline
+            steel
+            aluminum
+            oil
+            uranium
+            bauxite
+            coal
+            iron
+            lead
+            tax_id
+          }
         }
       }
     }
-  }
-` as const;
+  `;
 
-async function fetchRecentBankrecs(apiKey: string, allianceId: number, limit = 300): Promise<Bankrec[]> {
-  // Try schema A
-  try {
-    const data: any = await pnwQuery(apiKey, QUERY_A, { id: allianceId, limit });
-    const recs: any[] = data?.alliances?.[0]?.bankrecs ?? [];
-    if (Array.isArray(recs)) return recs;
-  } catch (_e) {
-    // fall through to B
-  }
-  // Try schema B
-  const dataB: any = await pnwQuery(apiKey, QUERY_B, { ids: [allianceId], limit });
-  const recsB: any[] = dataB?.alliances?.[0]?.data?.[0]?.bankrecs ?? [];
-  return Array.isArray(recsB) ? recsB : [];
-}
+  const vars: any = { ids: [allianceId], limit };
+  const data: any = await pnwQuery(apiKey, query, vars);
 
-function isAutomatedTax(note?: string | null): boolean {
-  if (!note) return false;
-  const n = String(note).toLowerCase();
-  return /automated\s*tax|tax\s*deposit|auto[\s-]*tax/.test(n);
-}
+  // Cope with either alliances->data[] or (rare) alliances[]
+  const alliances = Array.isArray(data?.alliances?.data)
+    ? data.alliances.data
+    : Array.isArray(data?.alliances)
+    ? data.alliances
+    : [];
 
-function passesDirection(r: Bankrec): boolean {
-  // Prefer incoming to alliance if types are present
-  const rt = (r.rtype || "").toLowerCase();
-  const st = (r.stype || "").toLowerCase();
-  if (rt && st) {
-    // nation -> alliance is typical for tax
-    if (rt === "alliance" && st !== "alliance") return true;
-    // fallback: if we don't recognize, let other filters decide
-  }
-  return true;
-}
+  const recs: any[] = alliances?.[0]?.bankrecs ?? [];
 
-function withinAllowedIds(r: Bankrec, allow: number[] | null | undefined): boolean {
-  if (!allow || allow.length === 0) return true;
-  const tid = Number(r.tax_id ?? 0);
-  if (!tid) return false;
-  return allow.includes(tid);
-}
-
-function sumDelta(recs: Bankrec[]): PreviewResult {
+  // Highest id among ALL fetched recs (so we can advance cursor even if zero matched)
   let newestId: number | null = null;
-  const delta: ResourceDelta = {};
   for (const r of recs) {
-    const id = Number(r.id ?? 0);
-    if (id && (!newestId || id > newestId)) newestId = id;
+    const id = toInt(r?.id);
+    if (id !== null && (newestId === null || id > newestId)) newestId = id;
+  }
+
+  // Local id-cutoff (sinceId is exclusive)
+  const afterCut = recs.filter((r) => {
+    const id = toInt(r?.id);
+    return id !== null && (sinceId === null || sinceId === undefined || id > sinceId);
+  });
+
+  // Optional allow-list of tax_id; if empty, it is ignored
+  const allowList: number[] = await getAllowedTaxIds(allianceId);
+  const hasAllow = Array.isArray(allowList) && allowList.length > 0;
+
+  const matched = afterCut.filter((r) => {
+    // Must be incoming to alliance
+    const rtype = String(r?.rtype ?? "").toLowerCase();
+    if (rtype !== "alliance") return false;
+
+    // Must look like an automated tax row
+    if (!isAutomatedTax(r?.note)) return false;
+
+    // If an allow-list exists, the row must have a tax_id and be in the list
+    if (hasAllow) {
+      const tid = toInt(r?.tax_id);
+      if (tid === null || !allowList.includes(tid)) return false;
+    }
+
+    return true;
+  });
+
+  return { all: recs, matched, newestId };
+}
+
+function sumDelta(recs: any[]): PreviewResult {
+  const delta: ResourceDelta = {};
+  let newestId: number | null = null;
+
+  for (const r of recs) {
+    const id = toInt(r?.id);
+    if (id !== null && (newestId === null || id > newestId)) newestId = id;
 
     for (const f of RES_FIELDS) {
-      const v = Number(r[f] ?? 0);
+      const v = Number(r?.[f] ?? 0);
       if (!v) continue;
-      // Alliance receives +v on tax deposits — keep sign as-is (PnW uses positive for credits)
       delta[f] = (delta[f] ?? 0) + v;
     }
   }
+
   return { count: recs.length, newestId, delta };
 }
 
-/** ------------ Public API (manual key) ------------ */
+/** --- PUBLIC API (manual-key) --- */
 export async function previewAllianceTaxCredits(args: PreviewArgs): Promise<PreviewResult> {
-  const { apiKey, allianceId, sinceId = null } = args;
+  const { apiKey, allianceId, sinceId = null, limit = DEFAULT_FETCH_LIMIT } = args;
 
-  const [recs, allow] = await Promise.all([
-    fetchRecentBankrecs(apiKey, allianceId, 500),
-    getAllowedTaxIds(allianceId).catch(() => [] as number[]), // robust
-  ]);
+  const { matched, newestId: newestSeen } = await fetchTaxRecs(
+    apiKey,
+    allianceId,
+    sinceId,
+    limit,
+  );
 
-  const out = recs
-    // note/keyword match
-    .filter((r) => isAutomatedTax(r.note))
-    // direction sanity (nation -> alliance)
-    .filter(passesDirection)
-    // optional allowlist
-    .filter((r) => withinAllowedIds(r, allow))
-    // cursor (client-side)
-    .filter((r) => (sinceId ? Number(r.id ?? 0) > sinceId : true));
-
-  return sumDelta(out);
+  const preview = sumDelta(matched);
+  // Advance cursor to newestSeen among ALL fetched, even if zero matched
+  return { count: preview.count, newestId: newestSeen ?? preview.newestId, delta: preview.delta };
 }
 
-/** ------------ Stored-key wrappers ------------ */
-export async function previewAllianceTaxCreditsStored(allianceId: number): Promise<PreviewResult> {
-  const apiKey = await getAllianceReadKey(allianceId);
-  const last = await getPnwCursor(allianceId); // may be null
-  return previewAllianceTaxCredits({ apiKey, allianceId, sinceId: last });
+/** --- PUBLIC API (stored-key wrappers) --- */
+export async function previewAllianceTaxCreditsStored(
+  allianceId: number,
+  sinceId?: number | null,
+  limit: number = DEFAULT_FETCH_LIMIT,
+): Promise<PreviewResult> {
+  const apiKey = await getAllianceReadKey(allianceId); // throws if missing/undecryptable
+  return previewAllianceTaxCredits({ apiKey, allianceId, sinceId: sinceId ?? null, limit });
 }
 
-export async function applyAllianceTaxCreditsStored(args: ApplyArgsStored): Promise<ApplyResult> {
-  const { allianceId, lastSeenId = null, confirm = true } = args;
-  const apiKey = await getAllianceReadKey(allianceId);
+/**
+ * Apply: fetch tax records after lastSeenId, compute delta, and (optionally) add to treasury.
+ * Returns what it did, plus newestId so callers can advance a cursor.
+ */
+export async function applyAllianceTaxCreditsStored(
+  args: ApplyArgsStored,
+): Promise<ApplyResult> {
+  const { allianceId, lastSeenId = null, confirm = true, limit = DEFAULT_FETCH_LIMIT } = args;
+  const apiKey = await getAllianceReadKey(allianceId); // throws if missing/undecryptable
 
-  // preview using lastSeenId (if caller passed one), otherwise stored cursor
-  const since = lastSeenId ?? (await getPnwCursor(allianceId));
-  const preview = await previewAllianceTaxCredits({ apiKey, allianceId, sinceId: since });
+  const preview = await previewAllianceTaxCredits({
+    apiKey,
+    allianceId,
+    sinceId: lastSeenId,
+    limit,
+  });
 
   const applied = confirm && preview.count > 0 && Object.keys(preview.delta).length > 0;
 
   if (applied) {
     await addToTreasury(allianceId, preview.delta, {
       source: "pnw_tax",
-      meta: { lastSeenId: since, newestId: preview.newestId },
+      meta: { lastSeenId, newestId: preview.newestId, kind: "automated_tax" },
     });
   }
 
-  // advance cursor if we saw anything new — even in preview mode we can safely update,
-  // but to stay conservative: advance only when applied or when count>0
-  if (preview.newestId && preview.count > 0) {
-    await setPnwCursor(allianceId, preview.newestId);
-  }
-
-  // always append a log for visibility
-  await appendPnwApplyLog({
-    ts: new Date().toISOString(),
-    allianceId,
-    lastSeenId: since ?? null,
-    newestId: preview.newestId ?? null,
-    records: preview.count,
-    delta: preview.delta,
-    applied,
-    reason: applied ? "apply" : "preview",
-  });
-
   return {
     allianceId,
-    lastSeenId: since ?? null,
-    newestId: preview.newestId ?? null,
+    lastSeenId,
+    newestId: preview.newestId,
     records: preview.count,
     delta: preview.delta,
     applied,
