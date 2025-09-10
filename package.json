@@ -11,7 +11,7 @@
     "start": "node dist/index.js",
     "build": "tsc",
     "prisma:generate": "prisma generate",
-    "prisma:migrate": "prisma migrate deploy"
+    "prisma:migrate": "prisma migrate deploy",
     "reg": "node scripts/register-one.mjs"
   },
   "dependencies": {
