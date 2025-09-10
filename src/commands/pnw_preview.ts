@@ -1,4 +1,3 @@
-// src/commands/pnw_preview.ts
 import {
   SlashCommandBuilder,
   ChatInputCommandInteraction,
@@ -8,6 +7,8 @@ import { resourceEmbed } from "../lib/embeds";
 import { previewAllianceTaxCreditsStored } from "../integrations/pnw/tax";
 
 type ResourceDelta = Record<string, number>;
+
+const DEFAULT_LIMIT = 600;
 
 function codeBlock(s: string) {
   return s ? "```\n" + s + "\n```" : "—";
@@ -38,6 +39,13 @@ export const data = new SlashCommandBuilder()
       .setName("last_seen")
       .setDescription("Override cursor: only records with id > last_seen"),
   )
+  .addIntegerOption((o) =>
+    o
+      .setName("limit")
+      .setDescription("How many recent bankrecs to scan (default 600)")
+      .setMinValue(50)
+      .setMaxValue(1000),
+  )
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .setDMPermission(false);
 
@@ -47,8 +55,13 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   try {
     const allianceId = interaction.options.getInteger("alliance_id", true)!;
     const lastSeen = interaction.options.getInteger("last_seen") ?? null;
+    const limit = interaction.options.getInteger("limit") ?? DEFAULT_LIMIT;
 
-    const preview = await previewAllianceTaxCreditsStored(allianceId, lastSeen);
+    const preview = await previewAllianceTaxCreditsStored(
+      allianceId,
+      lastSeen,
+      limit
+    );
     const count = preview?.count ?? 0;
     const newestId = preview?.newestId ?? null;
     const delta = (preview?.delta ?? {}) as ResourceDelta;
@@ -58,6 +71,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       subtitle: [
         `**Alliance:** ${allianceId}`,
         `**Cursor:** id > ${lastSeen ?? 0}`,
+        `**Scan limit:** ${limit}`,
         `**Records counted:** ${count}`,
         `**Newest bankrec id:** ${newestId ?? "—"}`,
       ].join("\n"),
@@ -68,13 +82,14 @@ export async function execute(interaction: ChatInputCommandInteraction) {
         },
       ],
       color: 0x5865f2,
-      footer: "Preview only. Use /pnw_apply confirm:true to apply and advance cursor.",
+      footer:
+        "Preview only. Use /pnw_apply confirm:true to apply and advance cursor.",
     });
 
     await interaction.editReply({ embeds: [embed] });
   } catch (err: any) {
     await interaction.editReply(
-      `❌ Failed to preview: ${err?.message || String(err)}`,
+      `❌ Failed to preview: ${err?.message || String(err)}`
     );
   }
 }
