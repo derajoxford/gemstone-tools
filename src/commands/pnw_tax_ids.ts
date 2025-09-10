@@ -4,11 +4,10 @@ import {
   ChatInputCommandInteraction,
   PermissionFlagsBits,
 } from "discord.js";
+import { getAllowedTaxIds, setAllowedTaxIds } from "../utils/pnw_tax_ids";
 import { getAllianceReadKey } from "../integrations/pnw/store";
-import { pnwQuery } from "../integrations/pnw/query";
-import { getAllowedTaxIds, setAllowedTaxIds, clearAllowedTaxIds } from "../utils/pnw_tax_ids";
+import { fetchAllianceBankrecs } from "../integrations/pnw/query";
 
-// ---------- helpers ----------
 function parseIdList(s: string): number[] {
   return s
     .split(/[\s,]+/)
@@ -19,31 +18,15 @@ function parseIdList(s: string): number[] {
 }
 
 async function sniffTaxIdsUsingStoredKey(allianceId: number, lookbackLimit = 250) {
-  const query = `
-    query SniffTaxIds($id: Int!, $limit: Int!) {
-      alliances(id: $id) {
-        id
-        bankrecs(limit: $limit) {
-          id
-          tax_id
-        }
-      }
-    }
-  ` as const;
-
   const apiKey = await getAllianceReadKey(allianceId);
-  const data: any = await pnwQuery(apiKey, query, { id: allianceId, limit: lookbackLimit });
-
-  const recs: any[] = data?.alliances?.[0]?.bankrecs ?? [];
+  const recs = await fetchAllianceBankrecs(apiKey, allianceId, lookbackLimit);
   const counts = new Map<number, number>();
   for (const r of recs) {
     const tid = Number(r?.tax_id ?? 0);
     if (!tid) continue;
     counts.set(tid, (counts.get(tid) ?? 0) + 1);
   }
-  return [...counts.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .map(([id, count]) => ({ id, count }));
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([id, count]) => ({ id, count }));
 }
 
 function fmtList(nums: number[]) {
@@ -56,7 +39,6 @@ async function replyError(interaction: ChatInputCommandInteraction, err: unknown
   console.error("[/pnw_tax_ids] error:", err);
 }
 
-// ---------- slash command ----------
 export const data = new SlashCommandBuilder()
   .setName("pnw_tax_ids")
   .setDescription("Manage which PnW tax_id values are treated as tax credits")
@@ -93,7 +75,7 @@ export const data = new SlashCommandBuilder()
       .addStringOption((o) =>
         o
           .setName("ids")
-          .setDescription("Comma/space separated tax IDs (e.g. 27291 12345)")
+          .setDescription("Comma/space separated tax IDs (e.g. 12, 34 56)")
           .setRequired(true),
       ),
   )
@@ -119,7 +101,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       const pairs = await sniffTaxIdsUsingStoredKey(allianceId, limit);
       if (!pairs.length) {
         await interaction.editReply(
-          `No tax_id values detected in the last ${limit} bank records for alliance **${allianceId}**.`,
+          `No tax_id values detected in the last ${limit} bank records for alliance ${allianceId}.`,
         );
         return;
       }
@@ -131,7 +113,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
           `**Detected tax_id values:**`,
           lines,
           "",
-          "Store a filter with:",
+          "You can store a filter with:",
           `\`/pnw_tax_ids set alliance_id:${allianceId} ids:<list from above>\``,
         ].join("\n"),
       );
@@ -140,9 +122,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
     if (sub === "get") {
       const ids = await getAllowedTaxIds(allianceId);
-      await interaction.editReply(
-        `Stored tax_id filter for **${allianceId}**: ${fmtList(ids ?? [])}`,
-      );
+      await interaction.editReply(`Stored tax_id filter for ${allianceId}: ${fmtList(ids)}`);
       return;
     }
 
@@ -155,15 +135,15 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       }
       await setAllowedTaxIds(allianceId, ids);
       await interaction.editReply(
-        `Saved tax_id filter for **${allianceId}**: ${fmtList(ids)}\n` +
+        `Saved tax_id filter for ${allianceId}: ${fmtList(ids)}\n` +
           "Future previews/apply will only count bankrecs whose `tax_id` is in this list.",
       );
       return;
     }
 
     if (sub === "clear") {
-      await clearAllowedTaxIds(allianceId);
-      await interaction.editReply(`Cleared stored tax_id filter for **${allianceId}**.`);
+      await setAllowedTaxIds(allianceId, []);
+      await interaction.editReply(`Cleared stored tax_id filter for ${allianceId}.`);
       return;
     }
 
