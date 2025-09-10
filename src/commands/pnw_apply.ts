@@ -9,6 +9,9 @@ import { getAlliancePnwKey } from "../integrations/pnw/store";
 import { previewAllianceTaxCredits } from "../integrations/pnw/tax";
 import { addToTreasury } from "../utils/treasury";
 import { getPnwCursor, setPnwCursor, appendPnwApplyLog } from "../utils/pnw_cursor";
+import { addToTreasury } from "../utils/treasury_store";
+import { appendTaxHistory } from "../utils/pnw_tax_history";
+
 
 const RESOURCE_ORDER = [
   "money","food","munitions","gasoline","aluminum","steel",
