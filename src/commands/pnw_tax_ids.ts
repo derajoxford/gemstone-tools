@@ -4,10 +4,15 @@ import {
   ChatInputCommandInteraction,
   PermissionFlagsBits,
 } from "discord.js";
-import { getAllowedTaxIds, setAllowedTaxIds } from "../utils/pnw_tax_ids";
 import { getAllianceReadKey } from "../integrations/pnw/store";
-import { fetchAllianceBankrecs } from "../integrations/pnw/query";
+import { pnwQuery } from "../integrations/pnw/query";
+import {
+  getAllowedTaxIds,
+  setAllowedTaxIds,
+  clearAllowedTaxId as _clearOne, // optional helper, not used here
+} from "../utils/pnw_tax_ids";
 
+// ---- small utils ----
 function parseIdList(s: string): number[] {
   return s
     .split(/[\s,]+/)
@@ -15,18 +20,6 @@ function parseIdList(s: string): number[] {
     .filter(Boolean)
     .map((t) => Number(t))
     .filter((n) => Number.isInteger(n) && n >= 0);
-}
-
-async function sniffTaxIdsUsingStoredKey(allianceId: number, lookbackLimit = 250) {
-  const apiKey = await getAllianceReadKey(allianceId);
-  const recs = await fetchAllianceBankrecs(apiKey, allianceId, lookbackLimit);
-  const counts = new Map<number, number>();
-  for (const r of recs) {
-    const tid = Number(r?.tax_id ?? 0);
-    if (!tid) continue;
-    counts.set(tid, (counts.get(tid) ?? 0) + 1);
-  }
-  return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([id, count]) => ({ id, count }));
 }
 
 function fmtList(nums: number[]) {
@@ -39,13 +32,67 @@ async function replyError(interaction: ChatInputCommandInteraction, err: unknown
   console.error("[/pnw_tax_ids] error:", err);
 }
 
+// ---- sniff helper (with schema-safe query + tiny debug dump) ----
+async function sniffTaxIdsUsingStoredKey(
+  allianceId: number,
+  lookbackLimit = 250,
+): Promise<{
+  counts: { id: number; count: number }[];
+  sample: string[];
+  total: number;
+}> {
+  const apiKey = await getAllianceReadKey(allianceId);
+
+  const query = /* GraphQL */ `
+    query SniffTaxIds($ids: [Int!]!, $limit: Int!) {
+      alliances(id: $ids) {
+        data {
+          id
+          bankrecs(limit: $limit) {
+            id
+            tax_id
+            stype
+            rtype
+            note
+          }
+        }
+      }
+    }
+  `;
+  const vars = { ids: [allianceId], limit: lookbackLimit };
+  const data: any = await pnwQuery(apiKey, query, vars);
+
+  const recs: any[] = data?.alliances?.data?.[0]?.bankrecs ?? [];
+  const counts = new Map<number, number>();
+  for (const r of recs) {
+    const tid = Number(r?.tax_id ?? 0);
+    if (!tid) continue;
+    counts.set(tid, (counts.get(tid) ?? 0) + 1);
+  }
+
+  // build a short debug sample so we can see what's actually coming back
+  const sample: string[] = [];
+  for (const r of recs.slice(0, 10)) {
+    const line =
+      `• ${r.id} | tax_id=${r.tax_id ?? "—"} | stype=${r.stype ?? "—"} | rtype=${r.rtype ?? "—"} | note=${(r.note ?? "").slice(0, 60)}`;
+    sample.push(line);
+  }
+
+  return {
+    counts: [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([id, count]) => ({ id, count })),
+    sample,
+    total: recs.length,
+  };
+}
+
+// ---- slash command ----
 export const data = new SlashCommandBuilder()
   .setName("pnw_tax_ids")
   .setDescription("Manage which PnW tax_id values are treated as tax credits")
   .addSubcommand((s) =>
     s
       .setName("sniff")
-      .setDescription("Scan recent bank records and suggest tax_id values")
+      .setDescription("Scan recent bank records and suggest tax_id values (shows a small debug sample)")
       .addIntegerOption((o) =>
         o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
       )
@@ -98,31 +145,38 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
     if (sub === "sniff") {
       const limit = interaction.options.getInteger("limit") ?? 250;
-      const pairs = await sniffTaxIdsUsingStoredKey(allianceId, limit);
-      if (!pairs.length) {
-        await interaction.editReply(
-          `No tax_id values detected in the last ${limit} bank records for alliance ${allianceId}.`,
-        );
-        return;
+      const { counts, sample, total } = await sniffTaxIdsUsingStoredKey(allianceId, limit);
+
+      const lines: string[] = [];
+      lines.push(`**Alliance:** ${allianceId}`);
+      lines.push(`**Lookback:** ${limit} (returned ${total} rows)`);
+      if (counts.length === 0) {
+        lines.push(`No \`tax_id\` values detected.`);
+      } else {
+        lines.push(`**Detected \`tax_id\` values:**`);
+        lines.push(...counts.map((p) => `• \`${p.id}\`  (${p.count} hits)`));
       }
-      const lines = pairs.map((p) => `• \`${p.id}\`  (${p.count} hits)`).join("\n");
-      await interaction.editReply(
-        [
-          `**Alliance:** ${allianceId}`,
-          `**Lookback:** ${limit} records`,
-          `**Detected tax_id values:**`,
-          lines,
-          "",
-          "You can store a filter with:",
-          `\`/pnw_tax_ids set alliance_id:${allianceId} ids:<list from above>\``,
-        ].join("\n"),
-      );
+
+      // small debug sample (up to 10)
+      lines.push("");
+      lines.push("**Sample (first 10 rows):**");
+      lines.push(...(sample.length ? sample : ["(no rows returned)"]));
+
+      if (counts.length > 0) {
+        lines.push("");
+        lines.push("You can store a filter with:");
+        lines.push(`\`/pnw_tax_ids set alliance_id:${allianceId} ids:<list from above>\``);
+      }
+
+      await interaction.editReply(lines.join("\n"));
       return;
     }
 
     if (sub === "get") {
       const ids = await getAllowedTaxIds(allianceId);
-      await interaction.editReply(`Stored tax_id filter for ${allianceId}: ${fmtList(ids)}`);
+      await interaction.editReply(
+        `Stored tax_id filter for **${allianceId}**: ${fmtList(ids ?? [])}`,
+      );
       return;
     }
 
@@ -135,15 +189,15 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       }
       await setAllowedTaxIds(allianceId, ids);
       await interaction.editReply(
-        `Saved tax_id filter for ${allianceId}: ${fmtList(ids)}\n` +
+        `Saved tax_id filter for **${allianceId}**: ${fmtList(ids)}\n` +
           "Future previews/apply will only count bankrecs whose `tax_id` is in this list.",
       );
       return;
     }
 
     if (sub === "clear") {
-      await setAllowedTaxIds(allianceId, []);
-      await interaction.editReply(`Cleared stored tax_id filter for ${allianceId}.`);
+      await setAllowedTaxIds(allianceId, []); // simple clear
+      await interaction.editReply(`Cleared stored tax_id filter for **${allianceId}**.`);
       return;
     }
 
