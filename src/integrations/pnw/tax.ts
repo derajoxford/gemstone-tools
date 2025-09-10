@@ -50,9 +50,7 @@ const RES_FIELDS = [
   "lead",
 ] as const;
 
-// *** CURRENT GraphQL SHAPE ***
-// - alliances(id: Int!) returns a single Alliance object (not a paginator)
-// - bankrecs(limit: Int) returns recent records; we filter client-side by sinceId and tax_id
+// current schema: alliances(id: Int!) -> Alliance -> bankrecs(limit: Int)
 const QUERY_ALLIANCE_BANKRECS = `
   query AllianceBankrecs($id: Int!, $limit: Int!) {
     alliances(id: $id) {
@@ -79,28 +77,25 @@ const QUERY_ALLIANCE_BANKRECS = `
   }
 ` as const;
 
-/**
- * Kept name to match other imports in your tree.
- * Pulls recent bankrecs and does client-side filtering for sinceId and tax_id.
- */
+/** Pull recent bankrecs; filter client-side by sinceId and allowed tax_id list. */
 export async function fetchTaxRecs(
   apiKey: string,
   allianceId: number,
   sinceId: number | null,
   allowedTaxIds: number[] | null,
-  limit = 400,
+  limit = 400
 ) {
   const data: any = await pnwQuery(apiKey, QUERY_ALLIANCE_BANKRECS, { id: allianceId, limit });
   const all: any[] = data?.alliances?.[0]?.bankrecs ?? [];
 
-  const onlyNew = sinceId ? all.filter((r) => Number(r?.id ?? 0) > Number(sinceId)) : all;
+  const onlyNew = sinceId ? all.filter(r => Number(r?.id ?? 0) > Number(sinceId)) : all;
 
   if (allowedTaxIds && allowedTaxIds.length) {
     const allow = new Set(allowedTaxIds.map(Number).filter(Number.isFinite));
-    return onlyNew.filter((r) => allow.has(Number(r?.tax_id ?? 0)));
+    return onlyNew.filter(r => allow.has(Number(r?.tax_id ?? 0)));
   }
-  // Heuristic fallback: treat rows with tax_id > 0 as tax credits
-  return onlyNew.filter((r) => Number(r?.tax_id ?? 0) > 0);
+  // fallback heuristic: treat records with a positive tax_id as tax credits
+  return onlyNew.filter(r => Number(r?.tax_id ?? 0) > 0);
 }
 
 function summarize(recs: any[]): PreviewResult {
@@ -126,7 +121,7 @@ export async function previewAllianceTaxCredits(args: PreviewArgs): Promise<Prev
 
 export async function previewAllianceTaxCreditsStored(
   allianceId: number,
-  sinceId?: number | null,
+  sinceId?: number | null
 ): Promise<PreviewResult> {
   const apiKey = await getAllianceReadKey(allianceId);
   const allow = await getAllowedTaxIds(allianceId);
@@ -139,7 +134,7 @@ export async function previewAllianceTaxCreditsStored(
 }
 
 export async function applyAllianceTaxCreditsStored(
-  args: ApplyArgsStored,
+  args: ApplyArgsStored
 ): Promise<ApplyResult> {
   const { allianceId, lastSeenId = null, confirm = true } = args;
   const apiKey = await getAllianceReadKey(allianceId);
