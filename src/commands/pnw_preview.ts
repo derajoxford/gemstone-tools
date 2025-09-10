@@ -1,19 +1,17 @@
+// src/commands/pnw_preview.ts
 import {
   SlashCommandBuilder,
   ChatInputCommandInteraction,
   PermissionFlagsBits,
 } from "discord.js";
-import { resourceEmbed } from "../lib/embeds";
 import { previewAllianceTaxCreditsStored } from "../integrations/pnw/tax";
-
-type ResourceDelta = Record<string, number>;
-
-const DEFAULT_LIMIT = 600;
+import { resourceEmbed } from "../lib/embeds";
+import { getPnwCursor } from "../utils/pnw_cursor";
 
 function codeBlock(s: string) {
   return s ? "```\n" + s + "\n```" : "—";
 }
-function formatDelta(delta: ResourceDelta): string {
+function formatDelta(delta: Record<string, number>): string {
   const keys = Object.keys(delta || {});
   const lines: string[] = [];
   for (const k of keys) {
@@ -30,66 +28,55 @@ function formatDelta(delta: ResourceDelta): string {
 
 export const data = new SlashCommandBuilder()
   .setName("pnw_preview")
-  .setDescription("Preview PnW tax credits using the stored key (no apply).")
-  .addIntegerOption((o) =>
-    o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
+  .setDescription("Preview PnW *automated tax* receipts (stored key), no changes.")
+  .addIntegerOption(o =>
+    o.setName("alliance_id").setDescription("Alliance ID").setRequired(true)
   )
-  .addIntegerOption((o) =>
-    o
-      .setName("last_seen")
-      .setDescription("Override cursor: only records with id > last_seen"),
+  .addIntegerOption(o =>
+    o.setName("last_seen").setDescription("Override cursor: only id > last_seen")
   )
-  .addIntegerOption((o) =>
-    o
-      .setName("limit")
-      .setDescription("How many recent bankrecs to scan (default 600)")
-      .setMinValue(50)
-      .setMaxValue(1000),
+  .addIntegerOption(o =>
+    o.setName("limit").setDescription("Recent rows to scan (default 500)")
   )
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .setDMPermission(false);
 
 export async function execute(interaction: ChatInputCommandInteraction) {
   await interaction.deferReply({ ephemeral: true });
-
   try {
     const allianceId = interaction.options.getInteger("alliance_id", true)!;
-    const lastSeen = interaction.options.getInteger("last_seen") ?? null;
-    const limit = interaction.options.getInteger("limit") ?? DEFAULT_LIMIT;
+    const overrideLastSeen = interaction.options.getInteger("last_seen");
+    const limit = interaction.options.getInteger("limit") ?? 500;
+
+    const storedCursor = await getPnwCursor(allianceId);
+    const lastSeenId = overrideLastSeen ?? (storedCursor ?? 0);
 
     const preview = await previewAllianceTaxCreditsStored(
       allianceId,
-      lastSeen,
+      lastSeenId || null,
       limit
     );
-    const count = preview?.count ?? 0;
-    const newestId = preview?.newestId ?? null;
-    const delta = (preview?.delta ?? {}) as ResourceDelta;
 
+    const block = formatDelta(preview.delta || {});
     const embed = resourceEmbed({
       title: "PnW Tax Preview (Stored Key)",
       subtitle: [
         `**Alliance:** ${allianceId}`,
-        `**Cursor:** id > ${lastSeen ?? 0}`,
+        `**Cursor:** id > ${lastSeenId ?? 0}`,
         `**Scan limit:** ${limit}`,
-        `**Records counted:** ${count}`,
-        `**Newest bankrec id:** ${newestId ?? "—"}`,
+        `**Records counted:** ${preview.count}`,
+        `**Newest bankrec id:** ${preview.newestId ?? "—"}`,
       ].join("\n"),
-      fields: [
-        {
-          name: "Tax delta (sum)",
-          value: codeBlock(formatDelta(delta)),
-        },
-      ],
+      fields: [{ name: "Tax delta (sum)", value: codeBlock(block), inline: false }],
       color: 0x5865f2,
-      footer:
-        "Preview only. Use /pnw_apply confirm:true to apply and advance cursor.",
+      footer: "Preview only. Use /pnw_apply confirm:true to apply and advance cursor.",
     });
 
     await interaction.editReply({ embeds: [embed] });
   } catch (err: any) {
+    console.error("[/pnw_preview] error:", err);
     await interaction.editReply(
-      `❌ Failed to preview: ${err?.message || String(err)}`
+      `❌ Failed to preview: ${err?.message ?? String(err)}`
     );
   }
 }
