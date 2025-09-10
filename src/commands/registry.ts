@@ -11,6 +11,7 @@ import * as pnw_logs from './pnw_logs';
 import * as pnw_summary_channel from './pnw_summary_channel';
 import * as pnw_tax_ids from "./pnw_tax_ids"; 
 import * as pnw_bankpeek from './pnw_bankpeek'; 
+import * as pnw_tax_history from './pnw_tax_history';
 
 export type CommandModule = {
   data?: { name?: string; toJSON?: () => any };
@@ -30,6 +31,7 @@ export const commandModules: CommandModule[] = [
   pnw_summary_channel,
   pnw_tax_ids, 
   pnw_bankpeek,
+  pnw_tax_history,
 ].filter((m) => m?.data && m?.execute);
 
 export const extraCommandsJSON = commandModules
