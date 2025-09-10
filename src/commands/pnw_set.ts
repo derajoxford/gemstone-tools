@@ -7,7 +7,6 @@ import {
 import { PrismaClient } from "@prisma/client";
 import { seal } from "../lib/crypto";
 import { resourceEmbed } from "../lib/embeds";
-import { previewAllianceTaxCreditsStored } from "../integrations/pnw/tax";
 
 const prisma = new PrismaClient();
 
