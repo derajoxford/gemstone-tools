@@ -1,16 +1,18 @@
 // src/integrations/pnw/tax.ts
 import { pnwQuery } from "./query";
 import { getAllianceReadKey } from "./store";
-import { addToTreasury } from "../../utils/treasury";
 import { getAllowedTaxIds } from "../../utils/pnw_tax_ids";
+import { addToTreasury } from "../../utils/treasury";
 
 export type ResourceDelta = Record<string, number>;
 
 export type PreviewArgs = {
   apiKey: string;
   allianceId: number;
-  /** Optional lower cursor (exclusive). We’ll client-filter by id > sinceId. */
+  /** Only include records with id > sinceId (client-side filtered) */
   sinceId?: number | null;
+  /** Optional tax_id allowlist; if empty or null we use heuristic (tax_id > 0) */
+  allowedTaxIds?: number[] | null;
 };
 
 export type PreviewResult = {
@@ -21,8 +23,10 @@ export type PreviewResult = {
 
 export type ApplyArgsStored = {
   allianceId: number;
+  /** Only include records with id > lastSeenId (client-side filtered) */
   lastSeenId?: number | null;
-  confirm?: boolean; // if false, preview only
+  /** If false, just preview and do not add to treasury */
+  confirm?: boolean;
 };
 
 export type ApplyResult = {
@@ -36,56 +40,36 @@ export type ApplyResult = {
 };
 
 const RES_FIELDS = [
-  "money","food","munitions","gasoline","steel","aluminum",
-  "oil","uranium","bauxite","coal","iron","lead",
+  "money",
+  "food",
+  "munitions",
+  "gasoline",
+  "steel",
+  "aluminum",
+  "oil",
+  "uranium",
+  "bauxite",
+  "coal",
+  "iron",
+  "lead",
 ] as const;
 
-function sumDelta(recs: any[]): PreviewResult {
-  let newestId: number | null = null;
-  const delta: ResourceDelta = {};
-  for (const r of recs) {
-    const id = Number(r?.id ?? 0);
-    if (id && (newestId === null || id > newestId)) newestId = id;
-    for (const f of RES_FIELDS) {
-      const v = Number(r?.[f] ?? 0);
-      if (!v) continue;
-      delta[f] = (delta[f] ?? 0) + v;
-    }
-  }
-  return { count: recs.length, newestId, delta };
-}
-
-function looksLikeTax(r: any): boolean {
-  // Fallback heuristic if no tax_id filter saved
-  const note = String(r?.note ?? "");
-  const stype = String(r?.stype ?? "").toUpperCase();   // sender type
-  const rtype = String(r?.rtype ?? "").toUpperCase();   // receiver type
-  // “Nation -> Alliance” deposits with “tax” in the note are almost always tax pulls
-  if (/\btax\b/i.test(note) && stype === "NATION" && rtype === "ALLIANCE") return true;
-  return false;
-}
-
 /**
- * Fetch recent bank records (newest first) and client-filter by sinceId/tax filter.
- * We deliberately avoid PnW’s “ids/paginator/after(DateTime)” variants for compatibility.
+ * Fetch recent bank records for an alliance.
+ * IMPORTANT: this uses the **current** PnW GraphQL shape:
+ *   alliances(id: Int!) { bankrecs(limit: Int) { id, tax_id, money, ... } }
+ * No paginator, no "ids", no "after_id", no "first/sort/order".
  */
-async function fetchTaxRecs(
-  apiKey: string,
-  allianceId: number,
-  sinceId: number | null,
-  allowedTaxIds: number[] | null,
-  limit = 400 // pull a decent window; we’ll filter client-side
-) {
+async function fetchRecentBankrecs(apiKey: string, allianceId: number, limit = 400) {
   const query = `
-    query AllianceBankrecsSimple($id: Int!, $limit: Int!) {
+    query AllianceBankrecs($id: Int!, $limit: Int!) {
       alliances(id: $id) {
         id
         bankrecs(limit: $limit) {
           id
           tax_id
           note
-          stype
-          rtype
+          date
           money
           food
           munitions
@@ -98,58 +82,92 @@ async function fetchTaxRecs(
           coal
           iron
           lead
-          date
         }
       }
     }
   ` as const;
 
   const data: any = await pnwQuery(apiKey, query, { id: allianceId, limit });
-  let recs: any[] = data?.alliances?.[0]?.bankrecs ?? [];
-
-  // Only records after our cursor
-  if (sinceId) recs = recs.filter(r => Number(r?.id ?? 0) > sinceId);
-
-  // Filter to tax-only:
-  // - If specific tax_ids are stored, require a match
-  // - Otherwise, use the heuristic
-  if (allowedTaxIds?.length) {
-    const set = new Set(allowedTaxIds.map(Number));
-    recs = recs.filter(r => set.has(Number(r?.tax_id ?? 0)));
-  } else {
-    recs = recs.filter(looksLikeTax);
-  }
-
+  const recs: any[] = data?.alliances?.[0]?.bankrecs ?? [];
   return recs;
 }
 
-/** Public: validate a provided key (manual preview) */
-export async function previewAllianceTaxCredits(args: PreviewArgs): Promise<PreviewResult> {
-  const { apiKey, allianceId, sinceId = null } = args;
-  const allowedTaxIds = await getAllowedTaxIds(allianceId);
-  const recs = await fetchTaxRecs(apiKey, allianceId, sinceId, allowedTaxIds ?? null);
-  return sumDelta(recs);
+/** Sum resources over selected records and report newest id */
+function summarize(recs: any[]): PreviewResult {
+  let newestId: number | null = null;
+  const delta: ResourceDelta = {};
+
+  for (const r of recs) {
+    const id = Number(r?.id ?? 0);
+    if (id && (newestId === null || id > newestId)) newestId = id;
+    for (const f of RES_FIELDS) {
+      const v = Number(r?.[f] ?? 0);
+      if (!v) continue;
+      delta[f] = (delta[f] ?? 0) + v;
+    }
+  }
+  return { count: recs.length, newestId, delta };
 }
 
-/** Public: use the stored (encrypted) read key */
+/**
+ * Core preview that accepts an explicit key (used by validation flows).
+ * - Grabs recent bankrecs
+ * - Client-side filters to id > sinceId
+ * - Filters to tax-only by allowedTaxIds (or heuristic: tax_id > 0)
+ */
+export async function previewAllianceTaxCredits(args: PreviewArgs): Promise<PreviewResult> {
+  const { apiKey, allianceId, sinceId = null, allowedTaxIds = null } = args;
+
+  const all = await fetchRecentBankrecs(apiKey, allianceId, 400);
+
+  const onlyNew = sinceId ? all.filter((r) => Number(r?.id ?? 0) > Number(sinceId)) : all;
+
+  let taxOnly: any[];
+  if (allowedTaxIds && allowedTaxIds.length > 0) {
+    const allow = new Set(allowedTaxIds.map(Number).filter(Number.isFinite));
+    taxOnly = onlyNew.filter((r) => allow.has(Number(r?.tax_id ?? 0)));
+  } else {
+    // Heuristic fallback: keep rows that have a tax_id > 0
+    taxOnly = onlyNew.filter((r) => Number(r?.tax_id ?? 0) > 0);
+  }
+
+  return summarize(taxOnly);
+}
+
+/**
+ * Stored-key wrapper: loads the alliance's read key and its tax_id allowlist.
+ */
 export async function previewAllianceTaxCreditsStored(
   allianceId: number,
-  sinceId?: number | null
+  sinceId?: number | null,
 ): Promise<PreviewResult> {
   const apiKey = await getAllianceReadKey(allianceId);
-  const allowedTaxIds = await getAllowedTaxIds(allianceId);
-  const recs = await fetchTaxRecs(apiKey, allianceId, sinceId ?? null, allowedTaxIds ?? null);
-  return sumDelta(recs);
+  const allow = await getAllowedTaxIds(allianceId); // [] means "none saved"
+  return previewAllianceTaxCredits({
+    apiKey,
+    allianceId,
+    sinceId: sinceId ?? null,
+    allowedTaxIds: allow.length ? allow : null,
+  });
 }
 
-/** Apply: add preview delta to treasury and return the result */
-export async function applyAllianceTaxCreditsStored(args: ApplyArgsStored): Promise<ApplyResult> {
+/**
+ * Apply: fetch tax records after lastSeenId, compute delta, and (optionally) add to treasury.
+ */
+export async function applyAllianceTaxCreditsStored(
+  args: ApplyArgsStored,
+): Promise<ApplyResult> {
   const { allianceId, lastSeenId = null, confirm = true } = args;
   const apiKey = await getAllianceReadKey(allianceId);
-  const allowedTaxIds = await getAllowedTaxIds(allianceId);
+  const allow = await getAllowedTaxIds(allianceId);
 
-  const recs = await fetchTaxRecs(apiKey, allianceId, lastSeenId, allowedTaxIds ?? null);
-  const preview = sumDelta(recs);
+  const preview = await previewAllianceTaxCredits({
+    apiKey,
+    allianceId,
+    sinceId: lastSeenId,
+    allowedTaxIds: allow.length ? allow : null,
+  });
+
   const applied = confirm && preview.count > 0 && Object.keys(preview.delta).length > 0;
 
   if (applied) {
