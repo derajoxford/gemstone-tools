@@ -4,9 +4,9 @@ import {
   ChatInputCommandInteraction,
   PermissionFlagsBits,
 } from "discord.js";
-import { getAllowedTaxIds, setAllowedTaxIds, clearAllowedTaxIds } from "../utils/pnw_tax_ids";
 import { getAllianceReadKey } from "../integrations/pnw/store";
 import { pnwQuery } from "../integrations/pnw/query";
+import { getAllowedTaxIds, setAllowedTaxIds, clearAllowedTaxIds } from "../utils/pnw_tax_ids";
 
 // ---------- helpers ----------
 function parseIdList(s: string): number[] {
@@ -19,7 +19,6 @@ function parseIdList(s: string): number[] {
 }
 
 async function sniffTaxIdsUsingStoredKey(allianceId: number, lookbackLimit = 250) {
-  // Use the compatible shape (no paginator, no after DateTime)
   const query = `
     query SniffTaxIds($id: Int!, $limit: Int!) {
       alliances(id: $id) {
