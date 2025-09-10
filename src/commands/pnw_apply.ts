@@ -1,167 +1,146 @@
 // src/commands/pnw_apply.ts
 import {
   SlashCommandBuilder,
+  ChatInputCommandInteraction,
   PermissionFlagsBits,
-  type ChatInputCommandInteraction,
   EmbedBuilder,
 } from "discord.js";
-import { getAlliancePnwKey } from "../integrations/pnw/store";
-import { previewAllianceTaxCredits } from "../integrations/pnw/tax";
-import { addToTreasury } from "../utils/treasury";
+
+import { previewAllianceTaxCreditsStored } from "../integrations/pnw/tax";
 import { getPnwCursor, setPnwCursor, appendPnwApplyLog } from "../utils/pnw_cursor";
 import { addToTreasury } from "../utils/treasury_store";
-import { appendTaxHistory } from "../utils/pnw_tax_history";
+import { resourceEmbed } from "../lib/embeds";
 
+type ResourceDelta = Record<string, number>;
 
-const RESOURCE_ORDER = [
-  "money","food","munitions","gasoline","aluminum","steel",
-  "oil","uranium","bauxite","coal","iron","lead",
-] as const;
+function codeBlock(s: string) {
+  return s ? "```\n" + s + "\n```" : "—";
+}
 
-function fmtNumber(n: number, opts?: { money?: boolean }) {
-  return (opts?.money
-    ? n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-    : Math.round(n).toLocaleString()
-  );
+function formatDelta(delta: ResourceDelta): string {
+  const keys = Object.keys(delta || {});
+  const lines: string[] = [];
+  for (const k of keys) {
+    const v = Number(delta[k] ?? 0);
+    if (!v) continue;
+    // Money can be decimal; others are usually integers in PnW
+    const asStr =
+      k === "money"
+        ? v.toLocaleString(undefined, { maximumFractionDigits: 2 })
+        : Math.round(v).toLocaleString();
+    lines.push(`${k.padEnd(10)} +${asStr}`);
+  }
+  return lines.join("\n");
 }
 
 export const data = new SlashCommandBuilder()
   .setName("pnw_apply")
-  .setDescription("Apply PnW tax credits to the Alliance Treasury (auto-cursor & logs).")
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-  .addIntegerOption((opt) =>
-    opt.setName("alliance_id").setDescription("PnW Alliance ID (numeric).").setRequired(true)
+  .setDescription("Fetch PnW bank *tax* records (stored key), sum deltas, and (optionally) apply to treasury.")
+  .addIntegerOption((o) =>
+    o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
   )
-  .addIntegerOption((opt) =>
-    opt
-      .setName("last_seen_id")
-      .setDescription("Override: only include bankrecs with id > this value. Defaults to stored cursor.")
-      .setRequired(false)
-  )
-  .addBooleanOption((opt) =>
-    opt
+  .addBooleanOption((o) =>
+    o
       .setName("confirm")
-      .setDescription("Set true to actually apply the credits. Default: false (preview only).")
-      .setRequired(false)
-  );
+      .setDescription("If true, credit to treasury and advance cursor")
+      .setRequired(true),
+  )
+  .addIntegerOption((o) =>
+    o
+      .setName("last_seen")
+      .setDescription("Override cursor: only records with id > last_seen are counted"),
+  )
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+  .setDMPermission(false);
 
 export async function execute(interaction: ChatInputCommandInteraction) {
   await interaction.deferReply({ ephemeral: true });
 
-  const allianceId = interaction.options.getInteger("alliance_id", true);
-  const lastSeenIdOverride = interaction.options.getInteger("last_seen_id", false);
-  const confirm = interaction.options.getBoolean("confirm", false) ?? false;
-
   try {
-    const apiKey = await getAlliancePnwKey(allianceId!);
-    if (!apiKey) {
-      await interaction.editReply("No stored PnW key for this alliance. Use `/pnw_set` first.");
-      return;
+    const allianceId = interaction.options.getInteger("alliance_id", true)!;
+    const confirm = interaction.options.getBoolean("confirm", true) ?? false;
+
+    const overrideLastSeen = interaction.options.getInteger("last_seen") ?? null;
+
+    // Read stored cursor unless overridden
+    const storedCursor = await getPnwCursor(allianceId);
+    const lastSeenId = overrideLastSeen ?? (storedCursor ?? 0);
+
+    // Preview recent tax-only bank records using the stored key and our cursor
+    const preview = await previewAllianceTaxCreditsStored(allianceId, lastSeenId || null);
+    const count = preview?.count ?? 0;
+    const newestId = preview?.newestId ?? null;
+    const delta = (preview?.delta ?? {}) as ResourceDelta;
+
+    const totalsBlock = formatDelta(delta);
+    const hasPositive = totalsBlock.trim().length > 0;
+
+    let applied = false;
+    let cursorAdvancedTo: number | null = null;
+
+    if (confirm && count > 0 && hasPositive) {
+      // 1) credit to our local treasury store
+      await addToTreasury(allianceId, delta);
+      // 2) advance cursor to newestId (if present)
+      if (typeof newestId === "number" && newestId > (lastSeenId ?? 0)) {
+        await setPnwCursor(allianceId, newestId);
+        cursorAdvancedTo = newestId;
+      }
+      // 3) log the apply event
+      await appendPnwApplyLog({
+        allianceId,
+        at: new Date().toISOString(),
+        mode: "apply",
+        lastSeenId: lastSeenId ?? null,
+        newestId: newestId ?? null,
+        records: count,
+        delta,
+      } as any);
+      applied = true;
+    } else {
+      // preview-only log (optional but useful)
+      await appendPnwApplyLog({
+        allianceId,
+        at: new Date().toISOString(),
+        mode: "preview",
+        lastSeenId: lastSeenId ?? null,
+        newestId: newestId ?? null,
+        records: count,
+        delta,
+      } as any);
     }
 
-    // Auto-cursor unless user overrides
-    const storedCursor = await getPnwCursor(allianceId!);
-    const lastSeenId = typeof lastSeenIdOverride === "number" ? lastSeenIdOverride : storedCursor;
-
-    const preview = await previewAllianceTaxCredits({
-      apiKey,
-      allianceId: allianceId!,
-      lastSeenId,
+    // Build a clean embed response
+    const embed = resourceEmbed({
+      title: `PnW Tax ${applied ? "Apply" : "Preview"} (Stored Key)`,
+      subtitle: [
+        `**Alliance:** ${allianceId}`,
+        `**Cursor:** id > ${lastSeenId ?? 0}`,
+        `**Records counted:** ${count}`,
+        `**Newest bankrec id:** ${newestId ?? "—"}`,
+      ].join("\n"),
+      fields: [
+        {
+          name: applied ? "Applied delta (sum)" : "Tax delta (sum)",
+          value: codeBlock(totalsBlock || ""),
+          inline: false,
+        },
+      ],
+      color: applied ? 0x2ecc71 : 0x5865f2,
+      footer: applied
+        ? cursorAdvancedTo
+          ? `Credited to treasury. Cursor saved as ${cursorAdvancedTo}.`
+          : `Credited to treasury.`
+        : `Preview only. Use confirm:true to apply and advance cursor.`,
     });
-
-    // Pretty embed
-    const embed = new EmbedBuilder()
-      .setTitle(confirm ? "PnW Tax Apply (Stored Key)" : "PnW Tax Apply — PREVIEW (Stored Key)")
-      .setColor(confirm ? 0x0984e3 : 0xf9a825)
-      .setDescription(
-        [
-          `**Alliance ID:** \`${allianceId}\``,
-          lastSeenId != null
-            ? `**Cursor (using ${typeof lastSeenIdOverride === "number" ? "override" : "stored"})**: \`id > ${lastSeenId}\``
-            : "**Cursor:** _none_ (all available in recent window)",
-          `**Records counted:** \`${preview.count}\``,
-          `**Newest bankrec id (next cursor):** \`${preview.newestId ?? "none"}\``,
-          "",
-          "_This sums **incoming tax bank records** (to this alliance). This is **not** your current bank balance._",
-        ]
-          .filter(Boolean)
-          .join("\n")
-      );
-
-    // Delta field
-    const nonZeroDelta: Record<string, number> = {};
-    const lines: string[] = [];
-    for (const key of RESOURCE_ORDER) {
-      const v = (preview.delta as any)[key] ?? 0;
-      if (!v) continue;
-      nonZeroDelta[key] = v;
-      lines.push(`• **${key}**: +${fmtNumber(v, { money: key === "money" })}`);
-    }
-
-    embed.addFields(
-      lines.length
-        ? [{ name: "Tax delta (sum)", value: lines.join("\n"), inline: false }]
-        : [{ name: "Tax delta (sum)", value: "_No positive tax deltas detected._", inline: false }]
-    );
-
-    if (preview.warnings?.length) {
-      embed.addFields([{ name: "Warnings", value: preview.warnings.map((w) => `• ${w}`).join("\n") }]);
-    }
-
-    // If not confirmed or nothing to apply, show preview only
-    if (!confirm || lines.length === 0) {
-      embed.setFooter({
-        text:
-          preview.newestId != null
-            ? `Preview only. If confirmed, cursor would be saved as ${preview.newestId}, and a log entry recorded.`
-            : `Preview only. No new records to apply.`,
-      });
-      await interaction.editReply({ embeds: [embed] });
-      return;
-    }
-
-    // Apply: credit to treasury
-    await addToTreasury(allianceId!, preview.delta as Record<string, number>, {
-      source: "pnw",
-      kind: "tax",
-      note: `Applied via /pnw_apply by ${interaction.user.tag} (${interaction.user.id}); fromCursor=${lastSeenId ?? "none"} toCursor=${preview.newestId ?? "none"}`,
-    } as any);
-
-    // Persist new cursor (if any)
-    if (typeof preview.newestId === "number") {
-      await setPnwCursor(allianceId!, preview.newestId);
-    }
-
-    // Append log entry (always on confirm)
-    await appendPnwApplyLog(allianceId!, {
-      ts: new Date().toISOString(),
-      actorId: interaction.user.id,
-      actorTag: interaction.user.tag,
-      fromCursor: lastSeenId ?? null,
-      toCursor: preview.newestId ?? null,
-      records: preview.count,
-      delta: nonZeroDelta,
-    });
-
-    embed.setColor(0x00b894);
-    embed.addFields([
-      {
-        name: "Applied",
-        value:
-          preview.newestId != null
-            ? `✅ Credited to treasury. **Next cursor saved:** \`${preview.newestId}\`.\nLog recorded under _meta.pnw.logs.`
-            : "✅ Credited to treasury. Log recorded.",
-        inline: false,
-      },
-    ]);
 
     await interaction.editReply({ embeds: [embed] });
   } catch (err: any) {
-    await interaction.editReply(
-      "Failed to apply PnW tax credits: " + (err?.message ?? String(err)) +
-      "\nTry a preview first with `/pnw_preview_stored`."
-    );
+    const msg =
+      err?.message?.startsWith("PnW GraphQL error")
+        ? `❌ ${err.message}`
+        : `❌ ${err?.message ?? String(err)}`;
+    console.error("[/pnw_apply] error:", err);
+    await interaction.editReply(msg);
   }
 }
-
-export default { data, execute };
