@@ -4,20 +4,16 @@ import {
   ChatInputCommandInteraction,
   PermissionFlagsBits,
 } from "discord.js";
-
-import { resourceEmbed } from "../lib/embeds";
-import { getPnwCursor } from "../utils/pnw_cursor";
 import { previewAllianceTaxCreditsStored } from "../integrations/pnw/tax";
+import { getPnwCursor } from "../utils/pnw_cursor";
+import { resourceEmbed } from "../lib/embeds";
 
 function codeBlock(s: string) {
   return s ? "```\n" + s + "\n```" : "—";
 }
-
 function formatDelta(delta: Record<string, number>): string {
-  const keys = Object.keys(delta || {});
   const lines: string[] = [];
-  for (const k of keys) {
-    const v = Number(delta[k] ?? 0);
+  for (const [k, v] of Object.entries(delta || {})) {
     if (!v) continue;
     const asStr =
       k === "money"
@@ -30,32 +26,26 @@ function formatDelta(delta: Record<string, number>): string {
 
 export const data = new SlashCommandBuilder()
   .setName("pnw_preview")
-  .setDescription(
-    "Preview PnW automated tax records (stored key), sum deltas (no apply)."
-  )
+  .setDescription("Preview PnW tax deltas since the saved cursor (no apply).")
   .addIntegerOption((o) =>
-    o
-      .setName("alliance_id")
-      .setDescription("Alliance ID")
-      .setRequired(true)
+    o.setName("alliance_id").setDescription("Alliance ID").setRequired(true)
   )
   .addIntegerOption((o) =>
     o
       .setName("limit")
-      .setDescription("Try scanning a larger recent window (best effort)")
+      .setDescription("Scan window (best effort), e.g. 600")
       .setRequired(false)
   )
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .setDMPermission(false);
 
-export async function execute(i: ChatInputCommandInteraction) {
-  await i.deferReply({ ephemeral: true });
+export async function execute(interaction: ChatInputCommandInteraction) {
+  await interaction.deferReply({ ephemeral: true });
   try {
-    const allianceId = i.options.getInteger("alliance_id", true)!;
-    const limit = i.options.getInteger("limit") ?? undefined;
+    const allianceId = interaction.options.getInteger("alliance_id", true)!;
+    const limit = interaction.options.getInteger("limit") ?? undefined;
 
-    const storedCursor = await getPnwCursor(allianceId);
-    const lastSeenId = storedCursor ?? 0;
+    const lastSeenId = (await getPnwCursor(allianceId)) ?? 0;
 
     const preview = await previewAllianceTaxCreditsStored(
       allianceId,
@@ -63,27 +53,20 @@ export async function execute(i: ChatInputCommandInteraction) {
       { limit, sampleSize: 3 }
     );
 
-    const totalsBlock = formatDelta(preview.delta);
+    const totals = formatDelta(preview.delta || {});
     const embed = resourceEmbed({
       title: "PnW Tax Preview (Stored Key)",
       subtitle: [
         `**Alliance:** ${allianceId}`,
         `**Cursor:** id > ${lastSeenId ?? 0}`,
-        `**Scan window:** ${limit ? `${limit} (best effort)` : "default"}`,
+        limit ? `**Scan limit:** ${limit}` : `**Scan window:** default`,
         `**Records counted:** ${preview.count}`,
         `**Newest bankrec id:** ${preview.newestId ?? "—"}`,
-        preview.sample?.length
-          ? `**Sample:** ${preview.sample
-              .map((r) => `#${r.id} — ${r.note || "—"}`)
-              .join("  •  ")}`
-          : "",
-      ]
-        .filter(Boolean)
-        .join("\n"),
+      ].join("\n"),
       fields: [
         {
           name: "Tax delta (sum)",
-          value: codeBlock(totalsBlock || ""),
+          value: codeBlock(totals || ""),
           inline: false,
         },
       ],
@@ -91,14 +74,13 @@ export async function execute(i: ChatInputCommandInteraction) {
       footer: "Preview only.",
     });
 
-    await i.editReply({ embeds: [embed] });
+    await interaction.editReply({ embeds: [embed] });
   } catch (err: any) {
     const msg =
-      err?.message?.startsWith("PnW GraphQL error") ||
-      err?.message?.includes("No valid stored")
+      err?.message?.startsWith("PnW GraphQL error")
         ? `❌ ${err.message}`
         : `❌ ${err?.message ?? String(err)}`;
     console.error("[/pnw_preview] error:", err);
-    await i.editReply(msg);
+    await interaction.editReply(msg);
   }
 }
