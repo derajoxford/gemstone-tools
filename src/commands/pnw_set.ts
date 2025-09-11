@@ -3,82 +3,56 @@ import {
   SlashCommandBuilder,
   ChatInputCommandInteraction,
   PermissionFlagsBits,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  ActionRowBuilder,
 } from "discord.js";
 import { PrismaClient } from "@prisma/client";
 import { seal } from "../lib/crypto.js";
-import { previewAllianceTaxCreditsStored } from "../integrations/pnw/tax";
+import { getPnwCursor } from "../utils/pnw_cursor";
 
 const prisma = new PrismaClient();
 
 export const data = new SlashCommandBuilder()
   .setName("pnw_set")
-  .setDescription("Link/save a PnW Alliance READ API key for tax previews & applies")
+  .setDescription("Link this alliance to a PnW user API key (for tax reads).")
   .addIntegerOption((o) =>
-    o
-      .setName("alliance_id")
-      .setDescription("PnW Alliance ID")
-      .setRequired(true),
-  )
-  .addStringOption((o) =>
-    o
-      .setName("api_key")
-      .setDescription("Alliance READ API key (paste here)")
-      .setRequired(true),
+    o.setName("alliance_id").setDescription("Alliance ID").setRequired(true)
   )
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .setDMPermission(false);
 
 export async function execute(interaction: ChatInputCommandInteraction) {
-  await interaction.deferReply({ ephemeral: true });
+  const allianceId = interaction.options.getInteger("alliance_id", true)!;
 
-  try {
-    const allianceId = interaction.options.getInteger("alliance_id", true)!;
-    const apiKey = interaction.options.getString("api_key", true)!.trim();
+  const modal = new ModalBuilder()
+    .setCustomId(`pnwset:${allianceId}`)
+    .setTitle("PnW User API Key");
 
-    if (!apiKey) {
-      await interaction.editReply("❌ Please provide a non-empty API key.");
-      return;
-    }
+  const api = new TextInputBuilder()
+    .setCustomId("apiKey")
+    .setLabel("User API Key")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true);
 
-    // Encrypt & store
-    const { ciphertext: encryptedApiKey, iv: nonceApi } = seal(apiKey);
+  modal.addComponents(
+    new ActionRowBuilder<TextInputBuilder>().addComponents(api)
+  );
 
-    await prisma.alliance.upsert({
-      where: { id: allianceId },
-      update: { guildId: interaction.guildId ?? undefined },
-      create: { id: allianceId, guildId: interaction.guildId ?? undefined },
-    });
-
-    await prisma.allianceKey.create({
-      data: {
-        allianceId,
-        encryptedApiKey,
-        nonceApi,
-        addedBy: interaction.user.id,
-      },
-    });
-
-    await interaction.editReply(
-      `✅ Alliance linked to PnW key.\nAlliance ID: **${allianceId}**`,
-    );
-
-    // Guarded validation preview (small window)
-    try {
-      const pv = await previewAllianceTaxCreditsStored(allianceId, 0, 50);
-      const c = pv?.count ?? 0;
-      await interaction.followUp({
-        content: `Check\nValidation: preview returned **${c}** tax-related bank record(s) in the recent window.`,
-        ephemeral: true,
-      });
-    } catch (e: any) {
-      await interaction.followUp({
-        content: `Check\nValidation failed: ${e?.message || String(e)}`,
-        ephemeral: true,
-      });
-    }
-  } catch (err: any) {
-    await interaction.editReply(
-      `❌ Failed to save key: ${err?.message || String(err)}`,
-    );
-  }
+  await interaction.showModal(modal);
 }
+
+// Handle the modal submission in your index.ts (you already have a pattern there).
+// Example handler (if you need it):
+// client.on('interactionCreate', async (i) => {
+//   if (!i.isModalSubmit()) return;
+//   if (!i.customId.startsWith('pnwset:')) return;
+//   const allianceId = Number(i.customId.split(':')[1] || 0);
+//   const apiKey = i.fields.getTextInputValue('apiKey');
+//   const { ciphertext: encApi, iv: ivApi } = seal(apiKey);
+//   await prisma.alliance.upsert({ where: { id: allianceId }, update: {}, create: { id: allianceId } });
+//   await prisma.allianceKey.create({ data: { allianceId, encryptedApiKey: encApi, nonceApi: ivApi, addedBy: i.user.id } });
+//   const cursor = (await getPnwCursor(allianceId)) ?? 0;
+//   await i.reply({ content: `✅ Alliance linked to PnW key.\nAlliance ID: ${allianceId}\n(Stored cursor: id > ${cursor})`, ephemeral: true });
+// });
