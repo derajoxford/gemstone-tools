@@ -1,3 +1,4 @@
+// src/commands/pnw_apply.ts
 import {
   SlashCommandBuilder,
   ChatInputCommandInteraction,
@@ -5,30 +6,22 @@ import {
 } from "discord.js";
 
 import { previewAllianceTaxCreditsStored } from "../integrations/pnw/tax";
-import {
-  getPnwCursor,
-  setPnwCursor,
-  appendPnwApplyLog,
-} from "../utils/pnw_cursor";
+import { getPnwCursor, setPnwCursor, appendPnwApplyLog } from "../utils/pnw_cursor";
 import { addToTreasury } from "../utils/treasury_store";
 import { resourceEmbed } from "../lib/embeds";
 
 type ResourceDelta = Record<string, number>;
-const DEFAULT_LIMIT = 600;
+function codeBlock(s: string) { return s ? "```\n" + s + "\n```" : "—"; }
 
-function codeBlock(s: string) {
-  return s ? "```\n" + s + "\n```" : "—";
-}
 function formatDelta(delta: ResourceDelta): string {
   const keys = Object.keys(delta || {});
   const lines: string[] = [];
   for (const k of keys) {
     const v = Number(delta[k] ?? 0);
     if (!v) continue;
-    const asStr =
-      k === "money"
-        ? v.toLocaleString(undefined, { maximumFractionDigits: 2 })
-        : Math.round(v).toLocaleString();
+    const asStr = k === "money"
+      ? v.toLocaleString(undefined, { maximumFractionDigits: 2 })
+      : Math.round(v).toLocaleString();
     lines.push(`${k.padEnd(10)} +${asStr}`);
   }
   return lines.join("\n");
@@ -36,127 +29,98 @@ function formatDelta(delta: ResourceDelta): string {
 
 export const data = new SlashCommandBuilder()
   .setName("pnw_apply")
-  .setDescription(
-    "Fetch PnW bank *tax* records (stored key), sum deltas, and (optionally) apply to treasury."
-  )
-  .addIntegerOption((o) =>
+  .setDescription("Fetch Automated Tax rows (scraped), sum, and optionally apply to treasury.")
+  .addIntegerOption(o =>
     o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
   )
-  .addBooleanOption((o) =>
-    o
-      .setName("confirm")
-      .setDescription("If true, credit to treasury and advance cursor")
-      .setRequired(true),
+  .addBooleanOption(o =>
+    o.setName("confirm").setDescription("If true, credit to treasury and advance cursor").setRequired(true),
   )
-  .addIntegerOption((o) =>
-    o
-      .setName("last_seen")
-      .setDescription("Override cursor: only records with id > last_seen"),
+  .addIntegerOption(o =>
+    o.setName("limit").setDescription("Max rows to scan (most recent)").setMinValue(1).setMaxValue(2000),
   )
-  .addIntegerOption((o) =>
-    o
-      .setName("limit")
-      .setDescription("How many recent bankrecs to scan (default 600)")
-      .setMinValue(50)
-      .setMaxValue(1000),
+  .addIntegerOption(o =>
+    o.setName("last_seen").setDescription("Override cursor: rows with timestamp(ms) > last_seen will be counted"),
   )
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .setDMPermission(false);
 
 export async function execute(interaction: ChatInputCommandInteraction) {
   await interaction.deferReply({ ephemeral: true });
-
   try {
     const allianceId = interaction.options.getInteger("alliance_id", true)!;
     const confirm = interaction.options.getBoolean("confirm", true) ?? false;
+    const limit = interaction.options.getInteger("limit") ?? null;
+    const override = interaction.options.getInteger("last_seen") ?? null;
 
-    const overrideLastSeen = interaction.options.getInteger("last_seen") ?? null;
-    const limit = interaction.options.getInteger("limit") ?? DEFAULT_LIMIT;
+    const storedCursor = await getPnwCursor(allianceId).catch(() => 0);
+    const lastSeenTs = override ?? (storedCursor || 0);
 
-    // Read stored cursor unless overridden
-    const storedCursor = await getPnwCursor(allianceId);
-    const lastSeenId = overrideLastSeen ?? (storedCursor ?? 0);
+    const preview = await previewAllianceTaxCreditsStored(allianceId, {
+      lastSeenTs,
+      limit: limit ?? undefined,
+    });
 
-    // Preview recent tax-only bank records using the stored key and our cursor
-    const preview = await previewAllianceTaxCreditsStored(
-      allianceId,
-      lastSeenId || null,
-      limit
-    );
-    const count = preview?.count ?? 0;
-    const newestId = preview?.newestId ?? null;
-    const delta = (preview?.delta ?? {}) as ResourceDelta;
-
-    const totalsBlock = formatDelta(delta);
-    const hasPositive = totalsBlock.trim().length > 0;
+    const totalsBlock = formatDelta(preview.delta as ResourceDelta);
+    const hasAny = (totalsBlock || "").trim().length > 0;
 
     let applied = false;
-    let cursorAdvancedTo: number | null = null;
+    let advancedTo: number | null = null;
 
-    if (confirm && count > 0 && hasPositive) {
-      // 1) credit to our local treasury store
-      await addToTreasury(allianceId, delta);
-      // 2) advance cursor to newestId (if present)
-      if (typeof newestId === "number" && newestId > (lastSeenId ?? 0)) {
-        await setPnwCursor(allianceId, newestId);
-        cursorAdvancedTo = newestId;
+    if (confirm && preview.count > 0 && hasAny) {
+      // 1) credit to treasury
+      await addToTreasury(allianceId, preview.delta as any);
+
+      // 2) advance cursor to newestTs (timestamp in ms)
+      if (typeof preview.newestTs === "number" && preview.newestTs > (lastSeenTs || 0)) {
+        await setPnwCursor(allianceId, preview.newestTs);
+        advancedTo = preview.newestTs;
       }
-      // 3) log the apply event
+
+      // 3) log
       await appendPnwApplyLog({
         allianceId,
         at: new Date().toISOString(),
         mode: "apply",
-        lastSeenId: lastSeenId ?? null,
-        newestId: newestId ?? null,
-        records: count,
-        delta,
+        lastSeenId: lastSeenTs || null,
+        newestId: preview.newestTs ?? null,
+        records: preview.count,
+        delta: preview.delta,
       } as any);
       applied = true;
     } else {
-      // preview-only log (optional but useful)
       await appendPnwApplyLog({
         allianceId,
         at: new Date().toISOString(),
         mode: "preview",
-        lastSeenId: lastSeenId ?? null,
-        newestId: newestId ?? null,
-        records: count,
-        delta,
+        lastSeenId: lastSeenTs || null,
+        newestId: preview.newestTs ?? null,
+        records: preview.count,
+        delta: preview.delta,
       } as any);
     }
 
-    // Build a clean embed response
     const embed = resourceEmbed({
       title: `PnW Tax ${applied ? "Apply" : "Preview"} (Stored Key)`,
       subtitle: [
         `**Alliance:** ${allianceId}`,
-        `**Cursor:** id > ${lastSeenId ?? 0}`,
-        `**Scan limit:** ${limit}`,
-        `**Records counted:** ${count}`,
-        `**Newest bankrec id:** ${newestId ?? "—"}`,
+        `**Cursor:** id > ${lastSeenTs || 0}`,
+        limit ? `**Scan limit:** ${limit}` : `**Scan window:** default`,
+        `**Records counted:** ${preview.count}`,
+        `**Newest bankrec id:** ${preview.newestTs ?? "—"}`,
       ].join("\n"),
       fields: [
-        {
-          name: applied ? "Applied delta (sum)" : "Tax delta (sum)",
-          value: codeBlock(totalsBlock || ""),
-          inline: false,
-        },
+        { name: applied ? "Applied delta (sum)" : "Tax delta (sum)", value: codeBlock(totalsBlock || ""), inline: false },
       ],
       color: applied ? 0x2ecc71 : 0x5865f2,
       footer: applied
-        ? cursorAdvancedTo
-          ? `Credited to treasury. Cursor saved as ${cursorAdvancedTo}.`
-          : `Credited to treasury.`
+        ? (advancedTo ? `Credited to treasury. Cursor saved as ${advancedTo}.` : `Credited to treasury.`)
         : `Preview only. Use confirm:true to apply and advance cursor.`,
     });
 
     await interaction.editReply({ embeds: [embed] });
   } catch (err: any) {
-    const msg =
-      err?.message?.startsWith("PnW GraphQL error")
-        ? `❌ ${err.message}`
-        : `❌ ${err?.message ?? String(err)}`;
     console.error("[/pnw_apply] error:", err);
-    await interaction.editReply(msg);
+    await interaction.editReply(`❌ ${err?.message || String(err)}`);
   }
 }
