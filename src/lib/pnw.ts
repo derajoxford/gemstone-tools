@@ -1,33 +1,61 @@
-import { gql } from 'graphql-request';
+// src/lib/pnw.ts
+import { request as rq, gql } from "graphql-request";
 
-export type PnwKeys = { apiKey: string; botKey?: string };
+type PnwOpts = { apiKey: string; botKey?: string };
 
-// Build a GET URL with ?api_key=...&query=...
-async function gqlGet<T>(apiKey: string, query: string): Promise<T> {
-  const url =
-    'https://api.politicsandwar.com/graphql' +
-    '?api_key=' + encodeURIComponent(apiKey) +
-    '&query=' + encodeURIComponent(query);
-  const res = await fetch(url, { method: 'GET' });
-  if (!res.ok) throw new Error(`GQL GET failed ${res.status}: ${await res.text()}`);
-  const json = await res.json();
-  if (json.errors) throw new Error(`GQL errors: ${JSON.stringify(json.errors)}`);
-  return json.data as T;
+// Low-level GQL call (URL param + header both accepted by PnW; we use URL param)
+export async function pnwQuery<T = any>(
+  opts: PnwOpts,
+  query: string,
+  variables?: Record<string, any>
+): Promise<T> {
+  const url = `https://api.politicsandwar.com/graphql?api_key=${encodeURIComponent(
+    opts.apiKey
+  )}`;
+  // Use fetch instead of graphql-request’s client to keep headers minimal & transparent
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Api-Key": opts.apiKey },
+    body: JSON.stringify({ query, variables }),
+  });
+
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok || (json as any)?.errors) {
+    throw new Error(
+      `PnW GraphQL error (status ${res.status}): ${
+        JSON.stringify((json as any)?.errors) || "unknown"
+      }`
+    );
+  }
+  return (json as any).data as T;
 }
 
-// NOTE: 'alliances' returns an AlliancePaginator => use '.data { ... }'
-// We inline the alliance IDs to avoid variables on GET.
-export async function fetchBankrecs(keys: PnwKeys, allianceIds: number[]) {
-  const ids = allianceIds.join(',');
-  const query = `
-    query {
-      alliances(id: [${ids}]) {
+/**
+ * Fetch recent bankrecs for given alliances.
+ * NOTE:
+ *  - $limit is OPTIONAL (Int) so we never hit “must not be null”.
+ *  - We return the raw alliances array with .data[0].bankrecs
+ */
+export async function fetchBankrecs(
+  opts: PnwOpts,
+  allianceIds: number[],
+  limit?: number
+): Promise<
+  Array<{
+    id: number;
+    bankrecs?: any[];
+  }>
+> {
+  const q = /* GraphQL */ `
+    query ($ids: [Int!]!, $limit: Int) {
+      alliances(id: $ids) {
         data {
           id
-          bankrecs {
+          bankrecs(limit: $limit) {
             id
             date
             note
+            tax_id
             sender_type
             sender_id
             receiver_type
@@ -47,8 +75,15 @@ export async function fetchBankrecs(keys: PnwKeys, allianceIds: number[]) {
           }
         }
       }
-    }`;
-  type Resp = { alliances: { data: any[] } };
-  const data = await gqlGet<Resp>(keys.apiKey, query);
-  return data.alliances?.data ?? [];
+    }
+  `;
+
+  const data = await pnwQuery<{
+    alliances: { data: Array<{ id: number; bankrecs: any[] }> };
+  }>(opts, q, { ids: allianceIds, limit: limit ?? null });
+
+  return (data?.alliances?.data || []).map((a) => ({
+    id: a.id,
+    bankrecs: a.bankrecs || [],
+  }));
 }
