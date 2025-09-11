@@ -1,6 +1,6 @@
 // src/integrations/pnw/tax.ts
 import { PrismaClient } from "@prisma/client";
-import { open } from "../../lib/crypto";
+import { open } from "../../lib/crypto.js";
 import { fetchBankrecs } from "../../lib/pnw";
 import { ORDER } from "../../lib/emojis";
 
@@ -35,22 +35,21 @@ export type PreviewResult = {
   newestId: number | null;
   delta: Record<string, number>;
   sample?: Array<{ id: number; note: string; money?: number }>;
-  bankrecIds?: number[]; // ids actually included in the sum (for dedupe persistence)
+  bankrecIds?: number[]; // for dedupe
 };
 
 const toInt = (v: any) => Number.parseInt(String(v ?? 0), 10) || 0;
 const toNum = (v: any) => Number.parseFloat(String(v ?? 0)) || 0;
 
 function isTaxForAlliance(r: Bankrec, allianceId: number): boolean {
-  // Incoming to alliance
+  // Only incoming to this alliance
   const incoming =
     toInt(r.receiver_type) === 2 && toInt(r.receiver_id) === allianceId;
   if (!incoming) return false;
 
-  // Heuristics that matched the working build
+  // Heuristics based on PnW: tax_id can be 0 for older rows, notes include “Automated Tax …”
   const taxId = toInt((r as any).tax_id);
   if (taxId > 0) return true;
-
   const note = String(r.note || "");
   if (/automated\s*tax/i.test(note)) return true;
 
@@ -78,8 +77,8 @@ async function openApiKey(allianceId: number): Promise<string> {
 }
 
 /**
- * GraphQL preview of tax bankrecs since lastSeenId.
- * Optionally exclude already-applied ids (dedupe safety).
+ * GraphQL preview of tax bankrecs > lastSeenId.
+ * We pass an optional scan limit through so you can widen the window.
  */
 export async function previewAllianceTaxCreditsStored(
   allianceId: number,
@@ -93,24 +92,22 @@ export async function previewAllianceTaxCreditsStored(
     );
   }
 
-  // fetchBankrecs already queries recent bankrecs; call once (or twice if we want a bit more)
-  const win1 = (await fetchBankrecs({ apiKey }, [allianceId])) || [];
-  let rows: Bankrec[] = (win1[0]?.bankrecs as any[]) || [];
+  const scanLimit = Math.max(1, opts?.limit ?? 600);
 
-  const want = Math.max(0, toInt(opts?.limit));
-  if (want && rows.length < want) {
-    const win2 = (await fetchBankrecs({ apiKey }, [allianceId])) || [];
-    const more = (win2[0]?.bankrecs as any[]) || [];
-    if (more.length > rows.length) rows = more;
+  const rowsPack = await fetchBankrecs({ apiKey }, [allianceId], scanLimit);
+  const rows: Bankrec[] = (rowsPack?.[0]?.bankrecs as any[]) || [];
+
+  if (!rows.length) {
+    return { count: 0, newestId: null, delta: {}, sample: [], bankrecIds: [] };
   }
 
   const minId = lastSeenId || 0;
   let candidates = rows.filter((r) => toInt(r.id) > minId);
 
-  // Tax-only
+  // Tax-only to this alliance
   candidates = candidates.filter((r) => isTaxForAlliance(r, allianceId));
 
-  // Dedupe guard: exclude ids we have already applied
+  // Optional dedupe (exclude ids already applied)
   if (opts?.excludeIds?.size) {
     candidates = candidates.filter((r) => !opts.excludeIds!.has(toInt(r.id)));
   }
@@ -119,7 +116,7 @@ export async function previewAllianceTaxCreditsStored(
     return { count: 0, newestId: null, delta: {}, sample: [], bankrecIds: [] };
   }
 
-  // Sort ascending by id for stable newestId and sample
+  // Sort ascending by id for stable newestId, samples
   candidates.sort((a, b) => toInt(a.id) - toInt(b.id));
 
   const newestId =
