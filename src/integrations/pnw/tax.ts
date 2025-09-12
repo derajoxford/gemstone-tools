@@ -11,13 +11,19 @@ export type TaxPreview = {
   delta: Record<string, number>;
 };
 
-// A tax row should be: nation -> alliance, receiver == our alliance
+// Prefer strong signal: tax_id > 0. Fallback to "Automated Tax" note.
 function looksLikeAutomatedTax(r: Bankrec, allianceId: number): boolean {
-  const isNationToAlliance = r.sender_type === 1 && r.receiver_type === 2 && r.receiver_id === allianceId;
-  if (!isNationToAlliance) return false;
+  // If API gives tax_id, that’s definitive.
+  if (typeof r.tax_id === 'number' && r.tax_id > 0) return true;
+
+  // Otherwise, try to infer from structure + note.
   const note = (r.note || '').toLowerCase();
-  // Very permissive: catch "Automated Tax" variations
-  return note.includes('automated tax');
+  const hasNote = note.includes('automated tax');
+
+  // Typical tax row is nation -> alliance (receiver is our alliance)
+  const nationToAlliance = r.receiver_type === 2 && r.receiver_id === allianceId;
+
+  return hasNote && nationToAlliance;
 }
 
 const RES_KEYS = [
@@ -25,8 +31,12 @@ const RES_KEYS = [
   'gasoline','munitions','steel','aluminum',
 ] as const;
 
-export async function previewAllianceTaxCreditsStored(allianceId: number, lastSeenId: number | null, limit: number = 600): Promise<TaxPreview> {
-  // pull the newest alliance key (or PNW_DEFAULT_API_KEY)
+export async function previewAllianceTaxCreditsStored(
+  allianceId: number,
+  lastSeenId: number | null,
+  limit: number = 600
+): Promise<TaxPreview> {
+  // Pull newest alliance key (or fallback)
   const a = await prisma.alliance.findUnique({
     where: { id: allianceId },
     include: { keys: { orderBy: { id: 'desc' }, take: 1 } },
@@ -35,21 +45,18 @@ export async function previewAllianceTaxCreditsStored(allianceId: number, lastSe
   const apiKey = apiKeyEnc ? open(apiKeyEnc.encryptedApiKey as any, apiKeyEnc.nonceApi as any) : (process.env.PNW_DEFAULT_API_KEY || '');
   if (!apiKey) throw new Error('No API key found for this alliance.');
 
-  // get recent bankrecs via GraphQL (paginator-safe)
   const rows = await fetchAllianceBankrecsViaGQL({ apiKey }, allianceId, Math.max(1, Number(limit) || 600));
 
-  // apply cursor filter (id > lastSeenId) if provided
-  const filteredByCursor = (lastSeenId && lastSeenId > 0)
-    ? rows.filter(r => Number(r.id) > lastSeenId)
-    : rows;
+  // Cursor filter
+  const afterCursor = (lastSeenId && lastSeenId > 0) ? rows.filter(r => Number(r.id) > lastSeenId) : rows;
 
-  // find only *automated tax* rows (nation -> alliance, note contains)
-  const taxRows = filteredByCursor.filter(r => looksLikeAutomatedTax(r, allianceId));
+  // Keep only tax rows
+  const taxRows = afterCursor.filter(r => looksLikeAutomatedTax(r, allianceId));
 
-  // compute newest id
+  // newest id
   const newestId = taxRows.length ? Math.max(...taxRows.map(r => Number(r.id))) : null;
 
-  // sum positive deltas
+  // sum
   const delta: Record<string, number> = {};
   for (const k of RES_KEYS) delta[k] = 0;
   for (const r of taxRows) {
@@ -58,11 +65,8 @@ export async function previewAllianceTaxCreditsStored(allianceId: number, lastSe
       if (v > 0) delta[k] += v;
     }
   }
-
-  // trim zeros
-  for (const k of Object.keys(delta)) {
-    if (!delta[k]) delete delta[k];
-  }
+  // prune zeros
+  for (const k of Object.keys(delta)) if (!delta[k]) delete delta[k];
 
   return { count: taxRows.length, newestId, delta };
 }
