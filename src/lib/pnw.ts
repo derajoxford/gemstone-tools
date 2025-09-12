@@ -1,19 +1,14 @@
 // src/lib/pnw.ts
-import 'dotenv/config';
+import fetch from "node-fetch";
 
-export type Bankrec = {
+export type BankrecRow = {
   id: number;
   date: string;
   note?: string | null;
-
   sender_type: number;
   sender_id: number;
   receiver_type: number;
   receiver_id: number;
-
-  // tax id if present (PnW shows 0 for normal rows, >0 for tax rows)
-  tax_id?: number;
-
   money: number;
   food: number;
   coal: number;
@@ -26,194 +21,115 @@ export type Bankrec = {
   munitions: number;
   steel: number;
   aluminum: number;
+  // not always present, but request it if available
+  tax_id?: number | null;
 };
 
-type GQLInput = { apiKey: string };
-const GQL_URL = 'https://api.politicsandwar.com/graphql';
+export async function gql<T>(
+  apiKey: string,
+  query: string,
+  variables?: Record<string, any>
+): Promise<T> {
+  const url = "https://api.politicsandwar.com/graphql?api_key=" + encodeURIComponent(apiKey);
 
-// ---------------- GQL core ----------------
-async function gql<T>(apiKey: string, query: string, variables?: Record<string, any>): Promise<T> {
-  if (!apiKey) throw new Error('No API key provided.');
-  // PnW expects the key in the URL query string. Keep header minimal.
-  const url = `${GQL_URL}?api_key=${encodeURIComponent(apiKey)}`;
   const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query, variables: variables || {} }),
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      // Carry key in header too — avoids occasional auth weirdness.
+      "X-Api-Key": apiKey,
+    },
+    body: JSON.stringify({ query, variables: variables ?? {} }),
   });
 
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || (data && data.errors)) {
-    const msg = `PnW GraphQL error (status ${res.status}): ${JSON.stringify(data?.errors || data)}`;
+  const text = await res.text();
+  let json: any = {};
+  try { json = text ? JSON.parse(text) : {}; } catch { /* keep raw text */ }
+
+  // 401/403/etc
+  if (!res.ok) {
+    const msg = `PnW GraphQL error (status ${res.status}): ${text || res.statusText}`;
     throw new Error(msg);
   }
-  return data.data as T;
+
+  // GraphQL-level errors still come back 200
+  if (json && json.errors) {
+    const msg = `PnW GraphQL error (status 200): ${JSON.stringify(json.errors)}`;
+    throw new Error(msg);
+  }
+
+  return json.data as T;
 }
 
-// ---------------- Queries (new schema w/ paginator) ----------------
-const Q_ALLIANCE_BANKRECS_V2 = `
-query AllianceBankrecsV2($ids: [Int!], $firstAlliances: Int!, $firstRecs: Int!) {
-  alliances(id: $ids, first: $firstAlliances) {
-    data {
-      id
-      bankrecs(first: $firstRecs, orderBy: [{ column: ID, order: DESC }]) {
+/**
+ * Fetch alliance bankrecs via GraphQL in paged chunks.
+ * We query alliances(id:[...]) then alliance.bankrecs(first:$first,page:$page).
+ * We keep it minimal and omit orderBy to avoid schema drift causing failures.
+ */
+export async function fetchAllianceBankrecsViaGQL(
+  apiKey: string,
+  allianceId: number,
+  {
+    perPage = 50,
+    maxPages = 20,   // up to ~1,000 rows safest
+    pageStart = 1,
+  }: { perPage?: number; maxPages?: number; pageStart?: number } = {}
+): Promise<BankrecRow[]> {
+  const FIRST = Math.max(1, Math.min(100, perPage)); // lighthouse default: <= 100
+  const MAXP = Math.max(1, Math.min(50, maxPages));
+
+  const Q = /* GraphQL */ `
+    query AllianceBankrecs($ids: [Int!], $page: Int!, $first: Int!) {
+      alliances(id: $ids) {
         data {
           id
-          date
-          note
-          sender_type
-          sender_id
-          receiver_type
-          receiver_id
-          tax_id
-          money
-          food
-          coal
-          oil
-          uranium
-          lead
-          iron
-          bauxite
-          gasoline
-          munitions
-          steel
-          aluminum
+          bankrecs(page: $page, first: $first) {
+            paginatorInfo { hasMorePages currentPage lastPage }
+            data {
+              id
+              date
+              note
+              sender_type
+              sender_id
+              receiver_type
+              receiver_id
+              money
+              food
+              coal
+              oil
+              uranium
+              lead
+              iron
+              bauxite
+              gasoline
+              munitions
+              steel
+              aluminum
+              tax_id
+            }
+          }
         }
       }
     }
+  `;
+
+  const rows: BankrecRow[] = [];
+  let page = pageStart;
+
+  for (let i = 0; i < MAXP; i++, page++) {
+    const data = await gql<{
+      alliances: { data: Array<{ id: number, bankrecs: { paginatorInfo: { hasMorePages: boolean, currentPage: number, lastPage: number }, data: BankrecRow[] } }> }
+    }>(apiKey, Q, { ids: [allianceId], page, first: FIRST });
+
+    const ali = data?.alliances?.data?.[0];
+    if (!ali) break;
+
+    const batch = ali.bankrecs?.data ?? [];
+    rows.push(...batch);
+
+    const hasMore = ali.bankrecs?.paginatorInfo?.hasMorePages;
+    if (!hasMore) break;
   }
-}
-`;
 
-// ---------------- Legacy query (older schema w/o paginator nesting) ----------------
-const Q_ALLIANCE_BANKRECS_LEGACY = `
-query AllianceBankrecsLegacy($ids: [Int!], $firstRecs: Int!) {
-  alliances(id: $ids) {
-    id
-    bankrecs(first: $firstRecs, orderBy: [{ column: ID, order: DESC }]) {
-      id
-      date
-      note
-      sender_type
-      sender_id
-      receiver_type
-      receiver_id
-      tax_id
-      money
-      food
-      coal
-      oil
-      uranium
-      lead
-      iron
-      bauxite
-      gasoline
-      munitions
-      steel
-      aluminum
-    }
-  }
-}
-`;
-
-// ---------------- Public helpers ----------------
-
-/** Fetch recent bankrecs for ONE alliance id. Handles both the new paginator and a legacy fallback. */
-export async function fetchAllianceBankrecsViaGQL(
-  { apiKey }: GQLInput,
-  allianceId: number,
-  limit: number = 250
-): Promise<Bankrec[]> {
-  const firstAlliances = 1;
-  const firstRecs = Math.max(1, Number(limit) || 250);
-
-  // Try V2 (paginator) first
-  try {
-    type R2 = {
-      alliances: {
-        data: Array<{
-          id: number;
-          bankrecs: { data: Bankrec[] };
-        }>;
-      };
-    };
-    const d = await gql<R2>(apiKey, Q_ALLIANCE_BANKRECS_V2, {
-      ids: [allianceId],
-      firstAlliances,
-      firstRecs,
-    });
-
-    const al = d?.alliances?.data?.[0];
-    if (!al) return [];
-    const rows = al.bankrecs?.data ?? [];
-    return normalizeBankrecs(rows);
-  } catch (e) {
-    // Fallback to legacy shape
-    type R1 = {
-      alliances: Array<{
-        id: number;
-        bankrecs: Bankrec[];
-      }>;
-    };
-    const d = await gql<R1>(apiKey, Q_ALLIANCE_BANKRECS_LEGACY, {
-      ids: [allianceId],
-      firstRecs,
-    });
-    const al = (d as any)?.alliances?.[0];
-    if (!al) return [];
-    const rows = (al.bankrecs as any[]) || [];
-    return normalizeBankrecs(rows as Bankrec[]);
-  }
-}
-
-/** Fetch recent bankrecs for MANY alliance ids. Returns [{ id, bankrecs }] */
-export async function fetchBankrecs(
-  { apiKey }: GQLInput,
-  allianceIds: number[],
-  limit: number = 250
-): Promise<Array<{ id: number; bankrecs: Bankrec[] }>> {
-  const out: Array<{ id: number; bankrecs: Bankrec[] }> = [];
-  for (const id of allianceIds) {
-    try {
-      const rows = await fetchAllianceBankrecsViaGQL({ apiKey }, id, limit);
-      out.push({ id, bankrecs: rows });
-    } catch {
-      out.push({ id, bankrecs: [] });
-    }
-  }
-  return out;
-}
-
-// ---------------- utils ----------------
-function toNum(x: any): number {
-  const n = Number.parseFloat(String(x));
-  return Number.isFinite(n) ? n : 0;
-}
-
-function normalizeBankrecs(rows: any[]): Bankrec[] {
-  return (rows || []).map((r: any) => ({
-    id: Number(r.id),
-    date: String(r.date),
-    note: r.note ?? null,
-
-    sender_type: Number(r.sender_type),
-    sender_id: Number(r.sender_id),
-    receiver_type: Number(r.receiver_type),
-    receiver_id: Number(r.receiver_id),
-
-    tax_id: r.tax_id != null ? Number(r.tax_id) : undefined,
-
-    money: toNum(r.money),
-    food: toNum(r.food),
-    coal: toNum(r.coal),
-    oil: toNum(r.oil),
-    uranium: toNum(r.uranium),
-    lead: toNum(r.lead),
-    iron: toNum(r.iron),
-    bauxite: toNum(r.bauxite),
-    gasoline: toNum(r.gasoline),
-    munitions: toNum(r.munitions),
-    steel: toNum(r.steel),
-    aluminum: toNum(r.aluminum),
-  }));
+  return rows;
 }
