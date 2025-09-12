@@ -7,77 +7,100 @@ import {
   TextInputBuilder,
   TextInputStyle,
   ActionRowBuilder,
-  Colors,
-  EmbedBuilder,
 } from "discord.js";
 import { PrismaClient } from "@prisma/client";
-import { seal, open } from "../lib/crypto.js";
 import { previewAllianceTaxCreditsStored } from "../integrations/pnw/tax";
 
 const prisma = new PrismaClient();
 
 export const data = new SlashCommandBuilder()
   .setName("pnw_set")
-  .setDescription("Save an alliance-scoped READ API key (used for validation only).")
+  .setDescription("Link or validate the PnW API key for this server’s alliance.")
   .addIntegerOption(o =>
-    o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
+    o.setName("alliance_id")
+      .setDescription("Alliance ID (optional if this server is already linked)")
+      .setRequired(false)
   )
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .setDMPermission(false);
 
-export async function execute(interaction: ChatInputCommandInteraction) {
-  const allianceId = interaction.options.getInteger("alliance_id", true)!;
-
-  const modal = new ModalBuilder()
-    .setCustomId(`pnwset:${allianceId}`)
-    .setTitle("PnW Alliance Read API Key");
-
-  const apiKey = new TextInputBuilder()
-    .setCustomId("api")
-    .setLabel("Alliance API Key")
-    .setStyle(TextInputStyle.Short)
-    .setRequired(true);
-
-  modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(apiKey));
-  await interaction.showModal(modal);
-
-  const submitted = await interaction
-    .awaitModalSubmit({ time: 60_000, filter: i => i.customId === `pnwset:${allianceId}` })
-    .catch(() => null);
-
-  if (!submitted) return;
-
+export async function execute(i: ChatInputCommandInteraction) {
   try {
-    const key = submitted.fields.getTextInputValue("api").trim();
-    const { ciphertext: enc, iv } = seal(key);
+    const providedAllianceId = i.options.getInteger("alliance_id") ?? null;
 
-    await prisma.alliance.upsert({
-      where: { id: allianceId },
-      update: {},
-      create: { id: allianceId },
+    // Find current mapping for this guild (if any)
+    const current = await prisma.alliance.findFirst({
+      where: { guildId: i.guildId ?? "" },
+      include: { keys: { orderBy: { id: "desc" }, take: 1 } },
     });
 
-    await prisma.allianceKey.create({
-      data: { allianceId, encryptedApiKey: enc, nonceApi: iv, addedBy: submitted.user.id },
-    });
+    let allianceId = current?.id ?? providedAllianceId ?? null;
 
-    // Sanity: try to decrypt back (guards ENCRYPTION_KEY mismatch)
-    open(enc as any, iv as any);
+    // If there is no alliance linked and none provided, ask user to supply one
+    if (!allianceId) {
+      await i.reply({
+        content:
+          "This server is not linked to a PnW alliance yet. Re-run `/pnw_set` with `alliance_id:<id>` or use `/setup_alliance`.",
+        ephemeral: true,
+      });
+      return;
+    }
 
-    // Quick validation: run a preview (won’t error if zero)
-    const preview = await previewAllianceTaxCreditsStored(allianceId, { lastSeenTs: 0, limit: 50 });
+    // If server wasn't linked yet, create the mapping now
+    if (!current) {
+      await prisma.alliance.upsert({
+        where: { id: allianceId },
+        update: { guildId: i.guildId ?? undefined },
+        create: { id: allianceId, guildId: i.guildId ?? undefined },
+      });
+    }
 
-    const embed = new EmbedBuilder()
-      .setTitle("✅ Alliance linked to PnW key.")
-      .setDescription([
-        `**Alliance ID:** ${allianceId}`,
+    // Do we already have a key saved?
+    const hasKey = !!(current?.keys?.length);
+
+    if (!hasKey) {
+      // Open the SAME modal your index.ts handler expects ("alliancekeys:<id>")
+      const modal = new ModalBuilder()
+        .setCustomId(`alliancekeys:${allianceId}`)
+        .setTitle("Alliance API Key");
+
+      const api = new TextInputBuilder()
+        .setCustomId("apiKey")
+        .setLabel("Paste your Alliance API Key")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true);
+
+      modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(api));
+      await i.showModal(modal);
+      // The modal submission is handled centrally by index.ts (handleAllianceModal)
+      return;
+    }
+
+    // Key exists — validate by previewing recent tax rows
+    await i.deferReply({ ephemeral: true });
+
+    // Use stored key; lastSeen=null means "no cursor filter", default limit window inside the fn
+    const preview = await previewAllianceTaxCreditsStored(allianceId, null, 500).catch(() => null);
+    const count = preview?.count ?? 0;
+
+    await i.editReply(
+      [
+        "✅ Alliance linked to PnW key.",
+        `Alliance ID: ${allianceId}`,
         "",
-        `Validation: preview returned **${preview.count}** tax-related bank record(s) in the recent window.`,
-      ].join("\n"))
-      .setColor(Colors.Green);
-
-    await submitted.reply({ embeds: [embed], ephemeral: true });
-  } catch (e: any) {
-    await submitted.reply({ content: `❌ Failed to save key: ${e?.message || e}`, ephemeral: true });
+        `Validation: preview returned **${count}** tax-related bank record(s) in the recent window.`,
+      ].join("\n")
+    );
+  } catch (err: any) {
+    console.error("[/pnw_set] error", err);
+    const msg = err?.message ? `❌ ${err.message}` : "❌ Something went wrong.";
+    // Try best-effort reply/editReply to avoid “The application did not respond”
+    if (i.deferred) {
+      await i.editReply(msg).catch(() => {});
+    } else if (i.replied) {
+      // already replied
+    } else {
+      await i.reply({ content: msg, ephemeral: true }).catch(() => {});
+    }
   }
 }
