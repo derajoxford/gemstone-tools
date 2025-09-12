@@ -1,162 +1,213 @@
 // src/integrations/pnw/tax.ts
 import { ORDER } from "../../lib/emojis";
 
-// Keys we sum into (matches ORDER)
+// Resource keys exactly as used in ORDER
 type Resource = typeof ORDER[number];
+
 type Row = {
-  when?: string;        // e.g., "09/09/2025 6:00 pm" if we can parse it
-  who?: string;         // nation/alliance text if present
+  when?: string;        // "09/09/2025 6:00 pm" (if found)
+  who?: string;         // payer text (best-effort)
   amounts: Record<Resource, number>;
 };
 
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"');
+}
+
+function stripTags(html: string): string {
+  return decodeEntities(html.replace(/<[^>]*>/g, " ")).replace(/\s{2,}/g, " ").trim();
+}
+
 /**
- * Fetch raw HTML for the alliance banktaxes page.
+ * Hit the alliance bank taxes page. It’s public HTML (Cloudflare can challenge).
  */
 async function fetchBankTaxesHtml(allianceId: number): Promise<string> {
   const url = `https://politicsandwar.com/alliance/id=${allianceId}&display=banktaxes`;
   const res = await fetch(url, {
     method: "GET",
     headers: {
-      // Be nice & avoid CF anti-bot heuristics
+      // Use very browser-like headers to avoid anti-bot flaky blocks
       "User-Agent":
-        "GemstoneTools/1.0 (+https://github.com/derajoxford/gemstone-tools)",
-      "Accept": "text/html,application/xhtml+xml",
-      "Cache-Control": "no-cache",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
+      "Accept":
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+      "DNT": "1",
+      "Connection": "keep-alive",
+      "Upgrade-Insecure-Requests": "1",
+      "Sec-Fetch-Dest": "document",
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-Site": "same-origin",
+      "Referer": `https://politicsandwar.com/alliance/id=${allianceId}`,
       "Pragma": "no-cache",
+      "Cache-Control": "no-cache",
     },
   });
+
+  const text = await res.text().catch(() => "");
   if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(
-      `HTTP ${res.status} on banktaxes page. Body starts: ${body.slice(0, 160)}`
-    );
+    throw new Error(`HTTP ${res.status} fetching banktaxes`);
   }
-  return await res.text();
+  // Detect common Cloudflare/blocked patterns
+  if (/Just a moment/i.test(text) || /cf-browser-verification/i.test(text) || /Cloudflare/i.test(text) && /challenge/i.test(text)) {
+    throw new Error("Blocked by Cloudflare/browser challenge");
+  }
+  // If page is a login wall for some reason
+  if (/Log in/i.test(text) && /Forgot Password/i.test(text) && /Create an account/i.test(text)) {
+    throw new Error("Login required (unexpected for banktaxes)");
+  }
+  return text;
 }
 
-/**
- * Very robust HTML -> rows parser:
- * - Finds <tr> blocks that contain "Automated Tax"
- * - Collects right-aligned numeric <td> cells as amounts (money, food, coal... per ORDER)
- * - Tries to pull a timestamp and the payer text, when available
- *
- * NOTE: PnW HTML can change. This is written to be forgiving:
- *   - looks for the literal "Automated Tax" anywhere in a row
- *   - treats any <td class="right">NUMBER</td> as a resource column in ORDER
- */
-function parseTaxRowsFromHtml(html: string): Row[] {
-  const rows: Row[] = [];
-
-  // Normalize
-  const norm = html
+/** Normalize whitespace for easier regex work */
+function normalize(html: string): string {
+  return html
     .replace(/\r/g, "")
     .replace(/\n/g, " ")
     .replace(/\s{2,}/g, " ");
+}
 
-  // Split into <tr> chunks
-  const trParts = norm.split(/<tr[\s>]/i).slice(1);
+/** Extract table header → index mapping for resource columns */
+function headerMap(normHtml: string): Map<number, Resource> {
+  // Try to capture <thead> first; fallback to the first row with <th>
+  let thead = normHtml.match(/<thead[^>]*>(.*?)<\/thead>/i)?.[1];
+  if (!thead) {
+    // grab first <tr> that contains <th>
+    thead = normHtml.match(/<tr[^>]*>(?=[\s\S]*?<th)([\s\S]*?)<\/tr>/i)?.[1] || "";
+  }
 
-  for (const part of trParts) {
-    const tr = "<tr " + part; // reconstruct
+  const ths = [...thead.matchAll(/<th[^>]*>([\s\S]*?)<\/th>/gi)].map(m => stripTags(m[1]).toLowerCase());
+  const map = new Map<number, Resource>();
 
-    // Must contain literal Automated Tax text
+  function toKey(h: string): Resource | null {
+    const t = h.replace(/[^a-z]/g, ""); // letters only
+    if (t.includes("money") || t === "cash" || t === "bank") return "money";
+    if (t.includes("food")) return "food";
+    if (t.includes("coal")) return "coal";
+    if (t === "oil" || t.includes("crudeoil")) return "oil";
+    if (t.includes("uranium")) return "uranium";
+    if (t.includes("lead")) return "lead";
+    if (t.includes("iron")) return "iron";
+    if (t.includes("bauxite")) return "bauxite";
+    if (t.includes("gasoline") || t === "gas" || t.includes("petrol")) return "gasoline";
+    if (t.includes("munitions") || t === "muni" || t === "munition") return "munitions";
+    if (t.includes("steel")) return "steel";
+    if (t.includes("aluminum") || t.includes("aluminium")) return "aluminum";
+    return null;
+  }
+
+  ths.forEach((h, idx) => {
+    const key = toKey(h);
+    if (key && ORDER.includes(key)) map.set(idx, key);
+  });
+
+  return map;
+}
+
+function parseNumberCell(text: string): number {
+  // strip everything except digits, decimal point, and minus
+  const cleaned = text.replace(/[\$,]/g, "").trim();
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : 0;
+}
+
+/**
+ * Parse all tax rows (those containing “Automated Tax”) and read resource cells
+ * using the header index map for accuracy.
+ */
+function parseTaxRowsFromHtml(html: string): Row[] {
+  const out: Row[] = [];
+  const norm = normalize(html);
+
+  // Build header mapping once
+  const colToResource = headerMap(norm);
+
+  // Split table body rows (prefer <tbody> if present)
+  let tbody = norm.match(/<tbody[^>]*>([\s\S]*?)<\/tbody>/i)?.[1];
+  if (!tbody) {
+    // fallback: the whole doc (we'll still split on <tr>)
+    tbody = norm;
+  }
+
+  const trs = tbody.split(/<tr[\s>]/i).slice(1);
+  for (const part of trs) {
+    const tr = "<tr " + part;
     if (!/Automated\s*Tax/i.test(tr)) continue;
 
-    // Try to pull a timestamp like "09/09/2025 6:00 pm"
-    const whenMatch = tr.match(
+    // Extract <td> cells in this row
+    const tds = [...tr.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)].map(m => m[1]);
+
+    // Derive when (Date) and who (payer) best-effort
+    const plainRow = stripTags(tr);
+    const whenMatch = plainRow.match(
       /\b(\d{2}\/\d{2}\/\d{4}\s+\d{1,2}:\d{2}\s*(?:am|pm))/i
     );
     const when = whenMatch?.[1];
 
-    // Try to pull a "who" (payer) — crude but helpful for debug
-    // Look for the cell that contains the "Automated Tax" text and grab sibling text
-    let who: string | undefined;
-    {
-      const whoCell = tr
-        .split(/<\/td>/i)
-        .find((td) => /Automated\s*Tax/i.test(td));
-      if (whoCell) {
-        // Sometimes the nation/alliance text is right after that cell in the same row;
-        // fallback: strip tags & compress
-        who = whoCell
-          .replace(/<[^>]*>/g, " ")
-          .replace(/\s{2,}/g, " ")
-          .trim();
-      }
-    }
+    // get the cell that actually contains "Automated Tax" for nearby context
+    const who = stripTags(tds.find(td => /Automated\s*Tax/i.test(td)) || "");
 
-    // Grab every right-aligned number cell
-    // Example cell: <td class="right">$250,000,000</td> or <td class="right">4,154.94</td>
-    const numCells: number[] = [];
-    const re = /<td[^>]*class="[^"]*\bright\b[^"]*"[^>]*>\s*([$])?\s*([0-9][\d,]*(?:\.\d+)?)\s*<\/td>/gi;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(tr))) {
-      const raw = m[2].replace(/,/g, "");
-      const val = Number(raw);
-      if (Number.isFinite(val)) numCells.push(val);
-    }
-
-    // Map onto ORDER. If there are more numeric cells than ORDER,
-    // we simply take the first ORDER.length — PnW tax table puts
-    // resource columns to the right.
+    // Initialize amounts
     const amounts: Record<Resource, number> = {} as any;
-    for (let idx = 0; idx < ORDER.length; idx++) {
-      const key = ORDER[idx] as Resource;
-      const val = numCells[idx] ?? 0;
-      amounts[key] = Number(val) || 0;
+    ORDER.forEach((k) => (amounts[k as Resource] = 0));
+
+    // Walk through each <td>, and if its index is mapped to a resource, parse number
+    tds.forEach((td, idx) => {
+      const key = colToResource.get(idx);
+      if (!key) return;
+      const val = parseNumberCell(stripTags(td));
+      if (val) amounts[key] += val;
+    });
+
+    // Keep only if any positive amount found
+    if (ORDER.some((k) => (amounts[k as Resource] || 0) > 0)) {
+      out.push({ when, who, amounts });
     }
-
-    // Only keep rows that actually have any positive resource
-    const anyPos = ORDER.some((k) => (amounts[k] || 0) > 0);
-    if (!anyPos) continue;
-
-    rows.push({ when, who, amounts });
   }
 
-  return rows;
+  return out;
 }
 
 /**
- * Public: preview tax credits using the stored-key approach in commands,
- * but this function does NOT need the key (the HTML page is public).
- *
- * Returns a sum (delta) and a simple count of matched rows.
- *
- * Note: newestId is null because the HTML table does not expose a bankrec id.
+ * Public: preview “Automated Tax” rows by scraping the HTML page.
+ * This matches how we previously got non-zero counts/totals.
  */
 export async function previewAllianceTaxCreditsStored(
   allianceId: number,
   _lastSeenIdOrNull?: number | null,
-  opts?: { limit?: number } // limit rows summed (most-recent first)
+  opts?: { limit?: number } // trims newest N rows (page is newest-first)
 ): Promise<{ count: number; newestId: number | null; delta: Record<Resource, number>; sample?: Row[] }> {
   const html = await fetchBankTaxesHtml(allianceId);
-  const allRows = parseTaxRowsFromHtml(html);
+  const rowsAll = parseTaxRowsFromHtml(html);
 
-  // Newest-first: the page lists newest first; keep that behavior
   const rows = typeof opts?.limit === "number" && opts.limit > 0
-    ? allRows.slice(0, opts.limit)
-    : allRows;
+    ? rowsAll.slice(0, opts.limit)
+    : rowsAll;
 
   const delta: Record<Resource, number> = {} as any;
-  for (const k of ORDER) delta[k as Resource] = 0;
+  ORDER.forEach((k) => (delta[k as Resource] = 0));
 
   for (const r of rows) {
-    for (const k of ORDER) {
+    ORDER.forEach((k) => {
       delta[k as Resource] += Number(r.amounts[k as Resource] || 0);
-    }
+    });
   }
 
   return {
     count: rows.length,
-    newestId: null, // HTML source — no numeric id
+    newestId: null, // HTML page doesn’t expose bankrec ids
     delta,
-    sample: rows.slice(0, 5), // for debug
+    sample: rows.slice(0, 5),
   };
 }
 
-/**
- * Debug helper used by /pnw_tax_debug
- */
+/** Used by /pnw_tax_debug to show what we parsed */
 export async function debugScrapeAllianceTaxes(
   allianceId: number
 ): Promise<{ rows: Row[] }> {
