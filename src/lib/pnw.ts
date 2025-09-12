@@ -1,13 +1,16 @@
 // src/lib/pnw.ts
-// Minimal PnW GraphQL helpers focused on alliance->bankrecs
+import 'dotenv/config';
 
 export type Bankrec = {
   id: number;
   date: string;
+  note?: string | null;
+
   sender_type: number;
   sender_id: number;
   receiver_type: number;
   receiver_id: number;
+
   money: number;
   food: number;
   coal: number;
@@ -20,26 +23,73 @@ export type Bankrec = {
   munitions: number;
   steel: number;
   aluminum: number;
-  note?: string | null;
-  tax_id?: number | null;
 };
 
-type AlliancesBankrecsResp = {
-  data?: {
-    alliances: Array<{
-      id: number;
-      bankrecs: Array<Partial<Bankrec>>;
-    }>;
-  };
-  errors?: any;
-};
+type GQLInput = { apiKey: string };
+const GQL_URL = 'https://api.politicsandwar.com/graphql';
 
-const GQL = `query($ids:[Int!]) {
-  alliances(id:$ids) {
+// ---------------- GQL core ----------------
+async function gql<T>(apiKey: string, query: string, variables?: Record<string, any>): Promise<T> {
+  const res = await fetch(GQL_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Api-Key': apiKey,
+    },
+    body: JSON.stringify({ query, variables: variables || {} }),
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || (data && data.errors)) {
+    const msg = `PnW GraphQL error (status ${res.status}): ${JSON.stringify(data?.errors || data)}`;
+    throw new Error(msg);
+  }
+  return data.data as T;
+}
+
+// ---------------- Queries (new schema w/ paginator) ----------------
+const Q_ALLIANCE_BANKRECS_V2 = `
+query AllianceBankrecsV2($ids: [Int!], $firstAlliances: Int!, $firstRecs: Int!) {
+  alliances(id: $ids, first: $firstAlliances) {
+    data {
+      id
+      bankrecs(first: $firstRecs, orderBy: [{ column: ID, order: DESC }]) {
+        data {
+          id
+          date
+          note
+          sender_type
+          sender_id
+          receiver_type
+          receiver_id
+          money
+          food
+          coal
+          oil
+          uranium
+          lead
+          iron
+          bauxite
+          gasoline
+          munitions
+          steel
+          aluminum
+        }
+      }
+    }
+  }
+}
+`;
+
+// ---------------- Legacy query (older schema w/o paginator nesting) ----------------
+const Q_ALLIANCE_BANKRECS_LEGACY = `
+query AllianceBankrecsLegacy($ids: [Int!], $firstRecs: Int!) {
+  alliances(id: $ids) {
     id
-    bankrecs {
+    bankrecs(first: $firstRecs, orderBy: [{ column: ID, order: DESC }]) {
       id
       date
+      note
       sender_type
       sender_id
       receiver_type
@@ -56,57 +106,116 @@ const GQL = `query($ids:[Int!]) {
       munitions
       steel
       aluminum
-      note
-      tax_id
     }
   }
-}`;
+}
+`;
 
-export async function fetchAllianceBankrecsViaGQL(opts: {
-  apiKey: string;
-  allianceId: number;
-}): Promise<Bankrec[]> {
-  const url = `https://api.politicsandwar.com/graphql?api_key=${encodeURIComponent(
-    opts.apiKey
-  )}`;
+// ---------------- Public helpers ----------------
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query: GQL, variables: { ids: [opts.allianceId] } }),
-  });
+/**
+ * Fetch recent bankrecs for ONE alliance id.
+ * Handles both the new paginator shape and a legacy fallback.
+ */
+export async function fetchAllianceBankrecsViaGQL(
+  { apiKey }: GQLInput,
+  allianceId: number,
+  limit: number = 250
+): Promise<Bankrec[]> {
+  const firstAlliances = 1;
+  const firstRecs = Math.max(1, Number(limit) || 250);
 
-  const json = (await res.json().catch(() => ({}))) as AlliancesBankrecsResp;
+  // Try V2 (paginator) first
+  try {
+    type R2 = {
+      alliances: {
+        data: Array<{
+          id: number;
+          bankrecs: { data: Bankrec[] };
+        }>;
+      };
+    };
+    const d = await gql<R2>(apiKey, Q_ALLIANCE_BANKRECS_V2, {
+      ids: [allianceId],
+      firstAlliances,
+      firstRecs,
+    });
 
-  if (!res.ok || json.errors) {
-    const msg = `PnW GraphQL error (status ${res.status}): ${
-      json?.errors ? JSON.stringify(json.errors) : "Unknown error"
-    }`;
-    throw new Error(msg);
+    const al = d?.alliances?.data?.[0];
+    if (!al) return [];
+    const rows = al.bankrecs?.data ?? [];
+    return normalizeBankrecs(rows);
+  } catch (e) {
+    // Fallback to legacy shape
+    try {
+      type R1 = {
+        alliances: Array<{
+          id: number;
+          bankrecs: Bankrec[];
+        }>;
+      };
+      const d = await gql<R1>(apiKey, Q_ALLIANCE_BANKRECS_LEGACY, {
+        ids: [allianceId],
+        firstRecs,
+      });
+      const al = (d as any)?.alliances?.[0];
+      if (!al) return [];
+      const rows = (al.bankrecs as any[]) || [];
+      return normalizeBankrecs(rows as Bankrec[]);
+    } catch (e2) {
+      throw e2;
+    }
   }
+}
 
-  const rows = json?.data?.alliances?.[0]?.bankrecs ?? [];
-  // Normalize + coerce numeric fields
-  return rows.map((r: any) => ({
-    id: Number(r.id) || 0,
-    date: String(r.date || ""),
-    sender_type: Number(r.sender_type) || 0,
-    sender_id: Number(r.sender_id) || 0,
-    receiver_type: Number(r.receiver_type) || 0,
-    receiver_id: Number(r.receiver_id) || 0,
-    money: Number(r.money) || 0,
-    food: Number(r.food) || 0,
-    coal: Number(r.coal) || 0,
-    oil: Number(r.oil) || 0,
-    uranium: Number(r.uranium) || 0,
-    lead: Number(r.lead) || 0,
-    iron: Number(r.iron) || 0,
-    bauxite: Number(r.bauxite) || 0,
-    gasoline: Number(r.gasoline) || 0,
-    munitions: Number(r.munitions) || 0,
-    steel: Number(r.steel) || 0,
-    aluminum: Number(r.aluminum) || 0,
+/**
+ * Fetch recent bankrecs for MANY alliance ids.
+ * Returns array of { id, bankrecs } to match existing callers.
+ */
+export async function fetchBankrecs(
+  { apiKey }: GQLInput,
+  allianceIds: number[],
+  limit: number = 250
+): Promise<Array<{ id: number; bankrecs: Bankrec[] }>> {
+  const out: Array<{ id: number; bankrecs: Bankrec[] }> = [];
+  for (const id of allianceIds) {
+    try {
+      const rows = await fetchAllianceBankrecsViaGQL({ apiKey }, id, limit);
+      out.push({ id, bankrecs: rows });
+    } catch {
+      out.push({ id, bankrecs: [] });
+    }
+  }
+  return out;
+}
+
+// ---------------- utils ----------------
+function toNum(x: any): number {
+  const n = Number.parseFloat(String(x));
+  return Number.isFinite(n) ? n : 0;
+}
+
+function normalizeBankrecs(rows: any[]): Bankrec[] {
+  return (rows || []).map((r: any) => ({
+    id: Number(r.id),
+    date: String(r.date),
     note: r.note ?? null,
-    tax_id: typeof r.tax_id === "number" ? r.tax_id : r.tax_id ? Number(r.tax_id) : 0,
+    sender_type: Number(r.sender_type),
+    sender_id: Number(r.sender_id),
+    receiver_type: Number(r.receiver_type),
+    receiver_id: Number(r.receiver_id),
+
+    money: toNum(r.money),
+    food: toNum(r.food),
+    coal: toNum(r.coal),
+    oil: toNum(r.oil),
+    uranium: toNum(r.uranium),
+    lead: toNum(r.lead),
+    iron: toNum(r.iron),
+    bauxite: toNum(r.bauxite),
+    gasoline: toNum(r.gasoline),
+    munitions: toNum(r.munitions),
+    steel: toNum(r.steel),
+    aluminum: toNum(r.aluminum),
   }));
 }
