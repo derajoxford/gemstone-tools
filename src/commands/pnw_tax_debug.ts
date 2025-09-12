@@ -1,38 +1,39 @@
 // src/commands/pnw_tax_debug.ts
-import { SlashCommandBuilder, ChatInputCommandInteraction, PermissionFlagsBits } from "discord.js";
-import { scrapeAllianceAutomatedTaxes } from "../integrations/pnw/tax_scrape";
-import { resourceEmbed } from "../lib/embeds";
+import { SlashCommandBuilder, ChatInputCommandInteraction } from "discord.js";
+import { previewAllianceTaxCreditsStored } from "../integrations/pnw/tax";
 
 export const data = new SlashCommandBuilder()
   .setName("pnw_tax_debug")
-  .setDescription("Debug-scrape the banktaxes page and report what we see.")
-  .addIntegerOption(o => o.setName("alliance_id").setDescription("Alliance ID").setRequired(true))
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-  .setDMPermission(false);
+  .setDescription("Fetch and parse the PnW bank taxes HTML; print parser diagnostics.")
+  .addIntegerOption(o =>
+    o.setName("alliance_id").setDescription("Alliance ID").setRequired(true)
+  );
 
-export async function execute(interaction: ChatInputCommandInteraction) {
-  await interaction.deferReply({ ephemeral: true });
+export async function execute(i: ChatInputCommandInteraction) {
+  await i.deferReply({ ephemeral: true });
+
   try {
-    const allianceId = interaction.options.getInteger("alliance_id", true)!;
-    const rows = await scrapeAllianceAutomatedTaxes(allianceId);
+    const allianceId = i.options.getInteger("alliance_id", true);
+    const preview = await previewAllianceTaxCreditsStored(allianceId, null, null);
 
-    const previews = rows.slice(-5).map(r =>
-      `• ${new Date(r.at).toLocaleString()}  |  note: ${r.note.slice(0,80)}`
-    ).join("\n") || "— none —";
+    const d = preview.debug || {};
+    const lines = [
+      `**Alliance:** ${allianceId}`,
+      `**Rows parsed:** ${preview.count}`,
+      `**Blocked:** ${d.blocked ? "yes" : "no"}`,
+      `**Matched bank taxes table:** ${d.matchedTable ? "yes" : "no"}`,
+      `**Fetched bytes:** ${d.fetchedBytes ?? "?"}`,
+      d.savedFile ? `**Saved HTML:** \`${d.savedFile}\`` : undefined,
+    ].filter(Boolean).join("\n");
 
-    const embed = resourceEmbed({
-      title: "PnW Tax Debug",
-      subtitle: [
-        `**Alliance:** ${allianceId}`,
-        `**Rows parsed:** ${rows.length}`,
-      ].join("\n"),
-      fields: [{ name: "Last few rows", value: "```\n" + previews + "\n```", inline: false }],
-      color: 0x99aab5,
-      footer: "If rows=0, server might be blocking (Cloudflare/login) or there are no tax rows in the last 14 days.",
+    const lastFew = preview.count
+      ? "— showing first row only —"
+      : "— none —";
+
+    await i.editReply({
+      content: `**PnW Tax Debug**\n${lines}\n\n**Last few rows**\n${lastFew}`,
     });
-
-    await interaction.editReply({ embeds: [embed] });
-  } catch (e: any) {
-    await interaction.editReply(`❌ Debug failed: ${e?.message || String(e)}`);
+  } catch (err: any) {
+    await i.editReply(`❌ ${err?.message || String(err)}`);
   }
 }
