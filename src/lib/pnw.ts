@@ -1,135 +1,119 @@
 // src/lib/pnw.ts
 import fetch from "node-fetch";
 
-export type BankrecRow = {
-  id: number;
-  date: string;
-  note?: string | null;
-  sender_type: number;
-  sender_id: number;
-  receiver_type: number;
-  receiver_id: number;
-  money: number;
-  food: number;
-  coal: number;
-  oil: number;
-  uranium: number;
-  lead: number;
-  iron: number;
-  bauxite: number;
-  gasoline: number;
-  munitions: number;
-  steel: number;
-  aluminum: number;
-  // not always present, but request it if available
-  tax_id?: number | null;
-};
+type GqlError = { message: string };
+type GqlResp<T> = { data?: T; errors?: GqlError[] };
 
-export async function gql<T>(
-  apiKey: string,
-  query: string,
-  variables?: Record<string, any>
-): Promise<T> {
-  const url = "https://api.politicsandwar.com/graphql?api_key=" + encodeURIComponent(apiKey);
+export class PnwGqlError extends Error {
+  status: number;
+  body: any;
+  constructor(status: number, body: any, message?: string) {
+    super(message || `PnW GraphQL error (status ${status})`);
+    this.status = status;
+    this.body = body;
+  }
+}
 
+/**
+ * Minimal GQL helper for PnW (v2) — POST with api_key in querystring
+ */
+export async function gql<T = any>(apiKey: string, query: string, variables?: Record<string, any>): Promise<T> {
+  const url = `https://api.politicsandwar.com/graphql?api_key=${encodeURIComponent(apiKey)}`;
   const res = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      // Carry key in header too — avoids occasional auth weirdness.
+      // X-Api-Key header is optional when api_key is in the querystring, but keep it for parity:
       "X-Api-Key": apiKey,
     },
-    body: JSON.stringify({ query, variables: variables ?? {} }),
+    body: JSON.stringify({ query, variables }),
   });
 
-  const text = await res.text();
-  let json: any = {};
-  try { json = text ? JSON.parse(text) : {}; } catch { /* keep raw text */ }
-
-  // 401/403/etc
-  if (!res.ok) {
-    const msg = `PnW GraphQL error (status ${res.status}): ${text || res.statusText}`;
-    throw new Error(msg);
+  let json: GqlResp<T>;
+  try {
+    json = (await res.json()) as any;
+  } catch {
+    throw new PnwGqlError(res.status, await res.text().catch(() => null), `PnW GraphQL error (status ${res.status}): non-JSON response`);
   }
 
-  // GraphQL-level errors still come back 200
-  if (json && json.errors) {
-    const msg = `PnW GraphQL error (status 200): ${JSON.stringify(json.errors)}`;
-    throw new Error(msg);
+  if (!res.ok || json.errors) {
+    const body = json.errors || json;
+    const msg = `PnW GraphQL error (status ${res.status}): ${JSON.stringify(body)}`;
+    throw new PnwGqlError(res.status, body, msg);
   }
-
-  return json.data as T;
+  if (!json.data) {
+    throw new PnwGqlError(res.status, json, `PnW GraphQL error (status ${res.status}): empty data`);
+  }
+  return json.data;
 }
 
 /**
- * Fetch alliance bankrecs via GraphQL in paged chunks.
- * We query alliances(id:[...]) then alliance.bankrecs(first:$first,page:$page).
- * We keep it minimal and omit orderBy to avoid schema drift causing failures.
+ * Fetch alliance bankrecs. Schema (2025-09):
+ * alliances(id: ID!) { id bankrecs(limit: Int) { ...Bankrec } }
+ *
+ * NOTE: This returns a plain array (no paginator). We filter client-side by id.
  */
 export async function fetchAllianceBankrecsViaGQL(
   apiKey: string,
   allianceId: number,
-  {
-    perPage = 50,
-    maxPages = 20,   // up to ~1,000 rows safest
-    pageStart = 1,
-  }: { perPage?: number; maxPages?: number; pageStart?: number } = {}
-): Promise<BankrecRow[]> {
-  const FIRST = Math.max(1, Math.min(100, perPage)); // lighthouse default: <= 100
-  const MAXP = Math.max(1, Math.min(50, maxPages));
+  opts?: { limit?: number }
+): Promise<Array<any>> {
+  const limit = Math.max(1, Math.min(1000, Number(opts?.limit ?? 500)));
 
-  const Q = /* GraphQL */ `
-    query AllianceBankrecs($ids: [Int!], $page: Int!, $first: Int!) {
-      alliances(id: $ids) {
-        data {
+  const QUERY = `
+    query($id: ID!, $limit: Int){
+      alliances(id: $id) {
+        id
+        bankrecs(limit: $limit) {
           id
-          bankrecs(page: $page, first: $first) {
-            paginatorInfo { hasMorePages currentPage lastPage }
-            data {
-              id
-              date
-              note
-              sender_type
-              sender_id
-              receiver_type
-              receiver_id
-              money
-              food
-              coal
-              oil
-              uranium
-              lead
-              iron
-              bauxite
-              gasoline
-              munitions
-              steel
-              aluminum
-              tax_id
-            }
-          }
+          date
+          sender_type
+          sender_id
+          receiver_type
+          receiver_id
+          note
+          money
+          food
+          coal
+          oil
+          uranium
+          lead
+          iron
+          bauxite
+          gasoline
+          munitions
+          steel
+          aluminum
+          credits
         }
       }
     }
   `;
 
-  const rows: BankrecRow[] = [];
-  let page = pageStart;
-
-  for (let i = 0; i < MAXP; i++, page++) {
-    const data = await gql<{
-      alliances: { data: Array<{ id: number, bankrecs: { paginatorInfo: { hasMorePages: boolean, currentPage: number, lastPage: number }, data: BankrecRow[] } }> }
-    }>(apiKey, Q, { ids: [allianceId], page, first: FIRST });
-
-    const ali = data?.alliances?.data?.[0];
-    if (!ali) break;
-
-    const batch = ali.bankrecs?.data ?? [];
-    rows.push(...batch);
-
-    const hasMore = ali.bankrecs?.paginatorInfo?.hasMorePages;
-    if (!hasMore) break;
-  }
-
-  return rows;
+  const data = await gql<any>(apiKey, QUERY, { id: String(allianceId), limit });
+  const arr = Array.isArray(data?.alliances) ? data.alliances : [];
+  const row = arr.find((a: any) => Number(a?.id) === Number(allianceId));
+  const recs = Array.isArray(row?.bankrecs) ? row.bankrecs : [];
+  return recs;
 }
+
+/** numeric safe-helpers */
+export const toInt = (v: any) => Number.parseInt(String(v ?? 0), 10) || 0;
+export const toNum = (v: any) => Number.parseFloat(String(v ?? 0)) || 0;
+
+export const RES_KEYS = [
+  "money",
+  "food",
+  "coal",
+  "oil",
+  "uranium",
+  "lead",
+  "iron",
+  "bauxite",
+  "gasoline",
+  "munitions",
+  "steel",
+  "aluminum",
+  // "credits" — not part of tax income but present on recs
+] as const;
+export type ResKey = (typeof RES_KEYS)[number];
