@@ -11,6 +11,9 @@ export type Bankrec = {
   receiver_type: number;
   receiver_id: number;
 
+  // tax id if present (PnW shows 0 for normal rows, >0 for tax rows)
+  tax_id?: number;
+
   money: number;
   food: number;
   coal: number;
@@ -30,12 +33,12 @@ const GQL_URL = 'https://api.politicsandwar.com/graphql';
 
 // ---------------- GQL core ----------------
 async function gql<T>(apiKey: string, query: string, variables?: Record<string, any>): Promise<T> {
-  const res = await fetch(GQL_URL, {
+  if (!apiKey) throw new Error('No API key provided.');
+  // PnW expects the key in the URL query string. Keep header minimal.
+  const url = `${GQL_URL}?api_key=${encodeURIComponent(apiKey)}`;
+  const res = await fetch(url, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Api-Key': apiKey,
-    },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ query, variables: variables || {} }),
   });
 
@@ -62,6 +65,7 @@ query AllianceBankrecsV2($ids: [Int!], $firstAlliances: Int!, $firstRecs: Int!) 
           sender_id
           receiver_type
           receiver_id
+          tax_id
           money
           food
           coal
@@ -94,6 +98,7 @@ query AllianceBankrecsLegacy($ids: [Int!], $firstRecs: Int!) {
       sender_id
       receiver_type
       receiver_id
+      tax_id
       money
       food
       coal
@@ -113,10 +118,7 @@ query AllianceBankrecsLegacy($ids: [Int!], $firstRecs: Int!) {
 
 // ---------------- Public helpers ----------------
 
-/**
- * Fetch recent bankrecs for ONE alliance id.
- * Handles both the new paginator shape and a legacy fallback.
- */
+/** Fetch recent bankrecs for ONE alliance id. Handles both the new paginator and a legacy fallback. */
 export async function fetchAllianceBankrecsViaGQL(
   { apiKey }: GQLInput,
   allianceId: number,
@@ -147,31 +149,24 @@ export async function fetchAllianceBankrecsViaGQL(
     return normalizeBankrecs(rows);
   } catch (e) {
     // Fallback to legacy shape
-    try {
-      type R1 = {
-        alliances: Array<{
-          id: number;
-          bankrecs: Bankrec[];
-        }>;
-      };
-      const d = await gql<R1>(apiKey, Q_ALLIANCE_BANKRECS_LEGACY, {
-        ids: [allianceId],
-        firstRecs,
-      });
-      const al = (d as any)?.alliances?.[0];
-      if (!al) return [];
-      const rows = (al.bankrecs as any[]) || [];
-      return normalizeBankrecs(rows as Bankrec[]);
-    } catch (e2) {
-      throw e2;
-    }
+    type R1 = {
+      alliances: Array<{
+        id: number;
+        bankrecs: Bankrec[];
+      }>;
+    };
+    const d = await gql<R1>(apiKey, Q_ALLIANCE_BANKRECS_LEGACY, {
+      ids: [allianceId],
+      firstRecs,
+    });
+    const al = (d as any)?.alliances?.[0];
+    if (!al) return [];
+    const rows = (al.bankrecs as any[]) || [];
+    return normalizeBankrecs(rows as Bankrec[]);
   }
 }
 
-/**
- * Fetch recent bankrecs for MANY alliance ids.
- * Returns array of { id, bankrecs } to match existing callers.
- */
+/** Fetch recent bankrecs for MANY alliance ids. Returns [{ id, bankrecs }] */
 export async function fetchBankrecs(
   { apiKey }: GQLInput,
   allianceIds: number[],
@@ -200,10 +195,13 @@ function normalizeBankrecs(rows: any[]): Bankrec[] {
     id: Number(r.id),
     date: String(r.date),
     note: r.note ?? null,
+
     sender_type: Number(r.sender_type),
     sender_id: Number(r.sender_id),
     receiver_type: Number(r.receiver_type),
     receiver_id: Number(r.receiver_id),
+
+    tax_id: r.tax_id != null ? Number(r.tax_id) : undefined,
 
     money: toNum(r.money),
     food: toNum(r.food),
