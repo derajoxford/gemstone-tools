@@ -1,10 +1,21 @@
 // src/integrations/pnw/tax.ts
+// Preview + sum “automated tax” credits using GraphQL bankrecs nested under alliances.
+// Heuristic: treat as tax when it’s Nation(1) -> Alliance(2) to *this* alliance AND (tax_id>0 OR note mentions Automated Tax).
+// We also honor a lastSeenId (cursor) so we don’t double count.
+
 import { PrismaClient } from "@prisma/client";
 import { open } from "../../lib/crypto.js";
+import { fetchAllianceBankrecsViaGQL, Bankrec } from "../../lib/pnw";
 
 const prisma = new PrismaClient();
 
-// Canonical resource keys we’ll sum over
+export type ResourceDelta = Record<string, number>;
+export type PreviewResult = {
+  count: number;
+  newestId: number | null;
+  delta: ResourceDelta;
+};
+
 const RES_KEYS = [
   "money",
   "food",
@@ -20,179 +31,86 @@ const RES_KEYS = [
   "aluminum",
 ] as const;
 
-type BankrecRow = {
-  id: string | number;
-  date?: string;
-  note?: string | null;
-  sender_type?: number | string;
-  sender_id?: number | string;
-  receiver_type?: number | string;
-  receiver_id?: number | string;
-  tax_id?: number | string | null;
-  money?: number | string;
-  food?: number | string;
-  coal?: number | string;
-  oil?: number | string;
-  uranium?: number | string;
-  lead?: number | string;
-  iron?: number | string;
-  bauxite?: number | string;
-  gasoline?: number | string;
-  munitions?: number | string;
-  steel?: number | string;
-  aluminum?: number | string;
-};
-
-type PreviewOut = {
-  count: number;
-  newestId: number | null;
-  delta: Record<string, number>;
-  rows?: BankrecRow[];
-};
-
-function toInt(v: any): number {
-  const n = Number.parseInt(String(v), 10);
-  return Number.isFinite(n) ? n : 0;
-}
-function toNum(v: any): number {
-  const n = Number.parseFloat(String(v));
-  return Number.isFinite(n) ? n : 0;
+function blankDelta(): ResourceDelta {
+  const d: ResourceDelta = {};
+  for (const k of RES_KEYS) d[k] = 0;
+  return d;
 }
 
-// --- Low level: GraphQL POST (keeps api_key both in URL and header for compatibility)
-async function gqlBankrecs(opts: {
-  apiKey: string;
-  allianceId: number;
-  limit: number;
-  minId?: number | null;
-}): Promise<BankrecRow[]> {
-  const { apiKey, allianceId, limit, minId } = opts;
+function isAutomatedTaxRow(r: Bankrec, allianceId: number): boolean {
+  const fromNationToAlliance =
+    Number(r.sender_type) === 1 &&
+    Number(r.receiver_type) === 2 &&
+    Number(r.receiver_id) === Number(allianceId);
 
-  const query = `
-    query Bankrecs($aid:Int!, $limit:Int!, $minId:Int) {
-      bankrecs(alliance_id: $aid, limit: $limit, min_id: $minId) {
-        id
-        date
-        note
-        sender_type
-        sender_id
-        receiver_type
-        receiver_id
-        tax_id
-        money
-        food
-        coal
-        oil
-        uranium
-        lead
-        iron
-        bauxite
-        gasoline
-        munitions
-        steel
-        aluminum
-      }
-    }
-  `;
+  if (!fromNationToAlliance) return false;
 
-  const url = `https://api.politicsandwar.com/graphql?api_key=${encodeURIComponent(apiKey)}`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Api-Key": apiKey,
-    },
-    body: JSON.stringify({
-      query,
-      variables: {
-        aid: allianceId,
-        limit,
-        minId: minId ?? null,
-      },
-    }),
-  });
+  // Primary signal: tax_id > 0 (when present)
+  if (r.tax_id && Number(r.tax_id) > 0) return true;
 
-  const text = await res.text();
-  let json: any;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    throw new Error(`PnW GraphQL error (status ${res.status}): ${text.slice(0, 200)}`);
+  // Secondary (fallback) signal: Note mentions Automated Tax (PnW UI copy)
+  if ((r.note || "").toLowerCase().includes("automated tax")) return true;
+
+  return false;
+}
+
+function addRowToDelta(delta: ResourceDelta, r: Bankrec) {
+  for (const k of RES_KEYS) {
+    const v = Number((r as any)[k] || 0);
+    if (v) delta[k] += v;
   }
-
-  if (!res.ok || json?.errors) {
-    throw new Error(
-      `PnW GraphQL error (status ${res.status}): ` +
-        (json?.errors?.[0]?.message || text.slice(0, 200))
-    );
-  }
-
-  const rows = (json?.data?.bankrecs ?? []) as BankrecRow[];
-  return Array.isArray(rows) ? rows : [];
 }
 
-// --- Core: preview using the stored key, with cursor + filtering on tax_id>0 inbound to alliance
+export async function previewAllianceTaxCredits(
+  apiKey: string,
+  allianceId: number,
+  opts?: { lastSeenId?: number | null }
+): Promise<PreviewResult> {
+  const lastSeenId = opts?.lastSeenId ?? null;
+
+  // Pull the latest bankrecs for this alliance (server default page size)
+  const rows = await fetchAllianceBankrecsViaGQL({ apiKey, allianceId });
+
+  // Apply cursor filter first (only newer than lastSeenId)
+  const fresh = rows.filter((r) => (lastSeenId ? Number(r.id) > lastSeenId : true));
+
+  // Keep only tax-looking rows
+  const taxRows = fresh.filter((r) => isAutomatedTaxRow(r, allianceId));
+
+  // Sum
+  const delta = blankDelta();
+  for (const r of taxRows) addRowToDelta(delta, r);
+
+  // newest id we saw among the considered set (to advance cursor)
+  const newestId =
+    taxRows.length > 0 ? Math.max(...taxRows.map((r) => Number(r.id) || 0)) : null;
+
+  return { count: taxRows.length, newestId, delta };
+}
+
 export async function previewAllianceTaxCreditsStored(
   allianceId: number,
-  lastSeenId: number | null = null,
-  limit = 600
-): Promise<PreviewOut> {
-  // 1) pull the latest stored key for this alliance
+  lastSeenId?: number | null
+): Promise<PreviewResult> {
+  // Find most recent API key for this alliance
   const a = await prisma.alliance.findUnique({
-    where: { id: allianceId },
+    where: { id: Number(allianceId) },
     include: { keys: { orderBy: { id: "desc" }, take: 1 } },
   });
+
   const enc = a?.keys?.[0];
-  const apiKey =
-    enc ? open(enc.encryptedApiKey as any, enc.nonceApi as any) : (process.env.PNW_DEFAULT_API_KEY || "");
-
-  if (!apiKey) throw new Error("No API key saved for this alliance.");
-
-  // 2) fetch recent bankrecs window
-  const rows = await gqlBankrecs({
-    apiKey,
-    allianceId,
-    limit: Math.max(50, Math.min(limit || 600, 1000)),
-    minId: lastSeenId && lastSeenId > 0 ? lastSeenId : null,
-  });
-
-  // 3) filter to inbound-to-alliance AND tax rows
-  const filtered = rows.filter((r) => {
-    const rt = toInt(r.receiver_type);
-    const rid = toInt(r.receiver_id);
-    const taxId = toInt(r.tax_id);
-    return rt === 2 && rid === allianceId && taxId > 0;
-  });
-
-  // 4) apply cursor client-side too (defensive, in case server min_id wasn’t honored)
-  const cursor = lastSeenId || 0;
-  const withCursor = filtered.filter((r) => toInt(r.id) > cursor);
-
-  // 5) sum deltas
-  const delta: Record<string, number> = {};
-  for (const k of RES_KEYS) delta[k] = 0;
-
-  let newestId: number | null = null;
-
-  for (const r of withCursor) {
-    // in tax deposits, resources should be positive into the alliance
-    for (const k of RES_KEYS) {
-      const v = toNum((r as any)[k]);
-      if (v) delta[k] += v;
-    }
-    const idn = toInt(r.id);
-    if (!newestId || idn > newestId) newestId = idn;
+  const fallback = process.env.PNW_DEFAULT_API_KEY || "";
+  if (!enc && !fallback) {
+    throw new Error("No API key available for this alliance.");
   }
 
-  // prune zero keys for cleaner UI (your embed code tolerates missing keys)
-  for (const k of Object.keys(delta)) {
-    if (!delta[k]) delete delta[k];
-  }
+  const apiKey = enc
+    ? open(enc.encryptedApiKey as any, enc.nonceApi as any)
+    : fallback;
 
-  return {
-    count: withCursor.length,
-    newestId: newestId ?? null,
-    delta,
-    rows: withCursor.slice(-5), // last few for potential debug views
-  };
+  if (!apiKey) throw new Error("Failed to decrypt alliance API key.");
+
+  return previewAllianceTaxCredits(apiKey, Number(allianceId), {
+    lastSeenId: lastSeenId ?? null,
+  });
 }
