@@ -1,89 +1,112 @@
 // src/lib/pnw.ts
-import { request as rq, gql } from "graphql-request";
+// Minimal PnW GraphQL helpers focused on alliance->bankrecs
 
-type PnwOpts = { apiKey: string; botKey?: string };
+export type Bankrec = {
+  id: number;
+  date: string;
+  sender_type: number;
+  sender_id: number;
+  receiver_type: number;
+  receiver_id: number;
+  money: number;
+  food: number;
+  coal: number;
+  oil: number;
+  uranium: number;
+  lead: number;
+  iron: number;
+  bauxite: number;
+  gasoline: number;
+  munitions: number;
+  steel: number;
+  aluminum: number;
+  note?: string | null;
+  tax_id?: number | null;
+};
 
-// Low-level GQL call (URL param + header both accepted by PnW; we use URL param)
-export async function pnwQuery<T = any>(
-  opts: PnwOpts,
-  query: string,
-  variables?: Record<string, any>
-): Promise<T> {
+type AlliancesBankrecsResp = {
+  data?: {
+    alliances: Array<{
+      id: number;
+      bankrecs: Array<Partial<Bankrec>>;
+    }>;
+  };
+  errors?: any;
+};
+
+const GQL = `query($ids:[Int!]) {
+  alliances(id:$ids) {
+    id
+    bankrecs {
+      id
+      date
+      sender_type
+      sender_id
+      receiver_type
+      receiver_id
+      money
+      food
+      coal
+      oil
+      uranium
+      lead
+      iron
+      bauxite
+      gasoline
+      munitions
+      steel
+      aluminum
+      note
+      tax_id
+    }
+  }
+}`;
+
+export async function fetchAllianceBankrecsViaGQL(opts: {
+  apiKey: string;
+  allianceId: number;
+}): Promise<Bankrec[]> {
   const url = `https://api.politicsandwar.com/graphql?api_key=${encodeURIComponent(
     opts.apiKey
   )}`;
-  // Use fetch instead of graphql-request’s client to keep headers minimal & transparent
+
   const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Api-Key": opts.apiKey },
-    body: JSON.stringify({ query, variables }),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query: GQL, variables: { ids: [opts.allianceId] } }),
   });
 
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok || (json as any)?.errors) {
-    throw new Error(
-      `PnW GraphQL error (status ${res.status}): ${
-        JSON.stringify((json as any)?.errors) || "unknown"
-      }`
-    );
+  const json = (await res.json().catch(() => ({}))) as AlliancesBankrecsResp;
+
+  if (!res.ok || json.errors) {
+    const msg = `PnW GraphQL error (status ${res.status}): ${
+      json?.errors ? JSON.stringify(json.errors) : "Unknown error"
+    }`;
+    throw new Error(msg);
   }
-  return (json as any).data as T;
-}
 
-/**
- * Fetch recent bankrecs for given alliances.
- * NOTE:
- *  - $limit is OPTIONAL (Int) so we never hit “must not be null”.
- *  - We return the raw alliances array with .data[0].bankrecs
- */
-export async function fetchBankrecs(
-  opts: PnwOpts,
-  allianceIds: number[],
-  limit?: number
-): Promise<
-  Array<{
-    id: number;
-    bankrecs?: any[];
-  }>
-> {
-  const q = /* GraphQL */ `
-    query ($ids: [Int!]!, $limit: Int) {
-      alliances(id: $ids) {
-        data {
-          id
-          bankrecs(limit: $limit) {
-            id
-            date
-            note
-            tax_id
-            sender_type
-            sender_id
-            receiver_type
-            receiver_id
-            money
-            food
-            coal
-            oil
-            uranium
-            lead
-            iron
-            bauxite
-            gasoline
-            munitions
-            steel
-            aluminum
-          }
-        }
-      }
-    }
-  `;
-
-  const data = await pnwQuery<{
-    alliances: { data: Array<{ id: number; bankrecs: any[] }> };
-  }>(opts, q, { ids: allianceIds, limit: limit ?? null });
-
-  return (data?.alliances?.data || []).map((a) => ({
-    id: a.id,
-    bankrecs: a.bankrecs || [],
+  const rows = json?.data?.alliances?.[0]?.bankrecs ?? [];
+  // Normalize + coerce numeric fields
+  return rows.map((r: any) => ({
+    id: Number(r.id) || 0,
+    date: String(r.date || ""),
+    sender_type: Number(r.sender_type) || 0,
+    sender_id: Number(r.sender_id) || 0,
+    receiver_type: Number(r.receiver_type) || 0,
+    receiver_id: Number(r.receiver_id) || 0,
+    money: Number(r.money) || 0,
+    food: Number(r.food) || 0,
+    coal: Number(r.coal) || 0,
+    oil: Number(r.oil) || 0,
+    uranium: Number(r.uranium) || 0,
+    lead: Number(r.lead) || 0,
+    iron: Number(r.iron) || 0,
+    bauxite: Number(r.bauxite) || 0,
+    gasoline: Number(r.gasoline) || 0,
+    munitions: Number(r.munitions) || 0,
+    steel: Number(r.steel) || 0,
+    aluminum: Number(r.aluminum) || 0,
+    note: r.note ?? null,
+    tax_id: typeof r.tax_id === "number" ? r.tax_id : r.tax_id ? Number(r.tax_id) : 0,
   }));
 }
