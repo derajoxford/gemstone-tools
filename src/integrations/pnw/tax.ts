@@ -1,217 +1,217 @@
 // src/integrations/pnw/tax.ts
-import { ORDER } from "../../lib/emojis";
+import fs from "node:fs/promises";
+import path from "node:path";
 
-// Resource keys exactly as used in ORDER
-type Resource = typeof ORDER[number];
-
-type Row = {
-  when?: string;        // "09/09/2025 6:00 pm" (if found)
-  who?: string;         // payer text (best-effort)
-  amounts: Record<Resource, number>;
+export type TaxRow = {
+  id?: number;                 // not on the HTML page; left for future use
+  dateISO?: string;            // parsed date if present
+  nationName?: string | null;  // who paid (if present)
+  note?: string | null;        // "Automated Tax ..." etc
+  money?: number;
+  food?: number;
+  coal?: number;
+  oil?: number;
+  uranium?: number;
+  lead?: number;
+  iron?: number;
+  bauxite?: number;
+  gasoline?: number;
+  munitions?: number;
+  steel?: number;
+  aluminum?: number;
 };
 
-function decodeEntities(s: string): string {
-  return s
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&#39;/g, "'")
-    .replace(/&quot;/g, '"');
-}
+export type PreviewResult = {
+  count: number;
+  newestId: number | null;     // HTML page has no ids; always null for now
+  delta: Record<string, number>;
+  debug?: {
+    fetchedBytes: number;
+    blocked: boolean;
+    matchedTable: boolean;
+    matchedRows: number;
+    savedFile?: string;
+  };
+};
 
-function stripTags(html: string): string {
-  return decodeEntities(html.replace(/<[^>]*>/g, " ")).replace(/\s{2,}/g, " ").trim();
-}
+const DATA_DIR = path.join(process.cwd(), "var");
+const DEBUG_DIR = path.join(DATA_DIR, "pnw_tax_html");
+const UA =
+  process.env.PNW_SCRAPE_UA ||
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36";
 
-/**
- * Hit the alliance bank taxes page. It’s public HTML (Cloudflare can challenge).
- */
-async function fetchBankTaxesHtml(allianceId: number): Promise<string> {
-  const url = `https://politicsandwar.com/alliance/id=${allianceId}&display=banktaxes`;
-  const res = await fetch(url, {
-    method: "GET",
-    headers: {
-      // Use very browser-like headers to avoid anti-bot flaky blocks
-      "User-Agent":
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
-      "Accept":
-        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-      "Accept-Language": "en-US,en;q=0.9",
-      "DNT": "1",
-      "Connection": "keep-alive",
-      "Upgrade-Insecure-Requests": "1",
-      "Sec-Fetch-Dest": "document",
-      "Sec-Fetch-Mode": "navigate",
-      "Sec-Fetch-Site": "same-origin",
-      "Referer": `https://politicsandwar.com/alliance/id=${allianceId}`,
-      "Pragma": "no-cache",
-      "Cache-Control": "no-cache",
-    },
-  });
+const COMMON_RES_KEYS = [
+  "money","food","coal","oil","uranium","lead","iron","bauxite","gasoline","munitions","steel","aluminum",
+] as const;
 
-  const text = await res.text().catch(() => "");
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status} fetching banktaxes`);
-  }
-  // Detect common Cloudflare/blocked patterns
-  if (/Just a moment/i.test(text) || /cf-browser-verification/i.test(text) || /Cloudflare/i.test(text) && /challenge/i.test(text)) {
-    throw new Error("Blocked by Cloudflare/browser challenge");
-  }
-  // If page is a login wall for some reason
-  if (/Log in/i.test(text) && /Forgot Password/i.test(text) && /Create an account/i.test(text)) {
-    throw new Error("Login required (unexpected for banktaxes)");
-  }
-  return text;
-}
-
-/** Normalize whitespace for easier regex work */
-function normalize(html: string): string {
-  return html
-    .replace(/\r/g, "")
-    .replace(/\n/g, " ")
-    .replace(/\s{2,}/g, " ");
-}
-
-/** Extract table header → index mapping for resource columns */
-function headerMap(normHtml: string): Map<number, Resource> {
-  // Try to capture <thead> first; fallback to the first row with <th>
-  let thead = normHtml.match(/<thead[^>]*>(.*?)<\/thead>/i)?.[1];
-  if (!thead) {
-    // grab first <tr> that contains <th>
-    thead = normHtml.match(/<tr[^>]*>(?=[\s\S]*?<th)([\s\S]*?)<\/tr>/i)?.[1] || "";
-  }
-
-  const ths = [...thead.matchAll(/<th[^>]*>([\s\S]*?)<\/th>/gi)].map(m => stripTags(m[1]).toLowerCase());
-  const map = new Map<number, Resource>();
-
-  function toKey(h: string): Resource | null {
-    const t = h.replace(/[^a-z]/g, ""); // letters only
-    if (t.includes("money") || t === "cash" || t === "bank") return "money";
-    if (t.includes("food")) return "food";
-    if (t.includes("coal")) return "coal";
-    if (t === "oil" || t.includes("crudeoil")) return "oil";
-    if (t.includes("uranium")) return "uranium";
-    if (t.includes("lead")) return "lead";
-    if (t.includes("iron")) return "iron";
-    if (t.includes("bauxite")) return "bauxite";
-    if (t.includes("gasoline") || t === "gas" || t.includes("petrol")) return "gasoline";
-    if (t.includes("munitions") || t === "muni" || t === "munition") return "munitions";
-    if (t.includes("steel")) return "steel";
-    if (t.includes("aluminum") || t.includes("aluminium")) return "aluminum";
-    return null;
-  }
-
-  ths.forEach((h, idx) => {
-    const key = toKey(h);
-    if (key && ORDER.includes(key)) map.set(idx, key);
-  });
-
-  return map;
-}
-
-function parseNumberCell(text: string): number {
-  // strip everything except digits, decimal point, and minus
-  const cleaned = text.replace(/[\$,]/g, "").trim();
-  const n = Number(cleaned);
+function toNum(x: string | number | null | undefined): number {
+  if (x == null) return 0;
+  const s = String(x).replace(/[,_\s$]/g, "");
+  const n = Number(s);
   return Number.isFinite(n) ? n : 0;
 }
 
-/**
- * Parse all tax rows (those containing “Automated Tax”) and read resource cells
- * using the header index map for accuracy.
- */
-function parseTaxRowsFromHtml(html: string): Row[] {
-  const out: Row[] = [];
-  const norm = normalize(html);
+function zeroDelta(): Record<string, number> {
+  const d: Record<string, number> = {};
+  for (const k of COMMON_RES_KEYS) d[k] = 0;
+  return d;
+}
 
-  // Build header mapping once
-  const colToResource = headerMap(norm);
+// --- fetch the bank taxes HTML with realistic headers and optional cookie ---
+export async function fetchBankTaxesHTML(allianceId: number): Promise<string> {
+  const url = `https://politicsandwar.com/alliance/id=${allianceId}&display=banktaxes`;
+  const headers: Record<string, string> = {
+    "User-Agent": UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.8",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+  };
+  // If you add a cookie in the env (see README/ops), we’ll send it.
+  const cookie = process.env.PNW_CF_COOKIE || process.env.PNW_COOKIE;
+  if (cookie) headers["Cookie"] = cookie;
 
-  // Split table body rows (prefer <tbody> if present)
-  let tbody = norm.match(/<tbody[^>]*>([\s\S]*?)<\/tbody>/i)?.[1];
-  if (!tbody) {
-    // fallback: the whole doc (we'll still split on <tr>)
-    tbody = norm;
-  }
+  const res = await fetch(url, { headers, redirect: "follow" as RequestRedirect });
+  const html = await res.text();
+  return html;
+}
 
-  const trs = tbody.split(/<tr[\s>]/i).slice(1);
-  for (const part of trs) {
-    const tr = "<tr " + part;
+// --- extremely defensive HTML parser for bank taxes table ---
+export function parseBankTaxes(html: string): { rows: TaxRow[], blocked: boolean, matchedTable: boolean } {
+  const text = html || "";
+  const lc = text.toLowerCase();
+
+  // detect challenge / login / captcha pages in a few common ways
+  const blocked =
+    lc.includes("just a moment") ||
+    lc.includes("cf-") ||
+    lc.includes("cloudflare") ||
+    lc.includes("cf-chl") ||
+    lc.includes("please enable javascript") ||
+    lc.includes("login") && lc.includes("password") && lc.includes("username");
+
+  // try to find the bank taxes table by headline/keywords
+  const matchedTable =
+    lc.includes("bank taxes") ||
+    lc.includes("automated tax") ||
+    lc.includes("collected taxes");
+
+  // very loose row extraction:
+  // - grab lines that contain "Automated Tax"
+  // - then extract resource amounts like $12,345,678 or 1,234.56
+  const rows: TaxRow[] = [];
+
+  const lineRegex = /<tr[^>]*>[\s\S]*?<\/tr>/gi;
+  const trList = text.match(lineRegex) || [];
+
+  for (const tr of trList) {
     if (!/Automated\s*Tax/i.test(tr)) continue;
 
-    // Extract <td> cells in this row
-    const tds = [...tr.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)].map(m => m[1]);
+    const row: TaxRow = { note: null };
 
-    // Derive when (Date) and who (payer) best-effort
-    const plainRow = stripTags(tr);
-    const whenMatch = plainRow.match(
-      /\b(\d{2}\/\d{2}\/\d{4}\s+\d{1,2}:\d{2}\s*(?:am|pm))/i
-    );
-    const when = whenMatch?.[1];
+    // note / payer (best-effort)
+    const noteMatch = tr.match(/Automated\s*Tax[^<]{0,120}/i);
+    row.note = noteMatch ? noteMatch[0].trim() : "Automated Tax";
 
-    // get the cell that actually contains "Automated Tax" for nearby context
-    const who = stripTags(tds.find(td => /Automated\s*Tax/i.test(td)) || "");
+    // date (best-effort)
+    const dateCell =
+      tr.match(/<td[^>]*>\s*\d{1,2}\/\d{1,2}\/\d{2,4}[^<]*<\/td>/i) ||
+      tr.match(/\d{4}-\d{2}-\d{2}[^<]*/i);
+    if (dateCell) {
+      const ds = dateCell[0].replace(/<[^>]+>/g, "").trim();
+      // let Date try its best:
+      const d = new Date(ds);
+      if (!isNaN(d.getTime())) row.dateISO = d.toISOString();
+    }
 
-    // Initialize amounts
-    const amounts: Record<Resource, number> = {} as any;
-    ORDER.forEach((k) => (amounts[k as Resource] = 0));
+    // resources (VERY loose; picks 12,345 or 12,345.67 and $12,345 forms)
+    const grab = (re: RegExp) => {
+      const m = tr.match(re);
+      return m ? toNum(m[1] || m[0]) : 0;
+    };
 
-    // Walk through each <td>, and if its index is mapped to a resource, parse number
-    tds.forEach((td, idx) => {
-      const key = colToResource.get(idx);
-      if (!key) return;
-      const val = parseNumberCell(stripTags(td));
-      if (val) amounts[key] += val;
-    });
+    // money (look for $ first)
+    row.money =
+      grab(/\$([0-9][0-9,\.]*)/) ||
+      grab(/money[^0-9\-]*([0-9][0-9,\.]*)/i);
 
-    // Keep only if any positive amount found
-    if (ORDER.some((k) => (amounts[k as Resource] || 0) > 0)) {
-      out.push({ when, who, amounts });
+    // others (look for headings/labels in the row text)
+    const lower = tr.replace(/<[^>]+>/g, " ").toLowerCase();
+
+    function pick(label: string) {
+      const m =
+        lower.match(new RegExp(`${label}[^0-9\\-]*([0-9][0-9,\\.]*)`)) ||
+        tr.match(new RegExp(`${label}[^0-9\\-]*([0-9][0-9,\\.]*)`, "i"));
+      return m ? toNum(m[1]) : 0;
+    }
+
+    row.aluminum = pick("aluminum");
+    row.bauxite  = pick("bauxite");
+    row.steel    = pick("steel");
+    row.munitions= pick("munitions");
+    row.gasoline = pick("gasoline");
+    row.iron     = pick("iron");
+    row.lead     = pick("lead");
+    row.uranium  = pick("uranium");
+    row.coal     = pick("coal");
+    row.oil      = pick("oil");
+    row.food     = pick("food");
+
+    // only push if at least one positive value present
+    const any =
+      (row.money||0)+(row.food||0)+(row.coal||0)+(row.oil||0)+(row.uranium||0)+
+      (row.lead||0)+(row.iron||0)+(row.bauxite||0)+(row.gasoline||0)+(row.munitions||0)+
+      (row.steel||0)+(row.aluminum||0);
+
+    if (any > 0 || /Automated\s*Tax/i.test(row.note || "")) {
+      rows.push(row);
     }
   }
 
-  return out;
+  return { rows, blocked, matchedTable };
 }
 
-/**
- * Public: preview “Automated Tax” rows by scraping the HTML page.
- * This matches how we previously got non-zero counts/totals.
- */
+// main preview used by /pnw_preview and /pnw_apply
 export async function previewAllianceTaxCreditsStored(
   allianceId: number,
-  _lastSeenIdOrNull?: number | null,
-  opts?: { limit?: number } // trims newest N rows (page is newest-first)
-): Promise<{ count: number; newestId: number | null; delta: Record<Resource, number>; sample?: Row[] }> {
-  const html = await fetchBankTaxesHtml(allianceId);
-  const rowsAll = parseTaxRowsFromHtml(html);
+  _lastSeenId?: number | null,  // ignored for HTML (no ids)
+  limit?: number | null
+): Promise<PreviewResult> {
+  const html = await fetchBankTaxesHTML(allianceId);
+  const { rows, blocked, matchedTable } = parseBankTaxes(html);
 
-  const rows = typeof opts?.limit === "number" && opts.limit > 0
-    ? rowsAll.slice(0, opts.limit)
-    : rowsAll;
+  // (optional) trim to limit most-recent rows if we can infer ordering
+  const limited = limit && limit > 0 ? rows.slice(0, limit) : rows;
 
-  const delta: Record<Resource, number> = {} as any;
-  ORDER.forEach((k) => (delta[k as Resource] = 0));
-
-  for (const r of rows) {
-    ORDER.forEach((k) => {
-      delta[k as Resource] += Number(r.amounts[k as Resource] || 0);
-    });
+  const delta = zeroDelta();
+  for (const r of limited) {
+    for (const k of COMMON_RES_KEYS) {
+      const v = toNum((r as any)[k]);
+      if (v) delta[k] += v;
+    }
   }
 
-  return {
-    count: rows.length,
-    newestId: null, // HTML page doesn’t expose bankrec ids
+  const result: PreviewResult = {
+    count: limited.length,
+    newestId: null,
     delta,
-    sample: rows.slice(0, 5),
+    debug: {
+      fetchedBytes: html.length,
+      blocked,
+      matchedTable,
+      matchedRows: limited.length,
+    },
   };
-}
 
-/** Used by /pnw_tax_debug to show what we parsed */
-export async function debugScrapeAllianceTaxes(
-  allianceId: number
-): Promise<{ rows: Row[] }> {
-  const html = await fetchBankTaxesHtml(allianceId);
-  const rows = parseTaxRowsFromHtml(html);
-  return { rows };
+  // if *nothing* matched, save a debug HTML to var/pnw_tax_html/ so we can inspect
+  if (limited.length === 0) {
+    try {
+      await fs.mkdir(DEBUG_DIR, { recursive: true });
+      const f = path.join(DEBUG_DIR, `alliance-${allianceId}-${Date.now()}.html`);
+      await fs.writeFile(f, html, "utf8");
+      result.debug!.savedFile = f;
+    } catch {}
+  }
+
+  return result;
 }
