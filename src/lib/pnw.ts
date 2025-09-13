@@ -1,144 +1,152 @@
 // src/lib/pnw.ts
-import fetch from "node-fetch";
-
-type GqlError = { message: string };
-type GqlResp<T> = { data?: T; errors?: GqlError[] };
+// Minimal PnW GraphQL helpers (uses Node 18+ global fetch)
 
 export class PnwGqlError extends Error {
   status: number;
   body: any;
-  constructor(status: number, body: any, message?: string) {
-    super(message || `PnW GraphQL error (status ${status})`);
+  constructor(status: number, body: any, message: string) {
+    super(message);
     this.status = status;
     this.body = body;
   }
 }
 
-export async function gql<T = any>(apiKey: string, query: string, variables?: Record<string, any>): Promise<T> {
-  const url = `https://api.politicsandwar.com/graphql?api_key=${encodeURIComponent(apiKey)}`;
+type Vars = Record<string, any>;
+
+export async function gql<T = any>(
+  apiKey: string,
+  query: string,
+  variables: Vars
+): Promise<T> {
+  const url = "https://api.politicsandwar.com/graphql?api_key=" + encodeURIComponent(apiKey);
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Api-Key": apiKey },
     body: JSON.stringify({ query, variables }),
   });
 
-  let json: GqlResp<T>;
-  try { json = (await res.json()) as any; }
-  catch {
-    throw new PnwGqlError(res.status, await res.text().catch(() => null), `PnW GraphQL error (status ${res.status}): non-JSON response`);
-  }
+  let body: any = null;
+  try { body = await res.json(); } catch { body = null; }
 
-  if (!res.ok || json.errors) {
-    const body = json.errors || json;
-    const msg = `PnW GraphQL error (status ${res.status}): ${JSON.stringify(body)}`;
+  if (!res.ok || (body && body.errors)) {
+    const msg = `PnW GraphQL error (status ${res.status}): ${JSON.stringify(body?.errors ?? body)}`;
     throw new PnwGqlError(res.status, body, msg);
   }
-  if (!json.data) throw new PnwGqlError(res.status, json, `PnW GraphQL error (status ${res.status}): empty data`);
-  return json.data;
+  return body.data as T;
 }
 
-// ---------- small helpers ----------
-export const toInt = (v: any) => Number.parseInt(String(v ?? 0), 10) || 0;
-export const toNum = (v: any) => Number.parseFloat(String(v ?? 0)) || 0;
+export type BankrecRow = {
+  id: number | string;
+  date: string;
+  sender_type: number | string;
+  sender_id: number | string;
+  receiver_type: number | string;
+  receiver_id: number | string;
+  note?: string | null;
 
-export const RES_KEYS = [
-  "money","food","coal","oil","uranium","lead","iron","bauxite","gasoline","munitions","steel","aluminum",
-] as const;
-export type ResKey = (typeof RES_KEYS)[number];
-
-// ---------- GQL: bankrecs (dual-shape support) ----------
-const FIELDS = `
-  id
-  date
-  sender_type
-  sender_id
-  receiver_type
-  receiver_id
-  note
-  money
-  food
-  coal
-  oil
-  uranium
-  lead
-  iron
-  bauxite
-  gasoline
-  munitions
-  steel
-  aluminum
-  credits
-`;
+  money: number;
+  food: number;
+  coal: number;
+  oil: number;
+  uranium: number;
+  lead: number;
+  iron: number;
+  bauxite: number;
+  gasoline: number;
+  munitions: number;
+  steel: number;
+  aluminum: number;
+};
 
 /**
- * Try Alliances Paginator shape first:
- *   alliances(ids:[Int]) { data { id bankrecs(limit:Int) { ... } } }
- * If the server complains (older alt shape), fall back to single-alliance:
- *   alliances(id:Int) { id bankrecs(limit:Int) { ... } }
+ * Fetch alliance bank records (recent first) using the current schema.
+ * Tries the plural `alliances(id: [$id])` first; if that shape isn't supported on
+ * the server, falls back to `alliance(id: $id)`.
+ *
+ * NOTE: There is no documented server-side filter for "Automated Tax" notes,
+ * so we fetch and filter client-side.
  */
 export async function fetchAllianceBankrecsViaGQL(
   apiKey: string,
   allianceId: number,
-  opts?: { limit?: number }
-): Promise<any[]> {
-  const limit = Math.max(1, Math.min(1000, Number(opts?.limit ?? 500)));
+  opts: { limit?: number } = {}
+): Promise<BankrecRow[]> {
+  const LIMIT = Math.max(1, Math.min(1000, opts.limit ?? 200));
 
-  // Variant A: paginator
-  const QA = `
-    query($ids: [Int], $limit: Int){
-      alliances(ids: $ids) {
-        data {
+  // Query A: plural "alliances"
+  const Q_ALLIANCES = `
+    query AllianceBankrecs($id: Int!, $limit: Int!) {
+      alliances(id: [$id]) {
+        id
+        bankrecs(limit: $limit, orderBy: "id desc") {
           id
-          bankrecs(limit: $limit) {
-            ${FIELDS}
-          }
+          date
+          sender_type
+          sender_id
+          receiver_type
+          receiver_id
+          note
+          money
+          food
+          coal
+          oil
+          uranium
+          lead
+          iron
+          bauxite
+          gasoline
+          munitions
+          steel
+          aluminum
         }
       }
     }
   `;
+
+  // Query B: singular "alliance"
+  const Q_ALLIANCE = `
+    query AllianceBankrecsSingle($id: Int!, $limit: Int!) {
+      alliance(id: $id) {
+        id
+        bankrecs(limit: $limit, orderBy: "id desc") {
+          id
+          date
+          sender_type
+          sender_id
+          receiver_type
+          receiver_id
+          note
+          money
+          food
+          coal
+          oil
+          uranium
+          lead
+          iron
+          bauxite
+          gasoline
+          munitions
+          steel
+          aluminum
+        }
+      }
+    }
+  `;
+
+  const vars = { id: allianceId, limit: LIMIT };
 
   try {
-    const dataA = await gql<any>(apiKey, QA, { ids: [Number(allianceId)], limit });
-    const arrA = Array.isArray(dataA?.alliances?.data) ? dataA.alliances.data : [];
-    const rowA = arrA.find((a: any) => Number(a?.id) === Number(allianceId));
-    return Array.isArray(rowA?.bankrecs) ? rowA.bankrecs : [];
-  } catch (e: any) {
-    const msg = String(e?.message || "");
-    const isShapeErr =
-      /AlliancePaginator|Cannot query field "data"|Unknown argument "ids"|position expecting type "\[Int]/i.test(msg);
-    if (!isShapeErr) throw e;
-  }
-
-  // Variant B: single alliance (no paginator)
-  const QB = `
-    query($id: Int!, $limit: Int){
-      alliances(id: $id) {
-        id
-        bankrecs(limit: $limit) {
-          ${FIELDS}
-        }
-      }
+    const data = await gql<{ alliances: Array<{ id: number, bankrecs: BankrecRow[] }> }>(apiKey, Q_ALLIANCES, vars);
+    const list = Array.isArray(data?.alliances) ? data.alliances : [];
+    const a = list[0];
+    return (a?.bankrecs ?? []) as BankrecRow[];
+  } catch (err: any) {
+    const msg = String(err?.message || "");
+    // If the server doesn't support the plural shape, try the singular.
+    if (/Cannot query field .*alliances|Unknown argument .*id.* on field "alliances"/i.test(msg)) {
+      const data = await gql<{ alliance?: { id: number, bankrecs: BankrecRow[] } }>(apiKey, Q_ALLIANCE, vars);
+      return (data?.alliance?.bankrecs ?? []) as BankrecRow[];
     }
-  `;
-  const dataB = await gql<any>(apiKey, QB, { id: Number(allianceId), limit });
-  const arrB = Array.isArray(dataB?.alliances) ? dataB.alliances : [];
-  const rowB = arrB.find((a: any) => Number(a?.id) === Number(allianceId));
-  return Array.isArray(rowB?.bankrecs) ? rowB.bankrecs : [];
-}
-
-/**
- * Backwards-compat for the cron in index.ts.
- * Returns [{ id, bankrecs }] the way the old helper did.
- */
-export async function fetchBankrecs(
-  opts: { apiKey: string },
-  allianceIds: number[],
-  limit = 500
-): Promise<Array<{ id: number; bankrecs: any[] }>> {
-  const out: Array<{ id: number; bankrecs: any[] }> = [];
-  for (const id of allianceIds) {
-    const bankrecs = await fetchAllianceBankrecsViaGQL(opts.apiKey, id, { limit });
-    out.push({ id, bankrecs });
+    throw err;
   }
-  return out;
 }
