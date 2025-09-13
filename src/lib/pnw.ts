@@ -1,5 +1,5 @@
 // src/lib/pnw.ts
-// Minimal PnW GraphQL helpers (uses Node 18+ global fetch)
+// Politics & War GraphQL helpers (uses Node 18+ global fetch)
 
 export class PnwGqlError extends Error {
   status: number;
@@ -62,25 +62,13 @@ function sortDescById(rows: BankrecRow[]): BankrecRow[] {
   return [...rows].sort((a, b) => Number(b.id) - Number(a.id));
 }
 
-function looksLikeOrderByError(e: unknown): boolean {
-  const msg =
-    (e as any)?.message ||
-    (e as any)?.body?.errors?.map((x: any) => x?.message).join(" | ") ||
-    "";
-  return /argument\s+"orderBy"|requires type .*OrderBy.*Clause/i.test(String(msg));
-}
-
 /**
- * Fetch alliance bank records (recent first) using the current schema.
- * Strategy:
- *  1) Try singular shape:
- *       alliance(id:$id) { bankrecs(limit:$limit, orderBy:[{column:ID,order:DESC}]) { ... } }
- *     Fallback (if orderBy not supported):
- *       alliance(id:$id) { bankrecs(limit:$limit) { ... } }  // then sort locally desc
- *  2) If singular not available, use plural+paginator .data[0]:
- *       alliances(id:[$id]) { data { bankrecs(limit:$limit, orderBy:[{column:ID,order:DESC}]) { ... } } }
- *     Fallback:
- *       alliances(id:[$id]) { data { bankrecs(limit:$limit) { ... } } }  // then sort locally desc
+ * Fetch recent alliance bank records. We avoid `orderBy` for schema compatibility
+ * and sort locally by id desc. Strategy:
+ *   1) Try singular shape:
+ *        alliance(id:$id) { bankrecs(limit:$limit) { ... } }
+ *   2) Fallback to plural paginator:
+ *        alliances(id:[$id]) { data { bankrecs(limit:$limit) { ... } } }
  */
 export async function fetchAllianceBankrecsViaGQL(
   apiKey: string,
@@ -112,21 +100,9 @@ export async function fetchAllianceBankrecsViaGQL(
     aluminum
   `;
 
-  // --- Singular with orderBy ---
-  const Q_SINGULAR_OB = `
+  // 1) Singular
+  const Q_SINGULAR = `
     query AllianceBankrecsSingle($id: Int!, $limit: Int!) {
-      alliance(id: $id) {
-        id
-        bankrecs(limit: $limit, orderBy: [{ column: ID, order: DESC }]) {
-          ${FIELDS}
-        }
-      }
-    }
-  `;
-
-  // --- Singular without orderBy (fallback) ---
-  const Q_SINGULAR_NOOB = `
-    query AllianceBankrecsSingleNoOB($id: Int!, $limit: Int!) {
       alliance(id: $id) {
         id
         bankrecs(limit: $limit) {
@@ -135,24 +111,18 @@ export async function fetchAllianceBankrecsViaGQL(
       }
     }
   `;
-
-  // --- Plural+paginator with orderBy ---
-  const Q_PLURAL_OB = `
-    query AllianceBankrecsPlural($id: Int!, $limit: Int!) {
-      alliances(id: [$id]) {
-        data {
-          id
-          bankrecs(limit: $limit, orderBy: [{ column: ID, order: DESC }]) {
-            ${FIELDS}
-          }
-        }
-      }
+  try {
+    const d1 = await gql<{ alliance?: { id: number, bankrecs: BankrecRow[] } }>(apiKey, Q_SINGULAR, vars);
+    if (Array.isArray(d1?.alliance?.bankrecs)) {
+      return sortDescById(d1.alliance.bankrecs).slice(0, LIMIT);
     }
-  `;
+  } catch {
+    // fall through to plural
+  }
 
-  // --- Plural+paginator without orderBy (fallback) ---
-  const Q_PLURAL_NOOB = `
-    query AllianceBankrecsPluralNoOB($id: Int!, $limit: Int!) {
+  // 2) Plural + paginator
+  const Q_PLURAL = `
+    query AllianceBankrecsPlural($id: Int!, $limit: Int!) {
       alliances(id: [$id]) {
         data {
           id
@@ -163,36 +133,9 @@ export async function fetchAllianceBankrecsViaGQL(
       }
     }
   `;
-
-  // 1) Try singular first
-  try {
-    const d1 = await gql<{ alliance?: { id: number, bankrecs: BankrecRow[] } }>(apiKey, Q_SINGULAR_OB, vars);
-    if (Array.isArray(d1?.alliance?.bankrecs)) return sortDescById(d1.alliance.bankrecs).slice(0, LIMIT);
-  } catch (e1) {
-    if (looksLikeOrderByError(e1)) {
-      const d1b = await gql<{ alliance?: { id: number, bankrecs: BankrecRow[] } }>(apiKey, Q_SINGULAR_NOOB, vars);
-      const rows = d1b?.alliance?.bankrecs ?? [];
-      return sortDescById(rows).slice(0, LIMIT);
-    }
-    // otherwise fall through to plural
-  }
-
-  // 2) Fallback: plural + paginator .data[]
-  try {
-    const d2 = await gql<{ alliances?: { data?: Array<{ id: number, bankrecs: BankrecRow[] }> } }>(apiKey, Q_PLURAL_OB, vars);
-    const list = d2?.alliances?.data ?? [];
-    const a = Array.isArray(list) ? list[0] : undefined;
-    if (Array.isArray(a?.bankrecs)) return sortDescById(a!.bankrecs).slice(0, LIMIT);
-  } catch (e2) {
-    if (looksLikeOrderByError(e2)) {
-      const d2b = await gql<{ alliances?: { data?: Array<{ id: number, bankrecs: BankrecRow[] }> } }>(apiKey, Q_PLURAL_NOOB, vars);
-      const list = d2b?.alliances?.data ?? [];
-      const a = Array.isArray(list) ? list[0] : undefined;
-      const rows = a?.bankrecs ?? [];
-      return sortDescById(rows).slice(0, LIMIT);
-    }
-    throw e2;
-  }
-
-  return [];
+  const d2 = await gql<{ alliances?: { data?: Array<{ id: number, bankrecs: BankrecRow[] }> } }>(apiKey, Q_PLURAL, vars);
+  const list = d2?.alliances?.data ?? [];
+  const a = Array.isArray(list) ? list[0] : undefined;
+  const rows = a?.bankrecs ?? [];
+  return sortDescById(rows).slice(0, LIMIT);
 }
