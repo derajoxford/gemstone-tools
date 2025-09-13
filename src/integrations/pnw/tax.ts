@@ -1,9 +1,12 @@
 // src/integrations/pnw/tax.ts
 import { PrismaClient } from "@prisma/client";
 import { open } from "../../lib/crypto.js";
-import { fetchAllianceBankrecsViaGQL, toInt, toNum, RES_KEYS } from "../../lib/pnw.js";
+import { fetchAllianceBankrecsViaGQL, BankrecRow } from "../../lib/pnw";
 
 const prisma = new PrismaClient();
+
+function toNum(v: any) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
+function toInt(v: any) { const n = parseInt(String(v), 10); return Number.isFinite(n) ? n : 0; }
 
 export type ResourceDelta = Record<string, number>;
 export type PreviewResult = {
@@ -12,80 +15,84 @@ export type PreviewResult = {
   delta: ResourceDelta;
 };
 
-/**
- * Business rule we used earlier:
- * - Count bankrecs that look like *automated tax credits into the alliance*.
- *   Historically these can be detected by:
- *   (A) bankrec note containing "Automated Tax" (case-insensitive), OR
- *   (B) if PnW ever adds a flag, we'd switch to that; for now we use (A).
- *
- * - They should be incoming to the alliance (receiver_type == 2, receiver_id == allianceId).
- * - Only include records with id > lastSeenId (cursor).
- */
-function isAutomatedTaxRec(r: any, allianceId: number): boolean {
-  const recvAlliance = toInt(r.receiver_type) === 2 && toInt(r.receiver_id) === toInt(allianceId);
-  const note = String(r.note || "");
-  const looksLikeAuto = /automated\s*tax/i.test(note); // "Automated Tax 100%/100%"
-  return recvAlliance && looksLikeAuto;
-}
-
-function sumDelta(rows: any[]): ResourceDelta {
-  const out: ResourceDelta = {};
-  for (const k of RES_KEYS) out[k] = 0;
-
-  for (const r of rows) {
-    for (const k of RES_KEYS) {
-      out[k] += toNum((r as any)[k]);
-    }
+/** Resolve the alliance API key from DB (latest saved), else env fallback. */
+async function getAllianceApiKey(allianceId: number): Promise<string> {
+  const a = await prisma.alliance.findUnique({
+    where: { id: allianceId },
+    include: { keys: { orderBy: { id: "desc" }, take: 1 } },
+  });
+  const enc = a?.keys?.[0];
+  if (enc) {
+    try { return open(enc.encryptedApiKey as any, enc.nonceApi as any) as string; }
+    catch { /* fall through */ }
   }
-  return out;
+  const envKey = process.env.PNW_DEFAULT_API_KEY || "";
+  if (!envKey) throw new Error("No stored API key and PNW_DEFAULT_API_KEY is not set.");
+  return envKey;
 }
 
+/**
+ * Core preview that uses a provided apiKey.
+ * - Fetches recent bankrecs for the alliance.
+ * - Filters rows whose note contains "Automated Tax" (case-insensitive).
+ * - Applies lastSeenId (only rows with id > lastSeenId are counted).
+ * - Sums deltas across PnW resources.
+ */
 export async function previewAllianceTaxCredits(
   apiKey: string,
   allianceId: number,
-  lastSeenId = 0,
-  limit = 600
+  lastSeenId: number | null = null,
+  limit = 200
 ): Promise<PreviewResult> {
-  const recs = await fetchAllianceBankrecsViaGQL(apiKey, allianceId, { limit });
+  const rows: BankrecRow[] = await fetchAllianceBankrecsViaGQL(apiKey, allianceId, { limit });
 
-  // Filter by id > lastSeenId then by "automated tax" into the alliance
-  const filtered = recs
-    .filter((r) => toInt(r.id) > toInt(lastSeenId))
-    .filter((r) => isAutomatedTaxRec(r, allianceId));
+  let newestId: number | null = null;
+  let count = 0;
+  const delta: ResourceDelta = {
+    money: 0, food: 0, coal: 0, oil: 0, uranium: 0, lead: 0, iron: 0,
+    bauxite: 0, gasoline: 0, munitions: 0, steel: 0, aluminum: 0,
+  };
 
-  const count = filtered.length;
-  const newestId =
-    count > 0 ? filtered.reduce((m, r) => Math.max(m, toInt(r.id)), 0) : null;
+  for (const r of rows) {
+    const idNum = toInt(r.id);
+    if (!newestId || idNum > newestId) newestId = idNum;
 
-  const delta = sumDelta(filtered);
-  return { count, newestId, delta };
-}
+    // Only consider rows strictly newer than the cursor (if provided)
+    if (lastSeenId && idNum <= lastSeenId) continue;
 
-/**
- * Convenience: pull key from DB (allianceKeys newest first), fallback to env PNW_DEFAULT_API_KEY.
- */
-export async function previewAllianceTaxCreditsStored(
-  allianceId: number,
-  lastSeenId = 0,
-  limit = 600
-): Promise<PreviewResult> {
-  // newest saved key for this alliance
-  const keyRow = await prisma.allianceKey.findFirst({
-    where: { allianceId },
-    orderBy: { id: "desc" },
-  });
+    // Count only automated tax lines (what appears on the banktaxes page)
+    const note = (r.note || "").toString();
+    if (!/automated tax/i.test(note)) continue;
 
-  const apiKey =
-    keyRow
-      ? open(keyRow.encryptedApiKey as any, keyRow.nonceApi as any)
-      : (process.env.PNW_DEFAULT_API_KEY || "");
+    // Must be incoming to this alliance
+    const recvType = toInt(r.receiver_type);
+    const recvId = toInt(r.receiver_id);
+    if (!(recvType === 2 && recvId === allianceId)) continue;
 
-  if (!apiKey) {
-    throw new Error(
-      `No API key available for alliance ${allianceId}. Use /pnw_set first.`
-    );
+    count++;
+    delta.money += toNum(r.money);
+    delta.food += toNum(r.food);
+    delta.coal += toNum(r.coal);
+    delta.oil += toNum(r.oil);
+    delta.uranium += toNum(r.uranium);
+    delta.lead += toNum(r.lead);
+    delta.iron += toNum(r.iron);
+    delta.bauxite += toNum(r.bauxite);
+    delta.gasoline += toNum(r.gasoline);
+    delta.munitions += toNum(r.munitions);
+    delta.steel += toNum(r.steel);
+    delta.aluminum += toNum(r.aluminum);
   }
 
+  return { count, newestId: newestId ?? null, delta };
+}
+
+/** Convenience wrapper that resolves the key from storage/env. */
+export async function previewAllianceTaxCreditsStored(
+  allianceId: number,
+  lastSeenId: number | null = null,
+  limit = 200
+): Promise<PreviewResult> {
+  const apiKey = await getAllianceApiKey(allianceId);
   return previewAllianceTaxCredits(apiKey, allianceId, lastSeenId, limit);
 }
