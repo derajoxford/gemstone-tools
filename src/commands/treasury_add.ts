@@ -4,207 +4,79 @@ import {
   ChatInputCommandInteraction,
   PermissionFlagsBits,
 } from "discord.js";
-import { addToTreasury } from "../utils/treasury";
-import { getAllianceReadKey } from "../integrations/pnw/store";
-import { pnwQuery } from "../integrations/pnw/query";
 
-// ----------------- helpers -----------------
-type Num = number | null | undefined;
+import { resourceEmbed } from "../lib/embeds";
+import { addToTreasury } from "../utils/treasury_store";
+import { PrismaClient } from "@prisma/client";
 
-function n(v: Num): number {
-  const x = Number(v);
-  return Number.isFinite(x) ? x : 0;
-}
+const prisma = new PrismaClient();
 
-function buildDeltaFromInteraction(i: ChatInputCommandInteraction) {
-  // all fields optional; default 0s
-  return {
-    money: n(i.options.getNumber("money")),
-    food: n(i.options.getNumber("food")),
-    munitions: n(i.options.getNumber("munitions")),
-    gasoline: n(i.options.getNumber("gasoline")),
-    steel: n(i.options.getNumber("steel")),
-    aluminum: n(i.options.getNumber("aluminum")),
-    oil: n(i.options.getNumber("oil")),
-    uranium: n(i.options.getNumber("uranium")),
-    bauxite: n(i.options.getNumber("bauxite")),
-    coal: n(i.options.getNumber("coal")),
-    iron: n(i.options.getNumber("iron")),
-    lead: n(i.options.getNumber("lead")),
-  };
-}
+type Delta = Record<string, number>;
+const RES_KEYS = [
+  "money",
+  "food",
+  "coal",
+  "oil",
+  "uranium",
+  "lead",
+  "iron",
+  "bauxite",
+  "gasoline",
+  "munitions",
+  "steel",
+  "aluminum",
+] as const;
 
-function pickAllianceNodeFromAnyShape(data: any): any | null {
-  // Supports both:
-  //  1) alliances(id: [Int]) -> AlliancePaginator -> data: [Alliance]
-  //  2) alliances(id: Int)    -> [Alliance] or Alliance
-  const root = data?.alliances;
-
-  if (!root) return null;
-
-  // Paginator shape
-  if (root && typeof root === "object" && !Array.isArray(root) && Array.isArray(root.data)) {
-    return root.data[0] ?? null;
+function asCleanDelta(input: any): Delta {
+  const out: Delta = {};
+  for (const k of RES_KEYS) {
+    const v = Number(input?.[k] ?? 0);
+    if (Number.isFinite(v) && v !== 0) out[k] = v;
   }
+  return out;
+}
 
-  // Array shape
-  if (Array.isArray(root)) {
-    return root[0] ?? null;
+function codeBlock(s: string) {
+  return s ? "```\n" + s + "\n```" : "—";
+}
+
+function formatDelta(delta: Delta): string {
+  const keys = Object.keys(delta);
+  if (!keys.length) return "—";
+  const lines: string[] = [];
+  for (const k of keys) {
+    const v = Number(delta[k] ?? 0);
+    if (!v) continue;
+    const asStr =
+      k === "money"
+        ? v.toLocaleString(undefined, { maximumFractionDigits: 2 })
+        : Math.round(v).toLocaleString();
+    const sign = v >= 0 ? "+" : "";
+    lines.push(`${k.padEnd(10)} ${sign}${asStr}`);
   }
-
-  // Single object shape
-  if (root && typeof root === "object") {
-    return root;
-  }
-
-  return null;
+  return lines.join("\n");
 }
 
-async function run(apiKey: string, query: string, vars: Record<string, any>) {
-  return pnwQuery(apiKey, query, vars);
-}
-
-/**
- * Scan recent bankrecs to count tax_id occurrences.
- * Tries multiple GraphQL shapes to be compatible with PnW variants.
- */
-async function sniffTaxIdsUsingStoredKey(allianceId: number, lookbackLimit = 250) {
-  const apiKey = await getAllianceReadKey(allianceId);
-
-  // --- Attempt 1: paginator + orderBy ---
-  const qA = `
-    query Q($ids: [Int!]!, $limit: Int!) {
-      alliances(id: $ids, first: 1) {
-        data {
-          id
-          bankrecs(limit: $limit, orderBy: "id desc") {
-            id
-            tax_id
-          }
-        }
-      }
-    }
-  ` as const;
-
-  // --- Attempt 2: paginator without orderBy ---
-  const qB = `
-    query Q($ids: [Int!]!, $limit: Int!) {
-      alliances(id: $ids, first: 1) {
-        data {
-          id
-          bankrecs(limit: $limit) {
-            id
-            tax_id
-          }
-        }
-      }
-    }
-  ` as const;
-
-  // --- Attempt 3: non-paginator + orderBy ---
-  const qC = `
-    query Q($id: Int!, $limit: Int!) {
-      alliances(id: $id) {
-        id
-        bankrecs(limit: $limit, orderBy: "id desc") {
-          id
-          tax_id
-        }
-      }
-    }
-  ` as const;
-
-  // --- Attempt 4: non-paginator without orderBy ---
-  const qD = `
-    query Q($id: Int!, $limit: Int!) {
-      alliances(id: $id) {
-        id
-        bankrecs(limit: $limit) {
-          id
-          tax_id
-        }
-      }
-    }
-  ` as const;
-
-  const attempts: Array<{
-    q: string;
-    vars: Record<string, any>;
-    name: string;
-  }> = [
-    { q: qA, vars: { ids: [allianceId], limit: lookbackLimit }, name: "paginator+orderBy" },
-    { q: qB, vars: { ids: [allianceId], limit: lookbackLimit }, name: "paginator" },
-    { q: qC, vars: { id: allianceId, limit: lookbackLimit }, name: "simple+orderBy" },
-    { q: qD, vars: { id: allianceId, limit: lookbackLimit }, name: "simple" },
-  ];
-
-  let lastErr: unknown = null;
-  for (const att of attempts) {
-    try {
-      const data: any = await run(apiKey, att.q, att.vars);
-      const node = pickAllianceNodeFromAnyShape(data);
-      const recs: any[] = node?.bankrecs ?? [];
-      const counts = new Map<number, number>();
-      for (const r of recs) {
-        const tid = Number(r?.tax_id ?? 0);
-        if (!Number.isFinite(tid) || tid <= 0) continue;
-        counts.set(tid, (counts.get(tid) ?? 0) + 1);
-      }
-      return [...counts.entries()]
-        .sort((a, b) => b[1] - a[1])
-        .map(([id, count]) => ({ id, count }));
-    } catch (err) {
-      lastErr = err;
-      // try next shape
-    }
-  }
-  throw lastErr ?? new Error("Unable to query PnW bankrecs for sniffing tax_id.");
-}
-
-async function replyError(interaction: ChatInputCommandInteraction, err: unknown) {
-  const msg = err instanceof Error ? err.message : String(err);
-  await interaction.editReply(`❌ ${msg}`);
-  console.error("[/treasury_add] error:", err);
-}
-
-// ----------------- command definition -----------------
 export const data = new SlashCommandBuilder()
   .setName("treasury_add")
-  .setDescription("Manually add resources to an alliance treasury, or sniff tax_id values")
-  .addSubcommand((s) =>
-    s
-      .setName("add")
-      .setDescription("Add resources to treasury (manual adjustment)")
-      .addIntegerOption((o) =>
-        o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
-      )
-      .addNumberOption((o) => o.setName("money").setDescription("Money to add"))
-      .addNumberOption((o) => o.setName("food").setDescription("Food to add"))
-      .addNumberOption((o) => o.setName("munitions").setDescription("Munitions to add"))
-      .addNumberOption((o) => o.setName("gasoline").setDescription("Gasoline to add"))
-      .addNumberOption((o) => o.setName("steel").setDescription("Steel to add"))
-      .addNumberOption((o) => o.setName("aluminum").setDescription("Aluminum to add"))
-      .addNumberOption((o) => o.setName("oil").setDescription("Oil to add"))
-      .addNumberOption((o) => o.setName("uranium").setDescription("Uranium to add"))
-      .addNumberOption((o) => o.setName("bauxite").setDescription("Bauxite to add"))
-      .addNumberOption((o) => o.setName("coal").setDescription("Coal to add"))
-      .addNumberOption((o) => o.setName("iron").setDescription("Iron to add"))
-      .addNumberOption((o) => o.setName("lead").setDescription("Lead to add")),
+  .setDescription("Admin: add (or subtract) amounts to the alliance treasury (JSON payload).")
+  .addIntegerOption((o) =>
+    o
+      .setName("alliance_id")
+      .setDescription("Alliance ID (defaults to this server's linked alliance)")
+      .setRequired(false),
   )
-  .addSubcommand((s) =>
-    s
-      .setName("sniff_tax_ids")
-      .setDescription("Scan recent bank records and suggest tax_id values")
-      .addIntegerOption((o) =>
-        o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
-      )
-      .addIntegerOption((o) =>
-        o
-          .setName("limit")
-          .setDescription("Bank records to scan (default 250)")
-          .setMinValue(50)
-          .setMaxValue(500),
-      ),
+  .addStringOption((o) =>
+    o
+      .setName("payload")
+      .setDescription('JSON like {"money":1000000,"steel":500} (negative values allowed)')
+      .setRequired(true),
+  )
+  .addStringOption((o) =>
+    o
+      .setName("note")
+      .setDescription("Optional note to include in the reply")
+      .setRequired(false),
   )
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .setDMPermission(false);
@@ -213,62 +85,56 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   await interaction.deferReply({ ephemeral: true });
 
   try {
-    const sub = interaction.options.getSubcommand(true);
-
-    if (sub === "add") {
-      const allianceId = interaction.options.getInteger("alliance_id", true)!;
-      const delta = buildDeltaFromInteraction(interaction);
-
-      const anyNonZero = Object.values(delta).some((v) => (v ?? 0) !== 0);
-      if (!anyNonZero) {
-        await interaction.editReply("Provide at least one non-zero resource amount to add.");
-        return;
-      }
-
-      await addToTreasury(allianceId, delta, {
-        source: "manual",
-        meta: { actor: interaction.user.id, command: "treasury_add" },
+    // Resolve alliance
+    let allianceId = interaction.options.getInteger("alliance_id") ?? null;
+    if (!allianceId) {
+      const a = await prisma.alliance.findFirst({
+        where: { guildId: interaction.guildId ?? "" },
+        select: { id: true },
       });
-
-      const pretty = Object.entries(delta)
-        .filter(([, v]) => (v ?? 0) !== 0)
-        .map(([k, v]) => `• ${k}: ${v}`)
-        .join("\n");
-
-      await interaction.editReply(
-        [`✅ Added to treasury for **${allianceId}**:`, pretty || "(no-op?)"].join("\n"),
-      );
-      return;
-    }
-
-    if (sub === "sniff_tax_ids") {
-      const allianceId = interaction.options.getInteger("alliance_id", true)!;
-      const limit = interaction.options.getInteger("limit") ?? 250;
-      const pairs = await sniffTaxIdsUsingStoredKey(allianceId, limit);
-
-      if (!pairs.length) {
-        await interaction.editReply(
-          `No tax_id values detected in the last ${limit} bank records for alliance **${allianceId}**.`,
+      if (!a) {
+        return interaction.editReply(
+          "This server is not linked to an alliance. Run **/setup_alliance** first."
         );
-        return;
       }
-
-      const lines = pairs.map((p) => `• \`${p.id}\`  (${p.count} hits)`).join("\n");
-      await interaction.editReply(
-        [
-          `**Alliance:** ${allianceId}`,
-          `**Lookback:** ${limit} records`,
-          `**Detected tax_id values:**`,
-          lines,
-          "",
-          "Tip: set a filter with `/pnw_tax_ids set alliance_id:<id> ids:<list>`",
-        ].join("\n"),
-      );
-      return;
+      allianceId = a.id;
     }
 
-    await interaction.editReply("Unknown subcommand.");
-  } catch (err) {
-    await replyError(interaction, err);
+    // Parse payload JSON
+    let raw: any;
+    try {
+      raw = JSON.parse(interaction.options.getString("payload", true));
+    } catch {
+      return interaction.editReply("❌ Invalid JSON in `payload`.");
+    }
+    const delta = asCleanDelta(raw);
+    if (!Object.keys(delta).length) {
+      return interaction.editReply("Nothing to add — your payload is all zeros or empty.");
+    }
+
+    // Apply to treasury
+    await addToTreasury(allianceId, delta);
+
+    // Build embed
+    const note = interaction.options.getString("note") || undefined;
+    const embed = resourceEmbed({
+      title: "🏛️ Treasury Adjusted",
+      subtitle: `**Alliance:** ${allianceId}`,
+      fields: [
+        { name: "Delta", value: codeBlock(formatDelta(delta)), inline: false },
+        ...(note ? [{ name: "Note", value: note, inline: false }] : []),
+      ],
+      color: 0x2ecc71,
+      footer: `Invoker: ${interaction.user.tag}`,
+    });
+
+    await interaction.editReply({ embeds: [embed] });
+  } catch (err: any) {
+    console.error("[/treasury_add] error:", err);
+    const msg =
+      err?.message?.startsWith("PnW GraphQL error")
+        ? `❌ ${err.message}`
+        : `❌ ${err?.message ?? String(err)}`;
+    await interaction.editReply(msg);
   }
 }
