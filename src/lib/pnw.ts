@@ -60,7 +60,7 @@ async function gql<T>(
       const msg = `PnW GraphQL error (status ${res.status}): ${JSON.stringify(body?.errors || body)}`;
       const transient = res.status >= 500 || (hasErrors && JSON.stringify(body.errors).includes("Internal Server Error"));
       if (transient && attempt < retries) {
-        await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+        await new Promise(r => setTimeout(r, 400 * (attempt + 1)));
         continue;
       }
       throw new PnwGqlError(res.status, body, msg);
@@ -95,12 +95,37 @@ function coerceRows(rows: any[]): BankrecRow[] {
   }));
 }
 
+/** Pull all message strings out of a PnwGqlError, safely. */
+function getErrorMessages(err: any): string[] {
+  const msgs: string[] = [];
+  const body = err?.body;
+  if (body?.errors && Array.isArray(body.errors)) {
+    for (const e of body.errors) {
+      if (e?.message) msgs.push(String(e.message));
+    }
+  }
+  if (!msgs.length && err?.message) msgs.push(String(err.message));
+  return msgs;
+}
+
+/** Is this a schema/shape mismatch that we should fall back from? */
+function isShapeError(err: any): boolean {
+  const msgs = getErrorMessages(err);
+  return msgs.some((m) =>
+    /AlliancePaginator/.test(m) ||
+    /Cannot query field "alliances" on type "Query"/.test(m) ||
+    /Cannot query field "alliance" on type "Query"/.test(m) ||
+    /Unknown argument "ids" on field "alliances"/.test(m) ||
+    /Unknown argument "id" on field "alliances"/.test(m) ||
+    /Unknown argument "first" on field "alliances"/.test(m) ||
+    /Cannot query field "data" on type "Alliance"/.test(m) ||
+    /Variable "\$id".*position expecting type "\[Int\]"/.test(m)
+  );
+}
+
 /**
- * Try multiple schema shapes:
- *   A) alliances(id: [Int!]) -> [Alliance]
- *   B) alliances(id: [Int!], first: 1) -> { data: [Alliance] }
- *   C) alliances(ids: [Int!]) -> [Alliance]               (some shards)
- *   D) alliance(id: Int!) -> Alliance                     (legacy; may not exist)
+ * Fetch alliance bankrecs; try multiple schema shapes.
+ * We intentionally try the Paginator shape first because many shards expose it.
  */
 export async function fetchAllianceBankrecsViaGQL(
   apiKey: string,
@@ -135,13 +160,7 @@ export async function fetchAllianceBankrecsViaGQL(
     }
   `;
 
-  const Q_A = `
-    query Bankrecs_A($ids: [Int!]!, $limit: Int!) {
-      alliances(id: $ids) {
-        ${FIELDS}
-      }
-    }
-  `;
+  // B) alliances(id: [Int!], first: 1) -> { data: [Alliance] }
   const Q_B = `
     query Bankrecs_B($ids: [Int!]!, $limit: Int!) {
       alliances(id: $ids, first: 1) {
@@ -149,6 +168,17 @@ export async function fetchAllianceBankrecsViaGQL(
       }
     }
   `;
+
+  // A) alliances(id: [Int!]) -> [Alliance]
+  const Q_A = `
+    query Bankrecs_A($ids: [Int!]!, $limit: Int!) {
+      alliances(id: $ids) {
+        ${FIELDS}
+      }
+    }
+  `;
+
+  // C) alliances(ids: [Int!]) -> [Alliance]
   const Q_C = `
     query Bankrecs_C($ids: [Int!]!, $limit: Int!) {
       alliances(ids: $ids) {
@@ -156,6 +186,8 @@ export async function fetchAllianceBankrecsViaGQL(
       }
     }
   `;
+
+  // D) legacy: alliance(id: Int!) -> Alliance
   const Q_D = `
     query Bankrecs_D($id: Int!, $limit: Int!) {
       alliance(id: $id) {
@@ -164,37 +196,7 @@ export async function fetchAllianceBankrecsViaGQL(
     }
   `;
 
-  // Helper to decide if an error is a schema/shape mismatch (safe to fall back)
-  const isShapeError = (e: any) => {
-    const m = String(e?.message || "");
-    return (
-      m.includes('Cannot query field "alliances"') ||
-      m.includes('Cannot query field "alliance"') ||
-      m.includes('Cannot query field "bankrecs" on type "AlliancePaginator"') ||
-      m.includes('Cannot query field "id" on type "AlliancePaginator"') ||
-      m.includes('Unknown argument "ids" on field "alliances"') ||
-      m.includes('Unknown argument "id" on field "alliances"') ||
-      m.includes('Variable "$id" of type "Int!" used in position expecting type "[Int]"') ||
-      m.includes('Unknown argument "first" on field "alliances"') ||
-      m.includes('Cannot query field "data" on type "Alliance"') ||
-      m.includes('Cannot query field "alliances" on type "Query". Did you mean "alliance"') ||
-      m.includes('Did you mean "alliances"')
-    );
-  };
-
-  // A) alliances(id: [Int!]) -> [Alliance]
-  try {
-    type R = { alliances: Array<{ id: number; bankrecs: any[] }> | null };
-    const d = await gql<R>(apiKey, Q_A, { ids, limit });
-    const arr = d?.alliances ?? [];
-    const first = Array.isArray(arr) ? arr[0] : null;
-    if (first && first.bankrecs) return coerceRows(first.bankrecs);
-    if (Array.isArray(arr) && arr.length === 0) return [];
-  } catch (e: any) {
-    if (!isShapeError(e)) throw e;
-  }
-
-  // B) alliances(id: [Int!], first: 1) -> { data: [Alliance] }
+  // ---- Try B (Paginator) ----
   try {
     type R = { alliances: { data: Array<{ id: number; bankrecs: any[] }> } | null };
     const d = await gql<R>(apiKey, Q_B, { ids, limit });
@@ -206,7 +208,19 @@ export async function fetchAllianceBankrecsViaGQL(
     if (!isShapeError(e)) throw e;
   }
 
-  // C) alliances(ids: [Int!]) -> [Alliance]
+  // ---- Try A (Array of Alliance) ----
+  try {
+    type R = { alliances: Array<{ id: number; bankrecs: any[] }> | null };
+    const d = await gql<R>(apiKey, Q_A, { ids, limit });
+    const arr = d?.alliances ?? [];
+    const first = Array.isArray(arr) ? arr[0] : null;
+    if (first && first.bankrecs) return coerceRows(first.bankrecs);
+    if (Array.isArray(arr) && arr.length === 0) return [];
+  } catch (e: any) {
+    if (!isShapeError(e)) throw e;
+  }
+
+  // ---- Try C (alliances(ids: ...)) ----
   try {
     type R = { alliances: Array<{ id: number; bankrecs: any[] }> | null };
     const d = await gql<R>(apiKey, Q_C, { ids, limit });
@@ -218,7 +232,7 @@ export async function fetchAllianceBankrecsViaGQL(
     if (!isShapeError(e)) throw e;
   }
 
-  // D) legacy: alliance(id: Int!)
+  // ---- Try D (legacy single alliance) ----
   try {
     type R = { alliance: { id: number; bankrecs: any[] } | null };
     const d = await gql<R>(apiKey, Q_D, { id: Number(allianceId), limit });
@@ -228,7 +242,6 @@ export async function fetchAllianceBankrecsViaGQL(
     if (!isShapeError(e)) throw e;
   }
 
-  // Nothing matched; return empty
   return [];
 }
 
