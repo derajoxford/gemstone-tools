@@ -13,8 +13,12 @@ const RES_KEYS = [
   "gasoline","munitions","steel","aluminum",
 ] as const;
 
-function isTaxRow(r: BankrecRow): boolean {
-  return r.tax_id != null && Number(r.tax_id) > 0;
+function isTaxCreditToAlliance(r: BankrecRow, allianceId: number): boolean {
+  // Only count automated taxes that CREDIT the alliance
+  return r.tax_id != null
+    && Number(r.tax_id) > 0
+    && r.receiver_type === 2
+    && r.receiver_id === allianceId;
 }
 
 function addDelta(dst: ResourceDelta, src: Partial<ResourceDelta>) {
@@ -40,20 +44,15 @@ export async function previewAllianceTaxCreditsStored(
 
   const rows = await fetchAllianceBankrecsViaGQL(apiKey, allianceId, { limit: Math.max(1, Math.min(500, limit)) });
 
-  // keep only tax rows newer than cursor
-  const filtered = rows.filter(r => isTaxRow(r) && (!lastSeenId || r.id > lastSeenId));
+  // Only tax credits to the alliance, newer than cursor
+  const filtered = rows.filter(r =>
+    isTaxCreditToAlliance(r, allianceId) && (!lastSeenId || r.id > lastSeenId)
+  );
 
   const delta: ResourceDelta = {};
-  for (const r of filtered) {
-    addDelta(delta, r as any);
-  }
+  for (const r of filtered) addDelta(delta, r as any);
 
   const newestId = filtered.length ? Math.max(...filtered.map(r => r.id)) : null;
 
-  return {
-    count: filtered.length,
-    newestId,
-    delta,
-    rows: filtered,
-  };
+  return { count: filtered.length, newestId, delta, rows: filtered };
 }
