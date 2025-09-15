@@ -1,41 +1,19 @@
-// src/lib/pnw.ts
-import fetch from "node-fetch";
+/* eslint-disable no-restricted-syntax */
+import { PrismaClient } from "@prisma/client";
 
-export class PnwGqlError extends Error {
-  status: number;
-  body: any;
-  constructor(status: number, body: any, message: string) {
-    super(message);
-    this.status = status;
-    this.body = body;
-  }
-}
+// We rely on an existing decrypt helper used elsewhere in the repo.
+import * as cryptoMod from "../src/lib/crypto.js";
+// open(cipher, nonce) => plaintext
+const open = (cryptoMod as any).open as (cipher: string, nonce: string) => string;
 
-const ENDPOINT = "https://api.politicsandwar.com/graphql";
-
-async function gql<T>(apiKey: string, query: string, variables?: Record<string, any>): Promise<T> {
-  const res = await fetch(`${ENDPOINT}?api_key=${apiKey}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ query, variables }),
-  });
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok || body.errors) {
-    const msg = `PnW GraphQL error (status ${res.status}): ${JSON.stringify(body.errors || body)}`;
-    throw new PnwGqlError(res.status, body, msg);
-  }
-  return body.data as T;
-}
-
-export type BankrecRow = {
+export type Bankrec = {
   id: number;
   date: string;
-  sender_type: number;
-  sender_id: number;
-  receiver_type: number;
-  receiver_id: number;
+  sender_type: string;
+  sender_id: number | null;
+  receiver_type: string;
+  receiver_id: number | null;
   note: string | null;
-  banker_id?: number | null;
   money: number;
   coal: number;
   oil: number;
@@ -48,180 +26,227 @@ export type BankrecRow = {
   steel: number;
   aluminum: number;
   food: number;
-  tax_id?: number | null;
+  tax_id: number | null;
 };
 
-// ---------------- Alliance-level bankrecs (does NOT include automated taxes) ----------------
-export async function fetchAllianceBankrecsViaGQL(
-  apiKey: string,
-  allianceId: number,
-  opts: { limit?: number } = {},
-): Promise<BankrecRow[]> {
-  const limit = Math.max(1, Math.min(500, opts.limit ?? 100));
-  const Q = /* GraphQL */ `
-    query AllianceBankrecs($id: Int!, $limit: Int!) {
-      alliances(id: $id) {
-        id
-        bankrecs(limit: $limit, orderBy: [{ column: id, order: DESC }]) {
-          id
-          date
-          sender_type
-          sender_id
-          receiver_type
-          receiver_id
-          note
-          money
-          coal
-          oil
-          uranium
-          lead
-          iron
-          bauxite
-          gasoline
-          munitions
-          steel
-          aluminum
-          food
-          tax_id
-        }
-      }
-    }
-  `;
-  const data = await gql<any>(apiKey, Q, { id: allianceId, limit });
-  const ali = Array.isArray(data.alliances) ? data.alliances[0] : data.alliances;
-  const rows = (ali?.bankrecs ?? []) as BankrecRow[];
-  return rows;
+export const RESOURCE_KEYS = [
+  "money",
+  "coal",
+  "oil",
+  "uranium",
+  "iron",
+  "bauxite",
+  "lead",
+  "gasoline",
+  "munitions",
+  "steel",
+  "aluminum",
+  "food",
+] as const;
+
+export type ResourceKey = typeof RESOURCE_KEYS[number];
+export type ResourceDelta = Record<ResourceKey, number>;
+
+const PNW_GQL_ENDPOINT = "https://api.politicsandwar.com/graphql";
+
+/**
+ * Fetches and decrypts the stored API key for a given alliance.
+ */
+export async function getAllianceApiKey(
+  prisma: PrismaClient,
+  allianceId: number
+): Promise<string> {
+  const k = await prisma.allianceKey.findFirst({
+    where: { allianceId },
+    orderBy: { id: "desc" },
+  });
+  if (!k) {
+    throw new Error(`No saved API key for alliance ${allianceId}`);
+  }
+  const token = open(k.encryptedApiKey, k.nonce);
+  if (!token) throw new Error("Failed to decrypt alliance API key");
+  return token;
 }
 
-// ---------------- Members in an alliance ----------------
-export async function fetchAllianceMemberNationIds(apiKey: string, allianceId: number): Promise<number[]> {
-  // Try using "nations" first; fall back to "members".
-  const QA = /* GraphQL */ `
-    query AllianceMembers($id: Int!) {
-      alliances(id: $id) { id nations { id } }
+/**
+ * Minimal GraphQL POST helper with Bearer token.
+ */
+export async function gqlFetch<T = any>(
+  token: string,
+  query: string,
+  variables: Record<string, any>
+): Promise<T> {
+  const res = await fetch(PNW_GQL_ENDPOINT, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`PnW GraphQL HTTP ${res.status}: ${text}`);
+  }
+  const json = (await res.json()) as any;
+  if (json.errors?.length) {
+    const msg = json.errors.map((e: any) => e.message).join("; ");
+    throw new Error(`PnW GraphQL error(s): ${msg}`);
+  }
+  return json.data as T;
+}
+
+/**
+ * The exact shape may differ slightly across PnW API versions.
+ * This query intentionally over-selects known fields and filters on the server
+ * by alliance participation (sender or receiver). We still hard-filter locally
+ * by tax_id > 0 and id > sinceId for absolute correctness.
+ */
+const BANKRECS_QUERY = /* GraphQL */ `
+  query BankrecsSince(
+    $allianceId: Int!
+    $limit: Int!
+    $cursorId: Int
+  ) {
+    bankrecs(
+      filter: {
+        OR: [
+          { receiver_type: "alliance", receiver_id: $allianceId }
+          { sender_type: "alliance", sender_id: $allianceId }
+        ]
+        ${/* not every schema supports id_gt; the API will ignore unknown filters */""}
+        id_gt: $cursorId
+      }
+      first: $limit
+      orderBy: { id: ASC }
+    ) {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      nodes {
+        id
+        date
+        sender_type
+        sender_id
+        receiver_type
+        receiver_id
+        note
+        money
+        coal
+        oil
+        uranium
+        iron
+        bauxite
+        lead
+        gasoline
+        munitions
+        steel
+        aluminum
+        food
+        tax_id
+      }
     }
-  `;
-  try {
-    const data = await gql<any>(apiKey, QA, { id: allianceId });
-    const ali = Array.isArray(data.alliances) ? data.alliances[0] : data.alliances;
-    const list = (ali?.nations ?? []) as Array<{ id: number }>;
-    if (list.length) return list.map(n => n.id);
-  } catch (e: any) {
-    const msg = String(e?.message || "");
-    if (!/Cannot query field "nations"|Unknown field/i.test(msg)) throw e;
+  }
+`;
+
+/**
+ * Fetches bankrecs *participating* with the alliance. We also locally enforce:
+ *  - id > sinceId  (cursor exclusive)
+ *  - tax_id > 0    (strict tax only)
+ *
+ * If the server ignores id_gt, we still protect with a local id filter.
+ */
+export async function fetchBankrecsSince(
+  prisma: PrismaClient,
+  allianceId: number,
+  sinceId: number | null,
+  pageSize = 500,
+  hardCap = 5000
+): Promise<Bankrec[]> {
+  const token = await getAllianceApiKey(prisma, allianceId);
+
+  let fetched: Bankrec[] = [];
+  let localCursor = sinceId ?? 0;
+  let safety = 0;
+
+  while (true) {
+    safety++;
+    if (safety > Math.ceil(hardCap / pageSize)) break;
+
+    const data = await gqlFetch<any>(token, BANKRECS_QUERY, {
+      allianceId,
+      limit: pageSize,
+      cursorId: localCursor || 0,
+    });
+
+    // Accept either {bankrecs:{nodes}} or plain array—be defensive.
+    const nodes: Bankrec[] =
+      data?.bankrecs?.nodes ??
+      data?.bankrecs ??
+      [];
+
+    // Local hard filters (id_gt + tax_id > 0)
+    const batch = nodes.filter(
+      (r) => r && typeof r.id === "number" && r.id > (sinceId ?? 0) && (r.tax_id ?? 0) > 0
+    );
+
+    fetched.push(...batch);
+
+    if (!data?.bankrecs?.pageInfo?.hasNextPage) break;
+
+    // Advance local cursor from last node we actually saw
+    const last = nodes[nodes.length - 1];
+    if (!last) break;
+    localCursor = Math.max(localCursor, Number(last.id || 0));
+    if (fetched.length >= hardCap) break;
   }
 
-  const QB = /* GraphQL */ `
-    query AllianceMembersFallback($id: Int!) {
-      alliances(id: $id) { id members { id } }
-    }
-  `;
-  const dataB = await gql<any>(apiKey, QB, { id: allianceId });
-  const aliB = Array.isArray(dataB.alliances) ? dataB.alliances[0] : dataB.alliances;
-  const listB = (aliB?.members ?? []) as Array<{ id: number }>;
-  return listB.map(n => n.id);
+  // Ensure ascending by id just in case
+  fetched.sort((a, b) => a.id - b.id);
+  return fetched;
 }
 
-// ---------------- Nation-level bankrecs (this DOES include automated taxes) ----------------
-export async function fetchNationBankrecsViaGQL(
-  apiKey: string,
-  nationIds: number[],
-  perNationLimit = 20,
-): Promise<BankrecRow[]> {
-  const IDS = [...new Set(nationIds)].filter(n => Number.isFinite(n));
-  if (!IDS.length) return [];
+/**
+ * Computes alliance-perspective signed deltas for a single bankrec.
+ * + Positive if alliance RECEIVES on the row.
+ * - Negative if alliance SENDS on the row.
+ */
+export function signedDeltaFor(
+  allianceId: number,
+  rec: Bankrec
+): ResourceDelta {
+  const isReceive =
+    rec.receiver_type === "alliance" && Number(rec.receiver_id) === Number(allianceId);
+  const isSend =
+    rec.sender_type === "alliance" && Number(rec.sender_id) === Number(allianceId);
 
-  const chunks: number[][] = [];
-  for (let i = 0; i < IDS.length; i += 40) chunks.push(IDS.slice(i, i + 40));
+  const sign = isReceive ? 1 : isSend ? -1 : 0;
 
-  const fields = `
-    id date sender_type sender_id receiver_type receiver_id note
-    money coal oil uranium lead iron bauxite gasoline munitions steel aluminum food tax_id
-  `;
-
-  const Q = /* GraphQL */ `
-    query NationBankrecs($ids: [Int!], $limit: Int!) {
-      nations(id: $ids) {
-        id
-        bankrecs(limit: $limit, orderBy: [{ column: id, order: DESC }]) { ${fields} }
-      }
-    }
-  `;
-  const Q_FALLBACK = /* GraphQL */ `
-    query NationBankrecsPaginated($ids: [Int!], $limit: Int!) {
-      nations(id: $ids, first: 500) {
-        data {
-          id
-          bankrecs(limit: $limit, orderBy: [{ column: id, order: DESC }]) { ${fields} }
-        }
-      }
-    }
-  `;
-
-  const out: BankrecRow[] = [];
-  for (const ids of chunks) {
-    try {
-      const d = await gql<any>(apiKey, Q, { ids, limit: perNationLimit });
-      const arr = Array.isArray(d.nations) ? d.nations : [];
-      for (const n of arr) out.push(...(n?.bankrecs ?? []));
-    } catch (e: any) {
-      const d = await gql<any>(apiKey, Q_FALLBACK, { ids, limit: perNationLimit });
-      const arr = Array.isArray(d.nations?.data) ? d.nations.data : [];
-      for (const n of arr) out.push(...(n?.bankrecs ?? []));
-    }
+  const out = {} as ResourceDelta;
+  for (const k of RESOURCE_KEYS) {
+    const raw = Number((rec as any)[k] || 0);
+    out[k] = sign * raw;
   }
   return out;
 }
 
-// ---------------- Helpers ----------------
-export function isAutomatedTaxRow(r: BankrecRow, allianceId: number): boolean {
-  return r.receiver_type === 2 && r.receiver_id === allianceId && !!r.tax_id && Number(r.tax_id) > 0;
+/**
+ * Utility to add two resource delta objects.
+ */
+export function sumDelta(a: ResourceDelta, b: ResourceDelta): ResourceDelta {
+  const out = {} as ResourceDelta;
+  for (const k of RESOURCE_KEYS) {
+    out[k] = Number(a[k] || 0) + Number(b[k] || 0);
+  }
+  return out;
 }
 
-export type Delta = {
-  money: number;
-  food: number;
-  coal: number;
-  oil: number;
-  uranium: number;
-  lead: number;
-  iron: number;
-  bauxite: number;
-  gasoline: number;
-  munitions: number;
-  steel: number;
-  aluminum: number;
-};
-
-export function sumDelta(rows: BankrecRow[]): Delta {
-  const z = (): Delta => ({
-    money: 0, food: 0, coal: 0, oil: 0, uranium: 0, lead: 0, iron: 0, bauxite: 0,
-    gasoline: 0, munitions: 0, steel: 0, aluminum: 0,
-  });
-  const d = z();
-  for (const r of rows) {
-    d.money += r.money || 0;
-    d.food += r.food || 0;
-    d.coal += r.coal || 0;
-    d.oil += r.oil || 0;
-    d.uranium += r.uranium || 0;
-    d.lead += r.lead || 0;
-    d.iron += r.iron || 0;
-    d.bauxite += r.bauxite || 0;
-    d.gasoline += r.gasoline || 0;
-    d.munitions += r.munitions || 0;
-    d.steel += r.steel || 0;
-    d.aluminum += r.aluminum || 0;
-  }
-  return d;
-}
-
-// ------------- Back-compat: legacy symbol so index.ts doesn’t crash -------------
-type PnwKeys = { apiKey: string };
-export async function fetchBankrecs(keys: PnwKeys, allianceIds: number[]) {
-  const out: Record<number, BankrecRow[]> = {};
-  for (const id of allianceIds) {
-    out[id] = await fetchAllianceBankrecsViaGQL(keys.apiKey, id, { limit: 100 });
-  }
+/**
+ * Create a zero-initialized delta.
+ */
+export function zeroDelta(): ResourceDelta {
+  const out = {} as ResourceDelta;
+  for (const k of RESOURCE_KEYS) out[k] = 0;
   return out;
 }
