@@ -3,133 +3,78 @@ import {
   SlashCommandBuilder,
   ChatInputCommandInteraction,
   PermissionFlagsBits,
+  EmbedBuilder,
 } from "discord.js";
+
 import { PrismaClient } from "@prisma/client";
-import { open } from "../lib/crypto.js";
-import {
-  fetchAllianceBankrecsViaGQL,
-  type BankrecRow,
-} from "../lib/pnw.js";
-import { isTaxBankrec } from "../integrations/pnw/tax.js";
+import * as cryptoMod from "../lib/crypto.js";
+import { fetchAllianceBankrecsViaGQL, BankrecRow } from "../lib/pnw";
 
 const prisma = new PrismaClient();
-
-// Show up to this many rows in the message body (avoid Discord length issues)
-const SHOW_MAX = 15;
-
-function fmtNum(n: number) {
-  return Number(n).toLocaleString(undefined);
-}
-
-function fmtDate(iso: string) {
-  // Rely on server TZ; if you prefer UTC, use new Date(iso).toUTCString()
-  return new Date(iso).toLocaleString();
-}
-
-function rowResources(r: BankrecRow): string {
-  const keys: (keyof BankrecRow)[] = [
-    "money",
-    "food",
-    "coal",
-    "oil",
-    "uranium",
-    "lead",
-    "iron",
-    "bauxite",
-    "gasoline",
-    "munitions",
-    "steel",
-    "aluminum",
-  ];
-  const parts: string[] = [];
-  for (const k of keys) {
-    const v = Number(r[k] ?? 0);
-    if (!v) continue;
-    parts.push(`${k}:${fmtNum(v)}`);
-  }
-  return parts.join(" · ") || "—";
-}
-
-async function getStoredApiKey(allianceId: number): Promise<string> {
-  const k = await prisma.allianceKey.findFirst({
-    where: { allianceId },
-    orderBy: { id: "desc" },
-  });
-  if (!k) throw new Error("No stored API key. Run /pnw_set first.");
-  return open(k.encryptedApiKey, k.nonceApi);
-}
+const open = (cryptoMod as any).open as (cipher: string, nonce: string) => string;
 
 export const data = new SlashCommandBuilder()
   .setName("pnw_bankpeek")
   .setDescription("Debug: fetch recent bankrecs from PnW GQL for an alliance")
-  // Required options MUST come before any optional (Discord rule)
-  .addIntegerOption((o) =>
-    o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
-  )
-  .addIntegerOption((o) =>
-    o
-      .setName("limit")
-      .setDescription("Rows to fetch (default 100, max 500)")
-      .setRequired(false),
-  )
-  .addStringOption((o) =>
+  .addIntegerOption(o => o.setName("alliance_id").setDescription("Alliance ID").setRequired(true))
+  .addIntegerOption(o => o.setName("limit").setDescription("Rows to fetch (default 100, max 500)").setRequired(false))
+  .addStringOption(o =>
     o
       .setName("filter")
       .setDescription("Optional filter")
-      .setRequired(false)
-      .addChoices({ name: "tax", value: "tax" }),
+      .addChoices({ name: "tax", value: "tax" })
+      .setRequired(false),
   )
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .setDMPermission(false);
 
-export async function execute(interaction: ChatInputCommandInteraction) {
-  // Always defer immediately to avoid the 3s interaction timeout
-  await interaction.deferReply({ ephemeral: true });
+function briefRow(r: BankrecRow): string {
+  const when = new Date(r.date).toLocaleString();
+  const header = `#${r.id} • ${when} • sender ${r.sender_type}:${r.sender_id} → receiver ${r.receiver_type}:${r.receiver_id}`;
+  const note = r.note && r.note.trim() ? r.note : "—";
+  const parts: string[] = [];
+  const keys = ["money","food","coal","oil","uranium","lead","iron","bauxite","gasoline","munitions","steel","aluminum"] as const;
+  for (const k of keys) {
+    const v = Number((r as any)[k] ?? 0);
+    if (v) parts.push(`${k}:${k==="money"?v.toLocaleString():v.toLocaleString()}`);
+  }
+  const body = parts.length ? parts.join(" · ") : "—";
+  return `${header}\n${note}\n${body}`;
+}
+
+export async function execute(i: ChatInputCommandInteraction) {
+  await i.deferReply({ ephemeral: true });
 
   try {
-    const allianceId = interaction.options.getInteger("alliance_id", true)!;
-    const limitOpt = interaction.options.getInteger("limit") ?? 100;
-    const filter = (interaction.options.getString("filter") || "").toLowerCase();
+    const allianceId = i.options.getInteger("alliance_id", true)!;
+    const limit = Math.max(1, Math.min(500, i.options.getInteger("limit") ?? 100));
+    const filter = (i.options.getString("filter") ?? "").toLowerCase();
 
-    const limit = Math.max(1, Math.min(limitOpt, 500));
-    const apiKey = await getStoredApiKey(allianceId);
+    const k = await prisma.allianceKey.findFirst({ where: { allianceId }, orderBy: { id: "desc" } });
+    if (!k) throw new Error(`❌ No stored API key. Run /pnw_set first (and ensure secrets match).`);
 
+    const apiKey = open(k.encryptedApiKey, k.nonceApi);
     const rows = await fetchAllianceBankrecsViaGQL(apiKey, allianceId, { limit });
 
-    let shown = rows;
-    if (filter === "tax") {
-      shown = rows.filter((r) => isTaxBankrec(r, allianceId));
-    }
-
-    const header =
-      filter === "tax"
-        ? `Bankpeek (filter=tax)\nAlliance: ${allianceId}\nFetched: ${shown.length} (raw: ${rows.length}, limit: ${limit})\n`
-        : `Bankpeek\nAlliance: ${allianceId}\nFetched: ${shown.length} (raw: ${rows.length}, limit: ${limit})\n`;
-
-    if (shown.length === 0) {
-      await interaction.editReply(header + "\n— no rows —");
-      return;
-    }
+    const filtered = filter === "tax" ? rows.filter(r => r.tax_id != null && Number(r.tax_id) > 0) : rows;
 
     const lines: string[] = [];
-    const subset = shown.slice(0, SHOW_MAX);
-    for (const r of subset) {
-      const hdr = `#${r.id} • ${fmtDate(r.date)} • sender ${r.sender_type}:${r.sender_id} → receiver ${r.receiver_type}:${r.receiver_id}`;
-      const note = (r.note && r.note.trim()) ? r.note.trim() : "—";
-      const res = rowResources(r);
-      lines.push(hdr + "\n" + note + "\n" + res + "\n");
-    }
-    if (shown.length > subset.length) {
-      lines.push(`… and ${shown.length - subset.length} more`);
-    }
+    for (const r of filtered.slice(0, 20)) lines.push(briefRow(r));
 
-    await interaction.editReply(header + "\n" + lines.join("\n"));
+    const embed = new EmbedBuilder()
+      .setTitle(`Bankpeek${filter ? ` (filter=${filter})` : ""}`)
+      .setDescription(
+        [
+          `**Alliance:** ${allianceId}`,
+          `**Fetched:** ${filtered.length} (raw: ${rows.length}, limit: ${limit})`,
+          "",
+          lines.join("\n\n") || "—",
+        ].join("\n"),
+      )
+      .setColor(0x00a8ff);
+
+    await i.editReply({ embeds: [embed] });
   } catch (err: any) {
-    console.error("[/pnw_bankpeek] error:", err);
-    const msg =
-      err?.message?.startsWith("PnW GraphQL error")
-        ? `❌ ${err.message}`
-        : `❌ ${err?.message ?? String(err)}`;
-    await interaction.editReply(msg);
+    await i.editReply(`❌ Fetch failed: ${err?.message ?? String(err)}`);
   }
 }
