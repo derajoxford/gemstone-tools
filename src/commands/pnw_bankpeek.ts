@@ -22,7 +22,10 @@ export const data = new SlashCommandBuilder()
     o
       .setName("filter")
       .setDescription("Optional filter")
-      .addChoices({ name: "tax", value: "tax" })
+      .addChoices(
+        { name: "tax_in", value: "tax_in" }, // tax credits to alliance only
+        { name: "tax_any", value: "tax_any" } // any row with tax_id > 0
+      )
       .setRequired(false),
   )
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
@@ -42,6 +45,13 @@ function briefRow(r: BankrecRow): string {
   return `${header}\n${note}\n${body}`;
 }
 
+function isTaxAny(r: BankrecRow) {
+  return r.tax_id != null && Number(r.tax_id) > 0;
+}
+function isTaxCreditToAlliance(r: BankrecRow, allianceId: number) {
+  return isTaxAny(r) && r.receiver_type === 2 && r.receiver_id === allianceId;
+}
+
 export async function execute(i: ChatInputCommandInteraction) {
   await i.deferReply({ ephemeral: true });
 
@@ -56,7 +66,9 @@ export async function execute(i: ChatInputCommandInteraction) {
     const apiKey = open(k.encryptedApiKey, k.nonceApi);
     const rows = await fetchAllianceBankrecsViaGQL(apiKey, allianceId, { limit });
 
-    const filtered = filter === "tax" ? rows.filter(r => r.tax_id != null && Number(r.tax_id) > 0) : rows;
+    let filtered = rows;
+    if (filter === "tax_in") filtered = rows.filter(r => isTaxCreditToAlliance(r, allianceId));
+    else if (filter === "tax_any") filtered = rows.filter(isTaxAny);
 
     const lines: string[] = [];
     for (const r of filtered.slice(0, 20)) lines.push(briefRow(r));
