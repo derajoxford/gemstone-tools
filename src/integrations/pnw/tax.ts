@@ -19,6 +19,7 @@ export type PreviewResult = {
   sample: Bankrec[];
 };
 
+/** Preview using the stored cursor (does not mutate). */
 export async function previewTaxes(
   prisma: PrismaClient,
   allianceId: number
@@ -43,6 +44,7 @@ export async function previewTaxes(
   };
 }
 
+/** Apply: add to treasury then advance cursor to newest processed id. */
 export async function applyTaxes(
   prisma: PrismaClient,
   allianceId: number
@@ -56,6 +58,7 @@ export async function applyTaxes(
   return prev;
 }
 
+/** Pretty-print the delta for embeds / logs. */
 export function formatDelta(delta: ResourceDelta): string {
   const lines: string[] = [];
   for (const k of RESOURCE_KEYS) {
@@ -64,3 +67,6 @@ export function formatDelta(delta: ResourceDelta): string {
   }
   return lines.length ? lines.join("\n") : "(all zero)";
 }
+
+/* ---------- Back-compat export name expected by commands/jobs ---------- */
+export const previewAllianceTaxCreditsStored = previewTaxes;
