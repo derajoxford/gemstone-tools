@@ -1,8 +1,8 @@
 /* eslint-disable no-restricted-syntax */
 import { PrismaClient } from "@prisma/client";
 
-// We rely on an existing decrypt helper used elsewhere in the repo.
-import * as cryptoMod from "../src/lib/crypto.js";
+// ✅ Correct path: pnw.ts sits in src/lib next to crypto.js
+import * as cryptoMod from "./crypto.js";
 // open(cipher, nonce) => plaintext
 const open = (cryptoMod as any).open as (cipher: string, nonce: string) => string;
 
@@ -114,7 +114,6 @@ const BANKRECS_QUERY = /* GraphQL */ `
           { receiver_type: "alliance", receiver_id: $allianceId }
           { sender_type: "alliance", sender_id: $allianceId }
         ]
-        ${/* not every schema supports id_gt; the API will ignore unknown filters */""}
         id_gt: $cursorId
       }
       first: $limit
