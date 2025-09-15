@@ -1,44 +1,25 @@
+// src/utils/pnw_cursor.ts
 import { PrismaClient } from "@prisma/client";
 
 /**
- * This module provides legacy-named helpers that other parts of the code import:
- * - getPnwCursor / setPnwCursor          → stored bankrec cursor (id)
- * - getPnwLogs / appendPnwLog            → minimal apply logs (kept in Settings as JSON)
- * - getPnwSummaryChannel / setPnwSummaryChannel → summary channel per alliance
- *
- * It stores values in the `Setting` table using string keys:
- *   pnw:tax_cursor:<allianceId>            (stringified number)
- *   pnw:apply_logs:<allianceId>            (stringified JSON array)
- *   pnw:summary_channel:<allianceId>       (Discord channel id string)
+ * Setting keys (shared by all helpers)
  */
+const cursorKey = (aid: number) => `pnw:tax_cursor:${aid}`;
+const logsKey = (aid: number) => `pnw:apply_logs:${aid}`;
+const summaryKey = (aid: number) => `pnw:summary_channel:${aid}`;
 
-function cursorKey(allianceId: number) {
-  return `pnw:tax_cursor:${allianceId}`;
-}
-function logsKey(allianceId: number) {
-  return `pnw:apply_logs:${allianceId}`;
-}
-function summaryKey(allianceId: number) {
-  return `pnw:summary_channel:${allianceId}`;
-}
+/* -------------------- Cursor helpers -------------------- */
 
-/** Read stored cursor (bankrec id). */
-export async function getPnwCursor(
-  prisma: PrismaClient,
-  allianceId: number
-): Promise<number | null> {
+/** New name */
+export async function getPnwCursor(prisma: PrismaClient, allianceId: number): Promise<number | null> {
   const row = await prisma.setting.findUnique({ where: { key: cursorKey(allianceId) } }).catch(() => null);
   if (!row) return null;
   const n = Number(row.value);
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
-/** Set/advance stored cursor (bankrec id). */
-export async function setPnwCursor(
-  prisma: PrismaClient,
-  allianceId: number,
-  id: number
-): Promise<void> {
+/** New name */
+export async function setPnwCursor(prisma: PrismaClient, allianceId: number, id: number): Promise<void> {
   await prisma.setting.upsert({
     where: { key: cursorKey(allianceId) },
     update: { value: String(id) },
@@ -46,9 +27,15 @@ export async function setPnwCursor(
   });
 }
 
-/** Log entry type for tax apply operations. */
+/** Back-compat alias (old callers expect these) */
+export const readTaxCursor = getPnwCursor;
+export const writeTaxCursor = async (prisma: PrismaClient, allianceId: number, newestId: number) =>
+  setPnwCursor(prisma, allianceId, newestId);
+
+/* -------------------- Apply logs -------------------- */
+
 export type PnwApplyLogEntry = {
-  at: string; // ISO timestamp
+  at: string;                // ISO timestamp
   allianceId: number;
   count: number;
   newestId: number | null;
@@ -56,7 +43,6 @@ export type PnwApplyLogEntry = {
   note?: string | null;
 };
 
-/** Append a log entry (kept as a small JSON array in Settings). */
 export async function appendPnwLog(
   prisma: PrismaClient,
   allianceId: number,
@@ -66,8 +52,7 @@ export async function appendPnwLog(
   const row = await prisma.setting.findUnique({ where: { key } }).catch(() => null);
   const arr: PnwApplyLogEntry[] = row?.value ? safeParseArray(row.value) : [];
   arr.push(entry);
-  // keep only the most recent 50
-  while (arr.length > 50) arr.shift();
+  while (arr.length > 50) arr.shift(); // keep last 50
   await prisma.setting.upsert({
     where: { key },
     update: { value: JSON.stringify(arr) },
@@ -75,7 +60,6 @@ export async function appendPnwLog(
   });
 }
 
-/** Retrieve recent logs (default 10). */
 export async function getPnwLogs(
   prisma: PrismaClient,
   allianceId: number,
@@ -84,40 +68,7 @@ export async function getPnwLogs(
   const key = logsKey(allianceId);
   const row = await prisma.setting.findUnique({ where: { key } }).catch(() => null);
   const arr: PnwApplyLogEntry[] = row?.value ? safeParseArray(row.value) : [];
-  if (limit < 1) return [];
-  return arr.slice(-limit);
-}
-
-/** Read the configured summary channel id (Discord channel id string). */
-export async function getPnwSummaryChannel(
-  prisma: PrismaClient,
-  allianceId: number
-): Promise<string | null> {
-  const row = await prisma.setting.findUnique({ where: { key: summaryKey(allianceId) } }).catch(() => null);
-  return row?.value ?? null;
-}
-
-/** Set/clear the summary channel id. Pass null to clear. */
-export async function setPnwSummaryChannel(
-  prisma: PrismaClient,
-  allianceId: number,
-  channelId: string | null
-): Promise<void> {
-  const key = summaryKey(allianceId);
-  if (!channelId) {
-    // Clear by deleting the row if it exists
-    try {
-      await prisma.setting.delete({ where: { key } });
-    } catch {
-      // ignore if not present
-    }
-    return;
-  }
-  await prisma.setting.upsert({
-    where: { key },
-    update: { value: channelId },
-    create: { key, value: channelId },
-  });
+  return arr.slice(-Math.max(1, Math.min(50, limit)));
 }
 
 function safeParseArray(s: string): PnwApplyLogEntry[] {
@@ -127,4 +78,31 @@ function safeParseArray(s: string): PnwApplyLogEntry[] {
   } catch {
     return [];
   }
+}
+
+/* -------------------- Summary channel -------------------- */
+
+export async function getPnwSummaryChannel(
+  prisma: PrismaClient,
+  allianceId: number
+): Promise<string | null> {
+  const row = await prisma.setting.findUnique({ where: { key: summaryKey(allianceId) } }).catch(() => null);
+  return row?.value ?? null;
+}
+
+export async function setPnwSummaryChannel(
+  prisma: PrismaClient,
+  allianceId: number,
+  channelId: string | null
+): Promise<void> {
+  const key = summaryKey(allianceId);
+  if (!channelId) {
+    try { await prisma.setting.delete({ where: { key } }); } catch {}
+    return;
+  }
+  await prisma.setting.upsert({
+    where: { key },
+    update: { value: channelId },
+    create: { key, value: channelId },
+  });
 }
