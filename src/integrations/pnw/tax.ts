@@ -31,7 +31,7 @@ export async function previewTaxes(
   let newestId: number | null = sinceId ?? null;
 
   for (const r of rows) {
-    const d = signedDeltaFor(allianceId, r);
+    const d = signedDeltaFor(allianceId, r); // + if alliance is receiver, - if sender
     delta = sumDelta(delta, d);
     if (newestId === null || r.id > newestId) newestId = r.id;
   }
