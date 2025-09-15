@@ -1,67 +1,40 @@
-// src/commands/pnw_preview.ts
 import {
   SlashCommandBuilder,
   ChatInputCommandInteraction,
-  PermissionFlagsBits,
+  EmbedBuilder,
 } from "discord.js";
+import { PrismaClient } from "@prisma/client";
+import { previewTaxes, formatDelta } from "../integrations/pnw/tax.js";
 
-import { previewAllianceTaxCreditsStored } from "../integrations/pnw/tax";
-import { getPnwCursor } from "../utils/pnw_cursor";
-import { resourceEmbed } from "../lib/embeds";
-
-type ResourceDelta = Record<string, number>;
-function codeBlock(s: string) { return s ? "```\n" + s + "\n```" : "—"; }
-function formatDelta(delta: ResourceDelta): string {
-  const keys = Object.keys(delta || {});
-  const lines: string[] = [];
-  for (const k of keys) {
-    const v = Number(delta[k] ?? 0);
-    if (!v) continue;
-    const asStr = k === "money" ? v.toLocaleString(undefined, { maximumFractionDigits: 2 }) : Math.round(v).toLocaleString();
-    lines.push(`${k.padEnd(10)} +${asStr}`);
-  }
-  return lines.join("\n");
-}
+const prisma = new PrismaClient();
 
 export const data = new SlashCommandBuilder()
   .setName("pnw_preview")
-  .setDescription("Preview *tax-only* bank records using the stored PnW key.")
-  .addIntegerOption(o => o.setName("alliance_id").setDescription("Alliance ID").setRequired(true))
-  .addIntegerOption(o => o.setName("limit").setDescription("Max rows to scan (default 300, max 500)").setRequired(false))
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-  .setDMPermission(false);
+  .setDescription("Preview un-applied PnW tax credits (cursor-safe).")
+  .addIntegerOption((opt) =>
+    opt
+      .setName("alliance_id")
+      .setDescription("Alliance ID (default 14258)")
+      .setRequired(false)
+  );
 
-export async function execute(i: ChatInputCommandInteraction) {
-  await i.deferReply({ ephemeral: true });
-  try {
-    const allianceId = i.options.getInteger("alliance_id", true)!;
-    const limit = Math.max(1, Math.min(500, i.options.getInteger("limit") ?? 300));
+export async function execute(interaction: ChatInputCommandInteraction) {
+  const allianceId = interaction.options.getInteger("alliance_id") ?? 14258;
 
-    const lastSeen = (await getPnwCursor(allianceId)) ?? 0;
-    const preview = await previewAllianceTaxCreditsStored(allianceId, lastSeen, limit);
+  await interaction.deferReply({ ephemeral: true });
 
-    const embed = resourceEmbed({
-      title: `PnW Tax Preview (Stored Key)`,
-      subtitle: [
-        `**Alliance:** ${allianceId}`,
-        `**Cursor:** id > ${lastSeen ?? 0}`,
-        `**Scan limit:** ${limit}`,
-        `**Records counted:** ${preview.count}`,
-        `**Newest bankrec id:** ${preview.newestId ?? "—"}`,
-      ].join("\n"),
-      fields: [
-        {
-          name: "Tax delta (sum)",
-          value: codeBlock(formatDelta(preview.delta) || ""),
-          inline: false,
-        },
-      ],
-      color: 0x5865f2,
-      footer: `Preview only.`,
-    });
+  const prev = await previewTaxes(prisma, allianceId);
 
-    await i.editReply({ embeds: [embed] });
-  } catch (err: any) {
-    await i.editReply(`❌ Failed to preview: ${err?.message ?? String(err)}`);
-  }
+  const embed = new EmbedBuilder()
+    .setTitle(`PnW Tax Preview — Alliance ${allianceId}`)
+    .addFields(
+      { name: "Rows", value: String(prev.count), inline: true },
+      { name: "Newest Bankrec ID", value: String(prev.newestId ?? "—"), inline: true },
+      { name: "Delta", value: "```txt\n" + formatDelta(prev.delta) + "\n```" }
+    )
+    .setFooter({ text: "Use /pnw_apply to post to treasury and advance cursor." });
+
+  await interaction.editReply({ embeds: [embed] });
 }
+
+export default { data, execute };
