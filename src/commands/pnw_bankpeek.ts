@@ -1,83 +1,55 @@
-// src/commands/pnw_bankpeek.ts
-import { ChatInputCommandInteraction, SlashCommandBuilder } from "discord.js";
-import { open } from "../lib/crypto.js";
 import {
-  fetchAllianceBankrecsViaGQL,
-  fetchAllianceMemberNationIds,
-  fetchNationBankrecsViaGQL,
-  isAutomatedTaxRow,
-  BankrecRow,
-} from "../lib/pnw.js";
+  SlashCommandBuilder,
+  ChatInputCommandInteraction,
+  EmbedBuilder,
+} from "discord.js";
 import { PrismaClient } from "@prisma/client";
+import { fetchBankrecsSince } from "../lib/pnw.js";
+import { readTaxCursor } from "../utils/cursor.js";
 
 const prisma = new PrismaClient();
 
 export const data = new SlashCommandBuilder()
   .setName("pnw_bankpeek")
-  .setDescription("Debug: fetch recent bankrecs from PnW GQL for an alliance")
-  .setDefaultMemberPermissions(32)
-  .addIntegerOption(o => o.setName("alliance_id").setDescription("Alliance ID").setRequired(true))
-  .addIntegerOption(o => o.setName("limit").setDescription("Rows to fetch (default 100, max 500)"))
-  .addStringOption(o =>
-    o
-      .setName("filter")
-      .setDescription("Optional filter")
-      .addChoices({ name: "tax", value: "tax" }),
+  .setDescription("Peek raw PnW bankrecs (tax-only) since stored cursor.")
+  .addIntegerOption((opt) =>
+    opt.setName("alliance_id").setDescription("Alliance ID (default 14258)").setRequired(false)
+  )
+  .addIntegerOption((opt) =>
+    opt
+      .setName("limit")
+      .setDescription("Max rows to show (default 10)")
+      .setRequired(false)
   );
 
-export async function execute(i: ChatInputCommandInteraction) {
-  const allianceId = i.options.getInteger("alliance_id", true);
-  const limit = Math.max(1, Math.min(500, i.options.getInteger("limit") ?? 100));
-  const filter = i.options.getString("filter") || "";
+export async function execute(interaction: ChatInputCommandInteraction) {
+  const allianceId = interaction.options.getInteger("alliance_id") ?? 14258;
+  const limit = interaction.options.getInteger("limit") ?? 10;
 
-  await i.deferReply({ ephemeral: true });
+  await interaction.deferReply({ ephemeral: true });
 
-  const k = await prisma.allianceKey.findFirst({ where: { allianceId }, orderBy: { id: "desc" } });
-  if (!k) return i.editReply("❌ No stored API key. Run /pnw_set first.");
-  const apiKey = open(k.encryptedApiKey, k.nonceApi);
+  const sinceId = await readTaxCursor(prisma, allianceId);
+  const rows = await fetchBankrecsSince(prisma, allianceId, sinceId, 500, 2000);
 
-  let rows: BankrecRow[] = [];
-  let source: "members" | "alliance" = "alliance";
+  const last = rows.slice(-limit);
+  const lines = last.map(
+    (r) =>
+      `#${r.id}  tax_id=${r.tax_id}  ${r.sender_type}:${r.sender_id} → ${r.receiver_type}:${r.receiver_id}  money=${r.money}`
+  );
 
-  if (filter === "tax") {
-    const memberIds = await fetchAllianceMemberNationIds(apiKey, allianceId);
-    const nationRows = await fetchNationBankrecsViaGQL(apiKey, memberIds, Math.max(5, Math.min(50, Math.ceil(limit / Math.max(1, memberIds.length)) * 5)));
-    rows = nationRows.filter(r => isAutomatedTaxRow(r, allianceId));
-    source = "members";
-  } else {
-    rows = await fetchAllianceBankrecsViaGQL(apiKey, allianceId, { limit });
-    source = "alliance";
-  }
+  const embed = new EmbedBuilder()
+    .setTitle(`Bankpeek — Alliance ${allianceId}`)
+    .setDescription(
+      lines.length
+        ? "```txt\n" + lines.join("\n") + "\n```"
+        : "(no tax rows since cursor)"
+    )
+    .addFields(
+      { name: "Since Cursor", value: String(sinceId ?? "none"), inline: true },
+      { name: "Fetched (tax)", value: String(rows.length), inline: true }
+    );
 
-  const rawCount = rows.length;
-  rows = rows.slice(0, limit);
-
-  if (filter === "tax") {
-    // newest first
-    rows.sort((a, b) => b.id - a.id);
-  }
-
-  const lines: string[] = [];
-  lines.push(`Bankpeek${filter ? ` (filter=${filter})` : ""}`);
-  lines.push(`Alliance: ${allianceId}`);
-  lines.push(`Fetched: ${rows.length} (raw: ${rawCount}, source: ${source})`);
-  lines.push("");
-
-  const show = rows.slice(0, 10);
-  for (const r of show) {
-    const header = `#${r.id} • ${new Date(r.date).toLocaleString()} • sender ${r.sender_type}:${r.sender_id} → receiver ${r.receiver_type}:${r.receiver_id}`;
-    const note = (r.note || "—").replace(/&bull;/g, "•");
-    const parts: string[] = [];
-    if (r.money) parts.push(`money:${r.money.toLocaleString()}`);
-    if (r.food) parts.push(`food:${r.food.toLocaleString()}`);
-    if (r.uranium) parts.push(`uranium:${r.uranium.toLocaleString()}`);
-    if (r.aluminum) parts.push(`aluminum:${r.aluminum.toLocaleString()}`);
-    if (r.steel) parts.push(`steel:${r.steel.toLocaleString()}`);
-    lines.push(header);
-    lines.push(note);
-    lines.push(parts.length ? parts.join(" · ") : "—");
-    lines.push("");
-  }
-
-  await i.editReply({ content: lines.join("\n") });
+  await interaction.editReply({ embeds: [embed] });
 }
+
+export default { data, execute };
