@@ -2,102 +2,85 @@
 import {
   SlashCommandBuilder,
   ChatInputCommandInteraction,
-  PermissionFlagsBits,
 } from "discord.js";
 import { PrismaClient } from "@prisma/client";
-import { open } from "../lib/crypto";
-import { fetchBankrecs } from "../lib/pnw";
+import { fetchBankrecs, BankrecRow } from "../lib/pnw";
 
 const prisma = new PrismaClient();
-const toInt = (v: any) => Number.parseInt(String(v ?? 0), 10) || 0;
-const toNum = (v: any) => Number.parseFloat(String(v ?? 0)) || 0;
 
 export const data = new SlashCommandBuilder()
   .setName("pnw_bankpeek")
-  .setDescription("Debug: peek recent alliance bankrecs (capped).")
-  .addIntegerOption((o) =>
+  .setDescription("Peek recent alliance bankrecs via PnW GraphQL (debug/ops).")
+  .addIntegerOption(o =>
     o.setName("alliance_id").setDescription("Alliance ID").setRequired(true)
   )
-  .addStringOption((o) =>
-    o
-      .setName("filter")
-      .setDescription("Filter")
-      .addChoices(
-        { name: "all", value: "all" },
-        { name: "tax", value: "tax" }
-      )
-      .setRequired(false)
+  .addIntegerOption(o =>
+    o.setName("limit").setDescription("How many rows (default 50, max ~600)")
   )
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+  .addStringOption(o =>
+    o.setName("filter")
+      .setDescription('Contains text (e.g. "tax" or "Automated Tax")')
+  )
   .setDMPermission(false);
 
 export async function execute(i: ChatInputCommandInteraction) {
   await i.deferReply({ ephemeral: true });
-  try {
-    const allianceId = i.options.getInteger("alliance_id", true)!;
-    const filter = i.options.getString("filter") ?? "all";
 
-    const a = await prisma.alliance.findUnique({
-      where: { id: allianceId },
-      include: { keys: { orderBy: { id: "desc" }, take: 1 } },
-    });
-    const k = a?.keys?.[0];
-    const apiKey =
-      (k ? open(k.encryptedApiKey as any, k.nonceApi as any) : null) ||
-      process.env.PNW_DEFAULT_API_KEY ||
-      "";
+  const allianceId = i.options.getInteger("alliance_id", true);
+  const limit = Math.max(1, Math.min(600, i.options.getInteger("limit") ?? 50));
+  const filter = (i.options.getString("filter") || "").toLowerCase();
 
-    if (!apiKey) {
-      return i.editReply(
-        "❌ No stored API key. Run /pnw_set first (and ensure secrets match)."
-      );
-    }
+  // Find API key for this alliance (stored by /pnw_set)
+  const k = await prisma.allianceKey.findFirst({
+    where: { allianceId: allianceId },
+    orderBy: { id: "desc" },
+  });
 
-    const res = (await fetchBankrecs({ apiKey }, [allianceId])) || [];
-    const rows: any[] = (res[0]?.bankrecs as any[]) || [];
-
-    const maxLines = 25;
-    const lines: string[] = [];
-    let total = 0;
-
-    for (const r of rows) {
-      const incomingToAlliance =
-        toInt(r.receiver_type) === 2 && toInt(r.receiver_id) === allianceId;
-
-      const taxId = toInt(r.tax_id);
-      const note = String(r.note || "");
-      const isTax = incomingToAlliance && (taxId > 0 || /automated\s*tax/i.test(note));
-
-      if (filter === "tax" && !isTax) continue;
-
-      total++;
-      if (lines.length < maxLines) {
-        const money = toNum(r.money);
-        lines.push(
-          `#${toInt(r.id)} | ${r.date || ""} | ${toInt(
-            r.sender_type
-          )}→${toInt(r.receiver_type)} | $${money.toLocaleString()} | tax_id:${taxId} | ${note || ""}`
-        );
-      }
-    }
-
-    if (!total) {
-      await i.editReply(`(filter=${filter}) No rows found in the recent window.`);
-      return;
-    }
-
-    const header =
-      filter === "tax"
-        ? `Alliance ${allianceId} — TAX records in recent window: ${total}`
-        : `Alliance ${allianceId} — ALL records in recent window: ${total}`;
-
-    let body = "```\n" + lines.join("\n") + "\n```";
-    if (total > maxLines) {
-      body += `\n(+${total - maxLines} more not shown)`;
-    }
-    await i.editReply(`${header}\n${body}`);
-  } catch (err: any) {
-    console.error("[/pnw_bankpeek] error:", err);
-    await i.editReply(`❌ ${err?.message ?? String(err)}`);
+  if (!k) {
+    return i.editReply("❌ No stored API key. Run /pnw_set first (and ensure GT_SECRET matches).");
   }
+
+  // Decrypt (your open() helper lives in lib/crypto in your repo)
+  // If your code stores plaintext, replace the next 3 lines with reading the string.
+  const { open } = await import("../lib/crypto.js");
+  const apiKey = open(k.encryptedApiKey as any, k.nonceApi as any);
+  if (!apiKey) return i.editReply("❌ Failed to decrypt API key. Check GT_SECRET/ENCRYPTION_KEY.");
+
+  // Fetch
+  let rows: BankrecRow[] = [];
+  try {
+    const res = await fetchBankrecs({ apiKey }, [allianceId], limit);
+    rows = res[0]?.bankrecs ?? [];
+  } catch (err: any) {
+    return i.editReply(`❌ Fetch failed: ${err?.message || String(err)}`);
+  }
+
+  // Optional filter by note text
+  if (filter) {
+    rows = rows.filter(r => (r.note || "").toLowerCase().includes(filter));
+  }
+
+  if (!rows.length) {
+    return i.editReply(`(filter=${filter || "none"}) No rows found in the recent window.`);
+  }
+
+  // Format safely under Discord's 2000-char limit
+  const lines = rows.map(r => {
+    const dir = `${r.sender_type}→${r.receiver_type}`;
+    const money = Number(r.money || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
+    const note = (r.note || "").replace(/\s+/g, " ").slice(0, 100);
+    return `#${r.id} | ${r.date} | ${dir} | $${money} | ${note}`;
+  });
+
+  let out = lines.join("\n");
+  if (out.length > 1800) {
+    // trim from the end
+    let n = lines.length;
+    while (out.length > 1800 && n > 1) {
+      n--;
+      out = lines.slice(0, n).join("\n") + `\n…(${lines.length - n} more)`;
+    }
+  }
+
+  await i.editReply("```\n" + out + "\n```");
 }
