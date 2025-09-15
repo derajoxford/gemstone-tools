@@ -34,6 +34,21 @@ export type ResourceDelta = Record<ResourceKey, number>;
 
 const PNW_GQL_ENDPOINT = "https://api.politicsandwar.com/graphql";
 
+/** 15s fetch timeout helper */
+function withTimeout(signal: AbortSignal | undefined, ms = 15000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(new Error(`Timeout after ${ms}ms`)), ms);
+  const onAbort = () => ctrl.abort(new Error("Upstream aborted"));
+  signal?.addEventListener("abort", onAbort);
+  return {
+    signal: ctrl.signal,
+    done: () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    },
+  };
+}
+
 export async function getAllianceApiKey(prisma: PrismaClient, allianceId: number): Promise<string> {
   const k = await prisma.allianceKey.findFirst({ where: { allianceId }, orderBy: { id: "desc" } });
   if (!k) throw new Error(`No saved API key for alliance ${allianceId}`);
@@ -42,16 +57,38 @@ export async function getAllianceApiKey(prisma: PrismaClient, allianceId: number
   return token;
 }
 
-export async function gqlFetch<T = any>(token: string, query: string, variables: Record<string, any>): Promise<T> {
-  const res = await fetch(PNW_GQL_ENDPOINT, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ query, variables }),
-  });
-  if (!res.ok) throw new Error(`PnW GraphQL HTTP ${res.status}: ${await res.text().catch(() => "")}`);
-  const json = (await res.json()) as any;
-  if (json.errors?.length) throw new Error(`PnW GraphQL error(s): ${json.errors.map((e: any) => e.message).join("; ")}`);
-  return json.data as T;
+export async function gqlFetch<T = any>(
+  token: string,
+  query: string,
+  variables: Record<string, any>,
+  opts?: { timeoutMs?: number }
+): Promise<T> {
+  const { signal, done } = withTimeout(undefined, opts?.timeoutMs ?? 15000);
+  try {
+    const res = await fetch(PNW_GQL_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ query, variables }),
+      signal,
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      throw new Error(`PnW GraphQL HTTP ${res.status} ${res.statusText}: ${text?.slice(0, 500)}`);
+    }
+    let json: any;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      throw new Error(`PnW GraphQL returned non-JSON body: ${text?.slice(0, 240)}`);
+    }
+    if (json.errors?.length) {
+      const msgs = json.errors.map((e: any) => e?.message ?? "Unknown error").join("; ");
+      throw new Error(`PnW GraphQL error(s): ${msgs}`);
+    }
+    return json.data as T;
+  } finally {
+    done();
+  }
 }
 
 const BANKRECS_QUERY = /* GraphQL */ `
@@ -97,7 +134,7 @@ export async function fetchBankrecsSince(
   while (true) {
     safety++; if (safety > Math.ceil(hardCap / pageSize)) break;
 
-    const data = await gqlFetch<any>(token, BANKRECS_QUERY, { allianceId, limit: pageSize, cursorId: localCursor || 0 });
+    const data = await gqlFetch<any>(token, BANKRECS_QUERY, { allianceId, limit: pageSize, cursorId: localCursor || 0 }, { timeoutMs: 15000 });
     const nodes: Bankrec[] = data?.bankrecs?.nodes ?? data?.bankrecs ?? [];
 
     const batch = nodes.filter((r) => r && typeof r.id === "number" && r.id > (sinceId ?? 0) && (r.tax_id ?? 0) > 0);
