@@ -11,7 +11,6 @@ export class PnwGqlError extends Error {
   }
 }
 
-// Minimal shape we actually use
 export interface BankrecRow {
   id: number;
   date: string;
@@ -48,7 +47,6 @@ async function gql<T>(
       headers: {
         "Content-Type": "application/json",
         "Accept": "application/json",
-        // Some infra wants it in the header too
         "X-Api-Key": apiKey,
       },
       body: JSON.stringify({ query, variables }),
@@ -73,7 +71,6 @@ async function gql<T>(
   throw new PnwGqlError(500, null, "PnW GraphQL retry exhaustion");
 }
 
-/** Normalize numeric columns to numbers (API sometimes returns strings). */
 function coerceRows(rows: any[]): BankrecRow[] {
   return (rows || []).map((r: any) => ({
     ...r,
@@ -99,9 +96,11 @@ function coerceRows(rows: any[]): BankrecRow[] {
 }
 
 /**
- * Fetch alliance bankrecs via GraphQL in a way that tolerates schema variants.
- * 1) Try `alliances(id: $id) { ... }`     (array-of-Alliance variant)
- * 2) Try `alliances(id: $id, first: 1) { data { ... } }` (paginator variant)
+ * Try multiple schema shapes:
+ *   A) alliances(id: [Int!]) -> [Alliance]
+ *   B) alliances(id: [Int!], first: 1) -> { data: [Alliance] }
+ *   C) alliances(ids: [Int!]) -> [Alliance]               (some shards)
+ *   D) alliance(id: Int!) -> Alliance                     (legacy; may not exist)
  */
 export async function fetchAllianceBankrecsViaGQL(
   apiKey: string,
@@ -109,106 +108,131 @@ export async function fetchAllianceBankrecsViaGQL(
   opts: { limit?: number } = {}
 ): Promise<BankrecRow[]> {
   const limit = Math.max(1, Math.min(1000, opts.limit ?? 200));
+  const ids = [Number(allianceId)];
 
-  // Variant 1: alliances(id) -> [Alliance]
-  const Q1 = `
-    query BankrecsV1($id: Int!, $limit: Int!) {
-      alliances(id: $id) {
-        id
-        bankrecs(limit: $limit) {
-          id
-          date
-          sender_type
-          sender_id
-          receiver_type
-          receiver_id
-          note
-          money
-          food
-          coal
-          oil
-          uranium
-          lead
-          iron
-          bauxite
-          gasoline
-          munitions
-          steel
-          aluminum
-        }
+  const FIELDS = `
+    id
+    bankrecs(limit: $limit) {
+      id
+      date
+      sender_type
+      sender_id
+      receiver_type
+      receiver_id
+      note
+      money
+      food
+      coal
+      oil
+      uranium
+      lead
+      iron
+      bauxite
+      gasoline
+      munitions
+      steel
+      aluminum
+    }
+  `;
+
+  const Q_A = `
+    query Bankrecs_A($ids: [Int!]!, $limit: Int!) {
+      alliances(id: $ids) {
+        ${FIELDS}
+      }
+    }
+  `;
+  const Q_B = `
+    query Bankrecs_B($ids: [Int!]!, $limit: Int!) {
+      alliances(id: $ids, first: 1) {
+        data { ${FIELDS} }
+      }
+    }
+  `;
+  const Q_C = `
+    query Bankrecs_C($ids: [Int!]!, $limit: Int!) {
+      alliances(ids: $ids) {
+        ${FIELDS}
+      }
+    }
+  `;
+  const Q_D = `
+    query Bankrecs_D($id: Int!, $limit: Int!) {
+      alliance(id: $id) {
+        ${FIELDS}
       }
     }
   `;
 
-  // Variant 2: alliances(id, first: 1) -> { data: [Alliance] }
-  const Q2 = `
-    query BankrecsV2($id: Int!, $limit: Int!) {
-      alliances(id: $id, first: 1) {
-        data {
-          id
-          bankrecs(limit: $limit) {
-            id
-            date
-            sender_type
-            sender_id
-            receiver_type
-            receiver_id
-            note
-            money
-            food
-            coal
-            oil
-            uranium
-            lead
-            iron
-            bauxite
-            gasoline
-            munitions
-            steel
-            aluminum
-          }
-        }
-      }
-    }
-  `;
+  // Helper to decide if an error is a schema/shape mismatch (safe to fall back)
+  const isShapeError = (e: any) => {
+    const m = String(e?.message || "");
+    return (
+      m.includes('Cannot query field "alliances"') ||
+      m.includes('Cannot query field "alliance"') ||
+      m.includes('Cannot query field "bankrecs" on type "AlliancePaginator"') ||
+      m.includes('Cannot query field "id" on type "AlliancePaginator"') ||
+      m.includes('Unknown argument "ids" on field "alliances"') ||
+      m.includes('Unknown argument "id" on field "alliances"') ||
+      m.includes('Variable "$id" of type "Int!" used in position expecting type "[Int]"') ||
+      m.includes('Unknown argument "first" on field "alliances"') ||
+      m.includes('Cannot query field "data" on type "Alliance"') ||
+      m.includes('Cannot query field "alliances" on type "Query". Did you mean "alliance"') ||
+      m.includes('Did you mean "alliances"')
+    );
+  };
 
-  // Try V1
+  // A) alliances(id: [Int!]) -> [Alliance]
   try {
-    type R1 = { alliances: Array<{ id: number; bankrecs: any[] }> | null };
-    const d1 = await gql<R1>(apiKey, Q1, { id: allianceId, limit });
-    const arr = (d1?.alliances ?? []) as Array<any>;
+    type R = { alliances: Array<{ id: number; bankrecs: any[] }> | null };
+    const d = await gql<R>(apiKey, Q_A, { ids, limit });
+    const arr = d?.alliances ?? [];
     const first = Array.isArray(arr) ? arr[0] : null;
     if (first && first.bankrecs) return coerceRows(first.bankrecs);
-    // If alliances exists but empty, just return [] (no error)
     if (Array.isArray(arr) && arr.length === 0) return [];
-    // Fallthrough to try V2
   } catch (e: any) {
-    const msg = String(e?.message || "");
-    // Only swallow errors that indicate a shape mismatch; rethrow hard errors
-    const shapeErr =
-      msg.includes('Cannot query field "alliances"') ||
-      msg.includes('Unknown argument "id" on field "alliances"') ||
-      msg.includes('Cannot query field "bankrecs" on type "AlliancePaginator"') ||
-      msg.includes('Cannot query field "id" on type "AlliancePaginator"') ||
-      msg.includes('Unknown argument "ids" on field "alliances"');
-    if (!shapeErr) throw e;
+    if (!isShapeError(e)) throw e;
   }
 
-  // Try V2
+  // B) alliances(id: [Int!], first: 1) -> { data: [Alliance] }
   try {
-    type R2 = { alliances: { data: Array<{ id: number; bankrecs: any[] }> } | null };
-    const d2 = await gql<R2>(apiKey, Q2, { id: allianceId, limit });
-    const arr = d2?.alliances?.data ?? [];
+    type R = { alliances: { data: Array<{ id: number; bankrecs: any[] }> } | null };
+    const d = await gql<R>(apiKey, Q_B, { ids, limit });
+    const arr = d?.alliances?.data ?? [];
     const first = Array.isArray(arr) ? arr[0] : null;
     if (first && first.bankrecs) return coerceRows(first.bankrecs);
-    return [];
+    if (Array.isArray(arr) && arr.length === 0) return [];
   } catch (e: any) {
-    // If this also fails, bubble it up
-    throw e;
+    if (!isShapeError(e)) throw e;
   }
+
+  // C) alliances(ids: [Int!]) -> [Alliance]
+  try {
+    type R = { alliances: Array<{ id: number; bankrecs: any[] }> | null };
+    const d = await gql<R>(apiKey, Q_C, { ids, limit });
+    const arr = d?.alliances ?? [];
+    const first = Array.isArray(arr) ? arr[0] : null;
+    if (first && first.bankrecs) return coerceRows(first.bankrecs);
+    if (Array.isArray(arr) && arr.length === 0) return [];
+  } catch (e: any) {
+    if (!isShapeError(e)) throw e;
+  }
+
+  // D) legacy: alliance(id: Int!)
+  try {
+    type R = { alliance: { id: number; bankrecs: any[] } | null };
+    const d = await gql<R>(apiKey, Q_D, { id: Number(allianceId), limit });
+    const a = d?.alliance;
+    if (a && a.bankrecs) return coerceRows(a.bankrecs);
+  } catch (e: any) {
+    if (!isShapeError(e)) throw e;
+  }
+
+  // Nothing matched; return empty
+  return [];
 }
 
-/** Heuristic: is this bankrec a tax credit into the alliance? */
+/** Heuristic: likely a tax credit into the alliance bank. */
 export function isLikelyTaxRow(r: BankrecRow, allianceId: number): boolean {
   const n = (r.note || "").toLowerCase();
   const noteLooksTax = n.includes("automated tax") || n.includes(" tax ") || n.startsWith("tax");
