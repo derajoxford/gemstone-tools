@@ -1,47 +1,14 @@
 // src/lib/pnw.ts
-// Politics & War GraphQL helpers (uses Node 18+ global fetch)
-
-export class PnwGqlError extends Error {
-  status: number;
-  body: any;
-  constructor(status: number, body: any, message: string) {
-    super(message);
-    this.status = status;
-    this.body = body;
-  }
-}
-
-type Vars = Record<string, any>;
-
-export async function gql<T = any>(
-  apiKey: string,
-  query: string,
-  variables: Vars
-): Promise<T> {
-  const url = "https://api.politicsandwar.com/graphql?api_key=" + encodeURIComponent(apiKey);
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Api-Key": apiKey },
-    body: JSON.stringify({ query, variables }),
-  });
-
-  let body: any = null;
-  try { body = await res.json(); } catch { body = null; }
-
-  if (!res.ok || (body && body.errors)) {
-    const msg = `PnW GraphQL error (status ${res.status}): ${JSON.stringify(body?.errors ?? body)}`;
-    throw new PnwGqlError(res.status, body, msg);
-  }
-  return body.data as T;
-}
+// Minimal PnW GraphQL client + bankrecs helpers.
+// Uses Node 18+/20+ global fetch (no node-fetch import needed).
 
 export type BankrecRow = {
-  id: number | string;
+  id: number;
   date: string;
-  sender_type: number | string;
-  sender_id: number | string;
-  receiver_type: number | string;
-  receiver_id: number | string;
+  sender_type: number;
+  sender_id: number;
+  receiver_type: number;
+  receiver_id: number;
   note?: string | null;
 
   money: number;
@@ -58,84 +25,116 @@ export type BankrecRow = {
   aluminum: number;
 };
 
-function sortDescById(rows: BankrecRow[]): BankrecRow[] {
-  return [...rows].sort((a, b) => Number(b.id) - Number(a.id));
+export class PnwGqlError extends Error {
+  status: number;
+  body: any;
+  constructor(status: number, body: any, msg: string) {
+    super(`PnW GraphQL error (status ${status}): ${msg}`);
+    this.status = status;
+    this.body = body;
+  }
+}
+
+async function gql<T>(
+  apiKey: string,
+  query: string,
+  variables?: Record<string, any>
+): Promise<T> {
+  const url = `https://api.politicsandwar.com/graphql?api_key=${encodeURIComponent(apiKey)}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Api-Key": apiKey },
+    body: JSON.stringify({ query, variables }),
+  });
+
+  let body: any = null;
+  try { body = await res.json(); } catch {
+    throw new PnwGqlError(res.status, null, "Invalid JSON from PnW");
+  }
+
+  if (!res.ok || body?.errors) {
+    const msg = JSON.stringify(body?.errors ?? body ?? {});
+    throw new PnwGqlError(res.status, body, msg);
+  }
+  return body.data as T;
 }
 
 /**
- * Fetch recent alliance bank records. We avoid `orderBy` for schema compatibility
- * and sort locally by id desc. Strategy:
- *   1) Try singular shape:
- *        alliance(id:$id) { bankrecs(limit:$limit) { ... } }
- *   2) Fallback to plural paginator:
- *        alliances(id:[$id]) { data { bankrecs(limit:$limit) { ... } } }
+ * Fetch bankrecs for a single alliance.
+ * IMPORTANT: schema wants a single `alliance(id: Int!)`, and `orderBy` is an array of clauses.
+ * `limit` is max rows (PnW typically caps around ~600).
  */
 export async function fetchAllianceBankrecsViaGQL(
   apiKey: string,
   allianceId: number,
-  opts: { limit?: number } = {}
+  { limit = 200 }: { limit?: number } = {}
 ): Promise<BankrecRow[]> {
-  const LIMIT = Math.max(1, Math.min(1000, opts.limit ?? 200));
-  const vars = { id: allianceId, limit: LIMIT };
-
-  const FIELDS = `
-    id
-    date
-    sender_type
-    sender_id
-    receiver_type
-    receiver_id
-    note
-    money
-    food
-    coal
-    oil
-    uranium
-    lead
-    iron
-    bauxite
-    gasoline
-    munitions
-    steel
-    aluminum
-  `;
-
-  // 1) Singular
-  const Q_SINGULAR = `
-    query AllianceBankrecsSingle($id: Int!, $limit: Int!) {
+  const Q = /* GraphQL */ `
+    query AllianceBankrecs($id: Int!, $limit: Int!) {
       alliance(id: $id) {
         id
-        bankrecs(limit: $limit) {
-          ${FIELDS}
-        }
-      }
-    }
-  `;
-  try {
-    const d1 = await gql<{ alliance?: { id: number, bankrecs: BankrecRow[] } }>(apiKey, Q_SINGULAR, vars);
-    if (Array.isArray(d1?.alliance?.bankrecs)) {
-      return sortDescById(d1.alliance.bankrecs).slice(0, LIMIT);
-    }
-  } catch {
-    // fall through to plural
-  }
-
-  // 2) Plural + paginator
-  const Q_PLURAL = `
-    query AllianceBankrecsPlural($id: Int!, $limit: Int!) {
-      alliances(id: [$id]) {
-        data {
+        bankrecs(
+          limit: $limit,
+          orderBy: [{ column: ID, order: DESC }]
+        ) {
           id
-          bankrecs(limit: $limit) {
-            ${FIELDS}
-          }
+          date
+          sender_type
+          sender_id
+          receiver_type
+          receiver_id
+          note
+          money
+          food
+          coal
+          oil
+          uranium
+          lead
+          iron
+          bauxite
+          gasoline
+          munitions
+          steel
+          aluminum
         }
       }
     }
   `;
-  const d2 = await gql<{ alliances?: { data?: Array<{ id: number, bankrecs: BankrecRow[] }> } }>(apiKey, Q_PLURAL, vars);
-  const list = d2?.alliances?.data ?? [];
-  const a = Array.isArray(list) ? list[0] : undefined;
-  const rows = a?.bankrecs ?? [];
-  return sortDescById(rows).slice(0, LIMIT);
+
+  const data = await gql<{ alliance: { id: number; bankrecs: BankrecRow[] } }>(
+    apiKey,
+    Q,
+    { id: Number(allianceId), limit: Number(limit) }
+  );
+
+  const rows = data?.alliance?.bankrecs ?? [];
+  // Normalize numeric fields
+  for (const r of rows) {
+    for (const k of [
+      "id", "sender_type", "sender_id", "receiver_type", "receiver_id",
+      "money", "food", "coal", "oil", "uranium", "lead", "iron",
+      "bauxite", "gasoline", "munitions", "steel", "aluminum",
+    ] as const) {
+      // @ts-ignore
+      r[k] = Number(r[k] ?? 0);
+    }
+  }
+  return rows;
+}
+
+/**
+ * Back-compat wrapper used by /pnw_bankpeek and older code.
+ * Signature kept intentionally simple: ({apiKey}, [allianceId], limit) -> [{ id, bankrecs: BankrecRow[] }]
+ */
+export async function fetchBankrecs(
+  opts: { apiKey: string },
+  allianceIds: number[],
+  limit = 200
+): Promise<Array<{ id: number; bankrecs: BankrecRow[] }>> {
+  const out: Array<{ id: number; bankrecs: BankrecRow[] }> = [];
+  for (const id of allianceIds) {
+    const rows = await fetchAllianceBankrecsViaGQL(opts.apiKey, id, { limit });
+    out.push({ id, bankrecs: rows });
+  }
+  return out;
 }
