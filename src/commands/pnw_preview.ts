@@ -5,21 +5,19 @@ import {
   PermissionFlagsBits,
 } from "discord.js";
 
+import { previewAllianceTaxCreditsStored } from "../integrations/pnw/tax";
 import { getPnwCursor } from "../utils/pnw_cursor";
 import { resourceEmbed } from "../lib/embeds";
-import { previewAllianceTaxCreditsStored } from "../integrations/pnw/tax";
 
+type ResourceDelta = Record<string, number>;
 function codeBlock(s: string) { return s ? "```\n" + s + "\n```" : "—"; }
-
-function formatDelta(delta: Record<string, number>): string {
+function formatDelta(delta: ResourceDelta): string {
   const keys = Object.keys(delta || {});
   const lines: string[] = [];
   for (const k of keys) {
     const v = Number(delta[k] ?? 0);
     if (!v) continue;
-    const asStr = k === "money"
-      ? v.toLocaleString(undefined, { maximumFractionDigits: 2 })
-      : Math.round(v).toLocaleString();
+    const asStr = k === "money" ? v.toLocaleString(undefined, { maximumFractionDigits: 2 }) : Math.round(v).toLocaleString();
     lines.push(`${k.padEnd(10)} +${asStr}`);
   }
   return lines.join("\n");
@@ -27,49 +25,43 @@ function formatDelta(delta: Record<string, number>): string {
 
 export const data = new SlashCommandBuilder()
   .setName("pnw_preview")
-  .setDescription("Preview automated tax rows (scraped) and show summed delta without applying.")
-  .addIntegerOption(o =>
-    o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
-  )
-  .addIntegerOption(o =>
-    o.setName("limit").setDescription("Max rows to scan (most recent)").setMinValue(1).setMaxValue(2000)
-  )
+  .setDescription("Preview *tax-only* bank records using the stored PnW key.")
+  .addIntegerOption(o => o.setName("alliance_id").setDescription("Alliance ID").setRequired(true))
+  .addIntegerOption(o => o.setName("limit").setDescription("Max rows to scan (default 300, max 500)").setRequired(false))
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .setDMPermission(false);
 
-export async function execute(interaction: ChatInputCommandInteraction) {
-  await interaction.deferReply({ ephemeral: true });
+export async function execute(i: ChatInputCommandInteraction) {
+  await i.deferReply({ ephemeral: true });
   try {
-    const allianceId = interaction.options.getInteger("alliance_id", true)!;
-    const limit = interaction.options.getInteger("limit") ?? null;
+    const allianceId = i.options.getInteger("alliance_id", true)!;
+    const limit = Math.max(1, Math.min(500, i.options.getInteger("limit") ?? 300));
 
-    // Use stored cursor as a timestamp (ms)
-    const lastSeenTs = await getPnwCursor(allianceId).catch(() => 0);
+    const lastSeen = (await getPnwCursor(allianceId)) ?? 0;
+    const preview = await previewAllianceTaxCreditsStored(allianceId, lastSeen, limit);
 
-    const preview = await previewAllianceTaxCreditsStored(allianceId, {
-      lastSeenTs: lastSeenTs || 0,
-      limit: limit ?? undefined,
-    });
-
-    const lines = [
-      `**Alliance:** ${allianceId}`,
-      `**Cursor:** id > ${lastSeenTs || 0}`,
-      limit ? `**Scan limit:** ${limit}` : `**Scan window:** default`,
-      `**Records counted:** ${preview.count}`,
-      `**Newest bankrec id:** ${preview.newestTs ?? "—"}`,
-    ];
-
-    const totalsBlock = formatDelta(preview.delta || {});
     const embed = resourceEmbed({
-      title: "PnW Tax Preview (Stored Key)",
-      subtitle: lines.join("\n"),
-      fields: [{ name: "Tax delta (sum)", value: codeBlock(totalsBlock || ""), inline: false }],
+      title: `PnW Tax Preview (Stored Key)`,
+      subtitle: [
+        `**Alliance:** ${allianceId}`,
+        `**Cursor:** id > ${lastSeen ?? 0}`,
+        `**Scan limit:** ${limit}`,
+        `**Records counted:** ${preview.count}`,
+        `**Newest bankrec id:** ${preview.newestId ?? "—"}`,
+      ].join("\n"),
+      fields: [
+        {
+          name: "Tax delta (sum)",
+          value: codeBlock(formatDelta(preview.delta) || ""),
+          inline: false,
+        },
+      ],
       color: 0x5865f2,
-      footer: "Preview only.",
+      footer: `Preview only.`,
     });
 
-    await interaction.editReply({ embeds: [embed] });
+    await i.editReply({ embeds: [embed] });
   } catch (err: any) {
-    await interaction.editReply(`❌ Failed to preview: ${err?.message || String(err)}`);
+    await i.editReply(`❌ Failed to preview: ${err?.message ?? String(err)}`);
   }
 }
