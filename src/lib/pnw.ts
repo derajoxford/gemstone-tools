@@ -11,7 +11,7 @@ export class PnwGqlError extends Error {
   }
 }
 
-// Minimal Bankrec row shape we actually use
+// Minimal shape we actually use
 export interface BankrecRow {
   id: number;
   date: string;
@@ -47,9 +47,9 @@ async function gql<T>(
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        // pass in header too – some infra likes it this way
-        "X-Api-Key": apiKey,
         "Accept": "application/json",
+        // Some infra wants it in the header too
+        "X-Api-Key": apiKey,
       },
       body: JSON.stringify({ query, variables }),
     });
@@ -57,11 +57,9 @@ async function gql<T>(
     let body: any = null;
     try { body = await res.json(); } catch {}
 
-    // GraphQL puts errors in body.errors with HTTP 200 sometimes
     const hasErrors = !!(body && body.errors && body.errors.length);
     if (!res.ok || hasErrors) {
       const msg = `PnW GraphQL error (status ${res.status}): ${JSON.stringify(body?.errors || body)}`;
-      // retry only on obvious server hiccups
       const transient = res.status >= 500 || (hasErrors && JSON.stringify(body.errors).includes("Internal Server Error"));
       if (transient && attempt < retries) {
         await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
@@ -71,25 +69,51 @@ async function gql<T>(
     }
     return body.data as T;
   }
-  // should never reach
+
   throw new PnwGqlError(500, null, "PnW GraphQL retry exhaustion");
 }
 
+/** Normalize numeric columns to numbers (API sometimes returns strings). */
+function coerceRows(rows: any[]): BankrecRow[] {
+  return (rows || []).map((r: any) => ({
+    ...r,
+    id: Number(r.id),
+    sender_type: Number(r.sender_type),
+    sender_id: Number(r.sender_id),
+    receiver_type: Number(r.receiver_type),
+    receiver_id: Number(r.receiver_id),
+    money: Number(r.money || 0),
+    food: Number(r.food || 0),
+    coal: Number(r.coal || 0),
+    oil: Number(r.oil || 0),
+    uranium: Number(r.uranium || 0),
+    lead: Number(r.lead || 0),
+    iron: Number(r.iron || 0),
+    bauxite: Number(r.bauxite || 0),
+    gasoline: Number(r.gasoline || 0),
+    munitions: Number(r.munitions || 0),
+    steel: Number(r.steel || 0),
+    aluminum: Number(r.aluminum || 0),
+    note: r.note ?? null,
+  }));
+}
+
 /**
- * Fetch alliance bankrecs via GraphQL (simple, stable shape).
- * Uses the *singular* alliance(id: Int!) field and the bankrecs(limit: Int!) list.
- * No paginator/ordering shenanigans — we rely on API defaults.
+ * Fetch alliance bankrecs via GraphQL in a way that tolerates schema variants.
+ * 1) Try `alliances(id: $id) { ... }`     (array-of-Alliance variant)
+ * 2) Try `alliances(id: $id, first: 1) { data { ... } }` (paginator variant)
  */
 export async function fetchAllianceBankrecsViaGQL(
   apiKey: string,
   allianceId: number,
   opts: { limit?: number } = {}
 ): Promise<BankrecRow[]> {
-  const LIMIT = Math.max(1, Math.min(1000, opts.limit ?? 200));
+  const limit = Math.max(1, Math.min(1000, opts.limit ?? 200));
 
-  const Q = `
-    query Bankrecs($id: Int!, $limit: Int!) {
-      alliance(id: $id) {
+  // Variant 1: alliances(id) -> [Alliance]
+  const Q1 = `
+    query BankrecsV1($id: Int!, $limit: Int!) {
+      alliances(id: $id) {
         id
         bankrecs(limit: $limit) {
           id
@@ -116,39 +140,78 @@ export async function fetchAllianceBankrecsViaGQL(
     }
   `;
 
-  type Resp = { alliance: { id: number, bankrecs: BankrecRow[] } | null };
-  const data = await gql<Resp>(apiKey, Q, { id: allianceId, limit: LIMIT });
-  const rows = data?.alliance?.bankrecs ?? [];
-  // coerce numbers
-  return rows.map(r => ({
-    ...r,
-    id: Number(r.id),
-    sender_type: Number(r.sender_type),
-    sender_id: Number(r.sender_id),
-    receiver_type: Number(r.receiver_type),
-    receiver_id: Number(r.receiver_id),
-    money: Number(r.money || 0),
-    food: Number(r.food || 0),
-    coal: Number(r.coal || 0),
-    oil: Number(r.oil || 0),
-    uranium: Number(r.uranium || 0),
-    lead: Number(r.lead || 0),
-    iron: Number(r.iron || 0),
-    bauxite: Number(r.bauxite || 0),
-    gasoline: Number(r.gasoline || 0),
-    munitions: Number(r.munitions || 0),
-    steel: Number(r.steel || 0),
-    aluminum: Number(r.aluminum || 0),
-    note: r.note ?? null,
-  }));
+  // Variant 2: alliances(id, first: 1) -> { data: [Alliance] }
+  const Q2 = `
+    query BankrecsV2($id: Int!, $limit: Int!) {
+      alliances(id: $id, first: 1) {
+        data {
+          id
+          bankrecs(limit: $limit) {
+            id
+            date
+            sender_type
+            sender_id
+            receiver_type
+            receiver_id
+            note
+            money
+            food
+            coal
+            oil
+            uranium
+            lead
+            iron
+            bauxite
+            gasoline
+            munitions
+            steel
+            aluminum
+          }
+        }
+      }
+    }
+  `;
+
+  // Try V1
+  try {
+    type R1 = { alliances: Array<{ id: number; bankrecs: any[] }> | null };
+    const d1 = await gql<R1>(apiKey, Q1, { id: allianceId, limit });
+    const arr = (d1?.alliances ?? []) as Array<any>;
+    const first = Array.isArray(arr) ? arr[0] : null;
+    if (first && first.bankrecs) return coerceRows(first.bankrecs);
+    // If alliances exists but empty, just return [] (no error)
+    if (Array.isArray(arr) && arr.length === 0) return [];
+    // Fallthrough to try V2
+  } catch (e: any) {
+    const msg = String(e?.message || "");
+    // Only swallow errors that indicate a shape mismatch; rethrow hard errors
+    const shapeErr =
+      msg.includes('Cannot query field "alliances"') ||
+      msg.includes('Unknown argument "id" on field "alliances"') ||
+      msg.includes('Cannot query field "bankrecs" on type "AlliancePaginator"') ||
+      msg.includes('Cannot query field "id" on type "AlliancePaginator"') ||
+      msg.includes('Unknown argument "ids" on field "alliances"');
+    if (!shapeErr) throw e;
+  }
+
+  // Try V2
+  try {
+    type R2 = { alliances: { data: Array<{ id: number; bankrecs: any[] }> } | null };
+    const d2 = await gql<R2>(apiKey, Q2, { id: allianceId, limit });
+    const arr = d2?.alliances?.data ?? [];
+    const first = Array.isArray(arr) ? arr[0] : null;
+    if (first && first.bankrecs) return coerceRows(first.bankrecs);
+    return [];
+  } catch (e: any) {
+    // If this also fails, bubble it up
+    throw e;
+  }
 }
 
 /** Heuristic: is this bankrec a tax credit into the alliance? */
 export function isLikelyTaxRow(r: BankrecRow, allianceId: number): boolean {
-  // Classic automated tax note; keep case-insensitive match
   const n = (r.note || "").toLowerCase();
-  const noteLooksTax = n.includes("automated tax") || n.includes("tax ");
-  // nation -> alliance + positive resources
+  const noteLooksTax = n.includes("automated tax") || n.includes(" tax ") || n.startsWith("tax");
   const flowLooksTax = r.sender_type === 1 && r.receiver_type === 2 && r.receiver_id === allianceId;
   return noteLooksTax && flowLooksTax;
 }
