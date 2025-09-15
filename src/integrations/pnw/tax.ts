@@ -1,95 +1,59 @@
 // src/integrations/pnw/tax.ts
 import { PrismaClient } from "@prisma/client";
-import { open } from "../../lib/crypto.js";
-import {
-  fetchAllianceBankrecsViaGQL,
-  type BankrecRow,
-} from "../../lib/pnw.js";
+import * as cryptoMod from "../../lib/crypto.js";
+import { fetchAllianceBankrecsViaGQL, BankrecRow } from "../../lib/pnw";
 
 const prisma = new PrismaClient();
+const open = (cryptoMod as any).open as (cipher: string, nonce: string) => string;
 
-const RESOURCE_KEYS: (keyof BankrecRow)[] = [
-  "money",
-  "food",
-  "coal",
-  "oil",
-  "uranium",
-  "lead",
-  "iron",
-  "bauxite",
-  "gasoline",
-  "munitions",
-  "steel",
-  "aluminum",
-];
+export type ResourceDelta = Record<string, number>;
 
-// Looser, practical tax heuristic:
-// Nation (1) -> Alliance (2) to our alliance, unless the note clearly opts out.
-// Still matches explicit labels if they exist.
-export function isTaxBankrec(row: BankrecRow, allianceId: number): boolean {
-  const note = (row.note || "").toLowerCase();
-  const explicit =
-    /automated\s*tax|bank\s*tax|tax\s*(deposit|payment)/i.test(row.note || "");
+const RES_KEYS = [
+  "money","food","coal","oil","uranium","lead","iron","bauxite",
+  "gasoline","munitions","steel","aluminum",
+] as const;
 
-  const inboundNationToAlliance =
-    row.sender_type === 1 &&
-    row.receiver_type === 2 &&
-    row.receiver_id === allianceId;
-
-  // obvious opt-outs
-  const ignore = /#ignore|safe\s*keep|safekeep|loan|reimburse|gift/i.test(note);
-
-  return (explicit || inboundNationToAlliance) && !ignore;
+function isTaxRow(r: BankrecRow): boolean {
+  return r.tax_id != null && Number(r.tax_id) > 0;
 }
 
-function sumDelta(rows: BankrecRow[]) {
-  const out: Record<string, number> = {};
-  for (const k of RESOURCE_KEYS) out[k as string] = 0;
-
-  for (const r of rows) {
-    for (const k of RESOURCE_KEYS) {
-      const v = Number((r as any)[k] ?? 0);
-      if (!Number.isFinite(v) || v === 0) continue;
-      out[k as string] = (out[k as string] ?? 0) + v;
-    }
+function addDelta(dst: ResourceDelta, src: Partial<ResourceDelta>) {
+  for (const k of RES_KEYS) {
+    const v = Number((src as any)[k] ?? 0);
+    if (!v) continue;
+    dst[k] = Number(dst[k] ?? 0) + v;
   }
-  // prune zeros
-  for (const k of Object.keys(out)) {
-    if (!out[k]) delete out[k];
-  }
-  return out;
-}
-
-async function getStoredApiKey(allianceId: number): Promise<string> {
-  const k = await prisma.allianceKey.findFirst({
-    where: { allianceId },
-    orderBy: { id: "desc" },
-  });
-  if (!k) throw new Error("No stored API key. Run /pnw_set first.");
-  return open(k.encryptedApiKey, k.nonceApi);
 }
 
 export async function previewAllianceTaxCreditsStored(
   allianceId: number,
   lastSeenId: number = 0,
-  limit: number = 200
-): Promise<{ count: number; newestId: number | null; delta: Record<string, number> }> {
-  const apiKey = await getStoredApiKey(allianceId);
-  const rows = await fetchAllianceBankrecsViaGQL(apiKey, allianceId, {
-    limit: Math.max(1, Math.min(limit || 200, 500)),
+  limit: number = 300
+): Promise<{ count: number; newestId: number | null; delta: ResourceDelta; rows: BankrecRow[] }> {
+  const keyRow = await prisma.allianceKey.findFirst({
+    where: { allianceId },
+    orderBy: { id: "desc" },
   });
+  if (!keyRow) throw new Error(`No stored API key for alliance ${allianceId}. Run /pnw_set first.`);
 
-  // Only rows newer than our cursor
-  const newer = rows.filter((r) => typeof r.id === "number" && r.id > (lastSeenId || 0));
+  const apiKey = open(keyRow.encryptedApiKey, keyRow.nonceApi);
 
-  // Tax rows by heuristic
-  const taxRows = newer.filter((r) => isTaxBankrec(r, allianceId));
+  const rows = await fetchAllianceBankrecsViaGQL(apiKey, allianceId, { limit: Math.max(1, Math.min(500, limit)) });
 
-  const count = taxRows.length;
-  const newestId =
-    taxRows.length > 0 ? taxRows.reduce((m, r) => (r.id > m ? r.id : m), taxRows[0].id) : null;
+  // keep only tax rows newer than cursor
+  const filtered = rows.filter(r => isTaxRow(r) && (!lastSeenId || r.id > lastSeenId));
 
-  const delta = sumDelta(taxRows);
+  const delta: ResourceDelta = {};
+  for (const r of filtered) {
+    addDelta(delta, r as any);
+  }
 
-  return { count, newestId, delta };
+  const newestId = filtered.length ? Math.max(...filtered.map(r => r.id)) : null;
+
+  return {
+    count: filtered.length,
+    newestId,
+    delta,
+    rows: filtered,
+  };
 }
