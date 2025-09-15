@@ -1,57 +1,46 @@
-// src/utils/treasury.ts
-import { promises as fs } from "fs";
-import path from "path";
+import { PrismaClient } from "@prisma/client";
+import { ResourceDelta, RESOURCE_KEYS } from "../lib/pnw.js";
 
-const DATA_DIR = path.join(process.cwd(), "var");
-const FILE = path.join(DATA_DIR, "treasury.json");
-
-export type Treasury = Record<string, number>; // resource -> amount
-type DbShape = Record<string, Treasury>;       // allianceId -> treasury
-
-async function readDb(): Promise<DbShape> {
-  try {
-    const text = await fs.readFile(FILE, "utf8");
-    const json = JSON.parse(text);
-    return (json && typeof json === "object") ? json as DbShape : {};
-  } catch (err: any) {
-    if (err?.code === "ENOENT") return {};
-    throw err;
+/**
+ * Fetches (or initializes) the AllianceTreasury row for an alliance.
+ * Assumes the schema has a JSON field `balances` holding resource totals.
+ */
+export async function getTreasury(
+  prisma: PrismaClient,
+  allianceId: number
+): Promise<{ id: number; allianceId: number; balances: Record<string, number> }> {
+  let t = await prisma.allianceTreasury.findUnique({ where: { allianceId } });
+  if (!t) {
+    t = await prisma.allianceTreasury.create({
+      data: { allianceId, balances: {} },
+    });
   }
-}
-
-async function writeDb(db: DbShape): Promise<void> {
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  await fs.writeFile(FILE, JSON.stringify(db, null, 2), "utf8");
-}
-
-function addInto(base: Treasury, delta: Treasury): Treasury {
-  const out: Treasury = { ...base };
-  for (const [k, v] of Object.entries(delta)) {
-    const n = Number(v || 0);
-    if (!n) continue;
-    out[k] = Number(out[k] || 0) + n;
-  }
-  return out;
-}
-
-export async function getTreasury(allianceId: number): Promise<Treasury> {
-  const db = await readDb();
-  return db[String(allianceId)] ?? {};
+  // Ensure all keys exist
+  const b = { ...(t.balances || {}) };
+  for (const k of RESOURCE_KEYS) if (typeof b[k] !== "number") b[k] = 0;
+  return { id: t.id, allianceId: t.allianceId, balances: b };
 }
 
 /**
- * Merge delta into alliance treasury and persist.
- * Optional 'meta' is ignored here but kept for API compatibility with callers.
+ * Adds a signed delta to the treasury balances and writes it back.
+ * Optionally you could log a TreasuryEvent row here as well.
  */
 export async function addToTreasury(
+  prisma: PrismaClient,
   allianceId: number,
-  delta: Treasury,
-  _meta?: any,
-): Promise<Treasury> {
-  const db = await readDb();
-  const cur = db[String(allianceId)] ?? {};
-  const next = addInto(cur, delta);
-  db[String(allianceId)] = next;
-  await writeDb(db);
-  return next;
+  delta: ResourceDelta,
+  note?: string
+) {
+  const t = await getTreasury(prisma, allianceId);
+  const next = { ...t.balances };
+  for (const k of RESOURCE_KEYS) {
+    next[k] = Number(next[k] || 0) + Number(delta[k] || 0);
+  }
+  await prisma.allianceTreasury.update({
+    where: { allianceId },
+    data: { balances: next },
+  });
+
+  // Optional: write a simple audit row if you have a model for it.
+  // await prisma.treasuryEvent.create({ data: { allianceId, delta, note: note ?? null } });
 }
