@@ -1,6 +1,6 @@
 // src/lib/pnw.ts
 import { PrismaClient } from "@prisma/client";
-import * as cryptoMod from "./crypto.js";  // <<< correct path
+import * as cryptoMod from "./crypto.js"; // correct relative path in src/lib
 const open = (cryptoMod as any).open as (cipher: string, nonce: string) => string;
 
 export type Bankrec = {
@@ -77,6 +77,11 @@ const BANKRECS_QUERY = /* GraphQL */ `
   }
 `;
 
+/**
+ * Fetch bankrecs that involve the alliance, then locally enforce:
+ *  - id > sinceId
+ *  - tax_id > 0   (strict tax-only)
+ */
 export async function fetchBankrecsSince(
   prisma: PrismaClient,
   allianceId: number,
@@ -110,7 +115,7 @@ export async function fetchBankrecsSince(
 
 export function signedDeltaFor(allianceId: number, rec: Bankrec): ResourceDelta {
   const isReceive = rec.receiver_type === "alliance" && Number(rec.receiver_id) === Number(allianceId);
-  const isSend = rec.sender_type === "alliance" && Number(rec.sender_id) === Number(allianceId);
+  const isSend    = rec.sender_type   === "alliance" && Number(rec.sender_id)   === Number(allianceId);
   const sign = isReceive ? 1 : isSend ? -1 : 0;
   const out = {} as ResourceDelta;
   for (const k of RESOURCE_KEYS) out[k] = sign * Number((rec as any)[k] || 0);
@@ -118,8 +123,16 @@ export function signedDeltaFor(allianceId: number, rec: Bankrec): ResourceDelta 
 }
 
 export function sumDelta(a: ResourceDelta, b: ResourceDelta): ResourceDelta {
-  const out = {} as ResourceDelta; for (const k of RESOURCE_KEYS) out[k] = Number(a[k] || 0) + Number(b[k] || 0); return out;
+  const out = {} as ResourceDelta;
+  for (const k of RESOURCE_KEYS) out[k] = Number(a[k] || 0) + Number(b[k] || 0);
+  return out;
 }
 export function zeroDelta(): ResourceDelta {
-  const out = {} as ResourceDelta; for (const k of RESOURCE_KEYS) out[k] = 0; return out;
+  const out = {} as ResourceDelta;
+  for (const k of RESOURCE_KEYS) out[k] = 0;
+  return out;
 }
+
+/* ---------- Back-compat named exports (aliases expected elsewhere) ---------- */
+export const fetchAllianceBankrecsViaGQL = fetchBankrecsSince; // used by pnw_tax_ids.ts
+export const fetchBankrecs = fetchBankrecsSince;               // used by index.ts
