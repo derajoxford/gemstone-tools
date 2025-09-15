@@ -1,86 +1,53 @@
-// src/integrations/pnw/tax.ts
+// src/commands/pnw_bankpeek.ts
+import {
+  SlashCommandBuilder,
+  ChatInputCommandInteraction,
+  PermissionFlagsBits,
+} from "discord.js";
 import { PrismaClient } from "@prisma/client";
-import { open } from "../../lib/crypto.js";
+import { open } from "../lib/crypto.js";
 import {
   fetchAllianceBankrecsViaGQL,
   type BankrecRow,
-} from "../../lib/pnw.js";
+} from "../lib/pnw.js";
+import { isTaxBankrec } from "../integrations/pnw/tax.js";
 
 const prisma = new PrismaClient();
 
-const RESOURCE_KEYS: (keyof BankrecRow)[] = [
-  "money",
-  "food",
-  "coal",
-  "oil",
-  "uranium",
-  "lead",
-  "iron",
-  "bauxite",
-  "gasoline",
-  "munitions",
-  "steel",
-  "aluminum",
-];
+// Show up to this many rows in the message body (avoid Discord length issues)
+const SHOW_MAX = 15;
 
-// Strict, low-false-positive tax detector:
-//  • must be Nation(1) -> Alliance(2) to *this* alliance
-//  • note must explicitly indicate tax (Automated/Bank/Tax Deposit/etc)
-//  • allow an env override of acceptable phrases via PNW_TAX_NOTE_REGEX (JS regex)
-const DEFAULT_TAX_NOTE_RE = /automated\s*tax|bank\s*tax|tax\s*(deposit|payment|credit|collection|collected)/i;
-
-function taxNoteRegex(): RegExp {
-  const raw = process.env.PNW_TAX_NOTE_REGEX?.trim();
-  if (!raw) return DEFAULT_TAX_NOTE_RE;
-  try {
-    // Accept formats like: "(auto.*tax|bank tax)/i" or just "auto.*tax"
-    const m = raw.match(/^\/(.+)\/([gimsuy]*)$/);
-    if (m) return new RegExp(m[1], m[2]);
-    return new RegExp(raw, "i");
-  } catch {
-    return DEFAULT_TAX_NOTE_RE;
-  }
+function fmtNum(n: number) {
+  return Number(n).toLocaleString(undefined);
 }
 
-export function isTaxBankrec(row: BankrecRow, allianceId: number): boolean {
-  // must be nation -> alliance (this alliance)
-  if (
-    !(row.sender_type === 1 &&
-      row.receiver_type === 2 &&
-      row.receiver_id === allianceId)
-  ) return false;
-
-  // explicit tax phrasing in the note
-  const note = (row.note || "").trim();
-  if (!note) return false;
-
-  if (!taxNoteRegex().test(note)) return false;
-
-  // explicit opt-outs just in case
-  const ignore = /#ignore|safe\s*keep|safekeep|loan|reimburse|gift|manual\s*deposit/i.test(
-    note.toLowerCase(),
-  );
-  if (ignore) return false;
-
-  return true;
+function fmtDate(iso: string) {
+  // Rely on server TZ; if you prefer UTC, use new Date(iso).toUTCString()
+  return new Date(iso).toLocaleString();
 }
 
-function sumDelta(rows: BankrecRow[]) {
-  const out: Record<string, number> = {};
-  for (const k of RESOURCE_KEYS) out[k as string] = 0;
-
-  for (const r of rows) {
-    for (const k of RESOURCE_KEYS) {
-      const v = Number((r as any)[k] ?? 0);
-      if (!Number.isFinite(v) || v === 0) continue;
-      out[k as string] = (out[k as string] ?? 0) + v;
-    }
+function rowResources(r: BankrecRow): string {
+  const keys: (keyof BankrecRow)[] = [
+    "money",
+    "food",
+    "coal",
+    "oil",
+    "uranium",
+    "lead",
+    "iron",
+    "bauxite",
+    "gasoline",
+    "munitions",
+    "steel",
+    "aluminum",
+  ];
+  const parts: string[] = [];
+  for (const k of keys) {
+    const v = Number(r[k] ?? 0);
+    if (!v) continue;
+    parts.push(`${k}:${fmtNum(v)}`);
   }
-  // prune zeros
-  for (const k of Object.keys(out)) {
-    if (!out[k]) delete out[k];
-  }
-  return out;
+  return parts.join(" · ") || "—";
 }
 
 async function getStoredApiKey(allianceId: number): Promise<string> {
@@ -92,24 +59,77 @@ async function getStoredApiKey(allianceId: number): Promise<string> {
   return open(k.encryptedApiKey, k.nonceApi);
 }
 
-export async function previewAllianceTaxCreditsStored(
-  allianceId: number,
-  lastSeenId: number = 0,
-  limit: number = 200
-): Promise<{ count: number; newestId: number | null; delta: Record<string, number> }> {
-  const apiKey = await getStoredApiKey(allianceId);
-  const rows = await fetchAllianceBankrecsViaGQL(apiKey, allianceId, {
-    limit: Math.max(1, Math.min(limit || 200, 500)),
-  });
+export const data = new SlashCommandBuilder()
+  .setName("pnw_bankpeek")
+  .setDescription("Debug: fetch recent bankrecs from PnW GQL for an alliance")
+  // Required options MUST come before any optional (Discord rule)
+  .addIntegerOption((o) =>
+    o.setName("alliance_id").setDescription("Alliance ID").setRequired(true),
+  )
+  .addIntegerOption((o) =>
+    o
+      .setName("limit")
+      .setDescription("Rows to fetch (default 100, max 500)")
+      .setRequired(false),
+  )
+  .addStringOption((o) =>
+    o
+      .setName("filter")
+      .setDescription("Optional filter")
+      .setRequired(false)
+      .addChoices({ name: "tax", value: "tax" }),
+  )
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+  .setDMPermission(false);
 
-  const newer = rows.filter((r) => typeof r.id === "number" && r.id > (lastSeenId || 0));
-  const taxRows = newer.filter((r) => isTaxBankrec(r, allianceId));
+export async function execute(interaction: ChatInputCommandInteraction) {
+  // Always defer immediately to avoid the 3s interaction timeout
+  await interaction.deferReply({ ephemeral: true });
 
-  const count = taxRows.length;
-  const newestId =
-    taxRows.length > 0 ? taxRows.reduce((m, r) => (r.id > m ? r.id : m), taxRows[0].id) : null;
+  try {
+    const allianceId = interaction.options.getInteger("alliance_id", true)!;
+    const limitOpt = interaction.options.getInteger("limit") ?? 100;
+    const filter = (interaction.options.getString("filter") || "").toLowerCase();
 
-  const delta = sumDelta(taxRows);
+    const limit = Math.max(1, Math.min(limitOpt, 500));
+    const apiKey = await getStoredApiKey(allianceId);
 
-  return { count, newestId, delta };
+    const rows = await fetchAllianceBankrecsViaGQL(apiKey, allianceId, { limit });
+
+    let shown = rows;
+    if (filter === "tax") {
+      shown = rows.filter((r) => isTaxBankrec(r, allianceId));
+    }
+
+    const header =
+      filter === "tax"
+        ? `Bankpeek (filter=tax)\nAlliance: ${allianceId}\nFetched: ${shown.length} (raw: ${rows.length}, limit: ${limit})\n`
+        : `Bankpeek\nAlliance: ${allianceId}\nFetched: ${shown.length} (raw: ${rows.length}, limit: ${limit})\n`;
+
+    if (shown.length === 0) {
+      await interaction.editReply(header + "\n— no rows —");
+      return;
+    }
+
+    const lines: string[] = [];
+    const subset = shown.slice(0, SHOW_MAX);
+    for (const r of subset) {
+      const hdr = `#${r.id} • ${fmtDate(r.date)} • sender ${r.sender_type}:${r.sender_id} → receiver ${r.receiver_type}:${r.receiver_id}`;
+      const note = (r.note && r.note.trim()) ? r.note.trim() : "—";
+      const res = rowResources(r);
+      lines.push(hdr + "\n" + note + "\n" + res + "\n");
+    }
+    if (shown.length > subset.length) {
+      lines.push(`… and ${shown.length - subset.length} more`);
+    }
+
+    await interaction.editReply(header + "\n" + lines.join("\n"));
+  } catch (err: any) {
+    console.error("[/pnw_bankpeek] error:", err);
+    const msg =
+      err?.message?.startsWith("PnW GraphQL error")
+        ? `❌ ${err.message}`
+        : `❌ ${err?.message ?? String(err)}`;
+    await interaction.editReply(msg);
+  }
 }
