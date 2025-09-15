@@ -1,72 +1,84 @@
-// src/integrations/pnw/tax.ts
 import { PrismaClient } from "@prisma/client";
-import { open } from "../../lib/crypto.js";
 import {
-  BankrecRow,
-  fetchAllianceBankrecsViaGQL,
-  fetchAllianceMemberNationIds,
-  fetchNationBankrecsViaGQL,
-  isAutomatedTaxRow,
+  Bankrec,
+  fetchBankrecsSince,
+  RESOURCE_KEYS,
+  ResourceDelta,
+  signedDeltaFor,
   sumDelta,
+  zeroDelta,
 } from "../../lib/pnw.js";
-
-const prisma = new PrismaClient();
-
-async function getApiKeyForAlliance(allianceId: number): Promise<string> {
-  const k = await prisma.allianceKey.findFirst({ where: { allianceId }, orderBy: { id: "desc" } });
-  if (!k) throw new Error(`No stored key for alliance ${allianceId}. Run /pnw_set first.`);
-  return open(k.encryptedApiKey, k.nonceApi);
-}
+import { readTaxCursor, writeTaxCursor } from "../../utils/cursor.js";
+import { addToTreasury } from "../../utils/treasury.js";
 
 export type PreviewResult = {
-  allianceId: number;
   count: number;
   newestId: number | null;
-  delta: ReturnType<typeof sumDelta>;
-  sample: BankrecRow[];
-  source: "members" | "alliance";
+  delta: ResourceDelta;
+  sample: Bankrec[];
 };
 
 /**
- * Preview automated tax credits using stored key.
- * 1) Try member-level nation bankrecs for tax rows (preferred; includes Automated Tax)
- * 2) If that yields nothing, fall back to alliance bankrecs (rarely has tax rows)
+ * Preview tax credits since the stored cursor (exclusive).
  */
-export async function previewAllianceTaxCreditsStored(
-  allianceId: number,
-  lastSeenId: number = 0,
-  perNationLimit: number = 20,
+export async function previewTaxes(
+  prisma: PrismaClient,
+  allianceId: number
 ): Promise<PreviewResult> {
-  const apiKey = await getApiKeyForAlliance(allianceId);
+  const sinceId = await readTaxCursor(prisma, allianceId);
+  const rows = await fetchBankrecsSince(prisma, allianceId, sinceId, 500, 5000);
 
-  // PRIMARY: member-level tax scan
-  const memberIds = await fetchAllianceMemberNationIds(apiKey, allianceId);
-  const nationRows = await fetchNationBankrecsViaGQL(apiKey, memberIds, perNationLimit);
-  const taxRows = nationRows.filter(r => isAutomatedTaxRow(r, allianceId) && r.id > lastSeenId);
-  if (taxRows.length) {
-    const newestId = taxRows.reduce((m, r) => Math.max(m, r.id), 0);
-    taxRows.sort((a, b) => b.id - a.id);
-    return {
-      allianceId,
-      count: taxRows.length,
-      newestId,
-      delta: sumDelta(taxRows),
-      sample: taxRows.slice(0, 10),
-      source: "members",
-    };
+  let delta = zeroDelta();
+  let newestId: number | null = sinceId ?? null;
+
+  for (const r of rows) {
+    const d = signedDeltaFor(allianceId, r);
+    delta = sumDelta(delta, d);
+    if (newestId === null || r.id > newestId) newestId = r.id;
   }
 
-  // FALLBACK: alliance-level bankrecs (usually 0 for taxes, but keep as safety)
-  const aliRows = await fetchAllianceBankrecsViaGQL(apiKey, allianceId, { limit: 300 });
-  const aliTax = aliRows.filter(r => isAutomatedTaxRow(r, allianceId) && r.id > lastSeenId);
-  const newestId = aliTax.length ? aliTax.reduce((m, r) => Math.max(m, r.id), 0) : null;
-  aliTax.sort((a, b) => b.id - a.id);
   return {
-    allianceId,
-    count: aliTax.length,
-    newestId,
-    delta: sumDelta(aliTax),
-    sample: aliTax.slice(0, 10),
-    source: "alliance",
+    count: rows.length,
+    newestId: newestId ?? null,
+    delta,
+    sample: rows.slice(-5), // last few for quick human sanity
   };
+}
+
+/**
+ * Apply the previewed delta to treasury and advance the cursor.
+ * Idempotent: because the cursor only advances AFTER treasury mutation.
+ */
+export async function applyTaxes(
+  prisma: PrismaClient,
+  allianceId: number
+): Promise<PreviewResult> {
+  const prev = await previewTaxes(prisma, allianceId);
+
+  if (prev.count === 0) {
+    // Nothing to do; do not advance cursor
+    return prev;
+  }
+
+  // Apply to treasury (server-side addition)
+  await addToTreasury(prisma, allianceId, prev.delta, `PnW taxes (bankrecs up to #${prev.newestId})`);
+
+  // Now that the mutation succeeded, advance the cursor
+  if (prev.newestId) {
+    await writeTaxCursor(prisma, allianceId, prev.newestId);
+  }
+
+  return prev;
+}
+
+/**
+ * Pretty print a delta object into aligned lines.
+ */
+export function formatDelta(delta: ResourceDelta): string {
+  const lines: string[] = [];
+  for (const k of RESOURCE_KEYS) {
+    const v = delta[k];
+    if (v !== 0) lines.push(`${k}: ${v}`);
+  }
+  return lines.length ? lines.join("\n") : "(all zero)";
 }
