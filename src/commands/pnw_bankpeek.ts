@@ -33,26 +33,48 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   const allianceId = interaction.options.getInteger("alliance_id", true);
   const limit = Math.min(500, Math.max(1, interaction.options.getInteger("limit") ?? 100));
 
-  await interaction.deferReply({ ephemeral: true });
+  try {
+    await interaction.deferReply({ ephemeral: true });
 
-  const sinceId = await readTaxCursor(prisma, allianceId);
-  const rows = await fetchBankrecsSince(prisma, allianceId, sinceId, 500, 5000);
-  const last = rows.slice(-limit);
+    const sinceId = await readTaxCursor(prisma, allianceId);
+    const rows = await fetchBankrecsSince(prisma, allianceId, sinceId, 500, 5000);
+    const last = rows.slice(-limit);
 
-  const lines = last.map(
-    (r) =>
-      `#${r.id}  tax_id=${r.tax_id}  ${r.sender_type}:${r.sender_id} → ${r.receiver_type}:${r.receiver_id}  money=${r.money}`
-  );
-
-  const embed = new EmbedBuilder()
-    .setTitle(`Bankpeek — Alliance ${allianceId}`)
-    .setDescription(lines.length ? "```txt\n" + lines.join("\n") + "\n```" : "(no tax rows since cursor)")
-    .addFields(
-      { name: "Since Cursor", value: String(sinceId ?? "none"), inline: true },
-      { name: "Fetched (tax)", value: String(rows.length), inline: true }
+    const lines = last.map(
+      (r) =>
+        `#${r.id}  tax_id=${r.tax_id}  ${r.sender_type}:${r.sender_id} → ${r.receiver_type}:${r.receiver_id}` +
+        `  money=${r.money} steel=${r.steel} gas=${r.gasoline} munis=${r.munitions}`
     );
 
-  await interaction.editReply({ embeds: [embed] });
+    const embed = new EmbedBuilder()
+      .setTitle(`Bankpeek — Alliance ${allianceId}`)
+      .setDescription(
+        lines.length
+          ? "```txt\n" + lines.join("\n").slice(0, 3900) + (lines.join("\n").length > 3900 ? "\n…(truncated)" : "") + "\n```"
+          : "(no tax rows since cursor)"
+      )
+      .addFields(
+        { name: "Since Cursor", value: String(sinceId ?? "none"), inline: true },
+        { name: "Fetched (tax)", value: String(rows.length), inline: true }
+      );
+
+    await interaction.editReply({ embeds: [embed] });
+  } catch (err: any) {
+    const msg = (err && err.message) ? err.message : String(err);
+    await safeReply(interaction, `PnW GraphQL error: ${msg.slice(0, 1800)}`);
+  }
+}
+
+async function safeReply(interaction: ChatInputCommandInteraction, content: string) {
+  try {
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply({ content });
+    } else {
+      await interaction.reply({ content, ephemeral: true });
+    }
+  } catch {
+    // swallow; nothing else we can do
+  }
 }
 
 export default { data, execute };
