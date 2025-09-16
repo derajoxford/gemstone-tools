@@ -2,6 +2,25 @@
 import crypto from "node:crypto";
 import { PrismaClient } from "@prisma/client";
 
+// ---------- Resources (make available to everyone importing from lib/pnw.js) ----------
+export const RESOURCE_KEYS = [
+  "money",
+  "coal",
+  "oil",
+  "uranium",
+  "lead",
+  "iron",
+  "bauxite",
+  "gasoline",
+  "munitions",
+  "steel",
+  "aluminum",
+  "food",
+] as const;
+
+export type ResourceKey = typeof RESOURCE_KEYS[number];
+export type ResourceDelta = Partial<Record<ResourceKey, number>>;
+
 // ---------- helpers: schema-agnostic KV (same idea as pnw_cursor) ----------
 type KVHandle = { name: string; m: any };
 function getKV(prisma: PrismaClient): KVHandle | null {
@@ -148,4 +167,15 @@ export async function fetchBankrecs(
 ): Promise<Bankrec[]> {
   const apiKey = await getAllianceApiKey(prisma, allianceId);
   return fetchAllianceBankrecsViaGQL(apiKey, { allianceId, ...opts });
+}
+
+// small compatibility wrapper for callers expecting "Since"
+export async function fetchBankrecsSince(
+  prisma: PrismaClient,
+  allianceId: number,
+  afterId: number | null,
+  filter: "all" | "tax" | "nontax" = "all",
+  limit = 100
+): Promise<Bankrec[]> {
+  return fetchBankrecs(prisma, allianceId, { afterId, limit, filter });
 }
