@@ -43,3 +43,14 @@ export async function fetchAllianceBankrecsViaGQL(
   if (filter === "nontax")  filtered = records.filter(r => r.tax_id == null);
   return filtered;
 }
+// --- Convenience wrapper kept for existing imports ---
+export async function fetchBankrecsSince(
+  prisma: PrismaClient,
+  allianceId: number,
+  afterId: number | null,
+  opts?: { limit?: number; filter?: "all" | "tax" | "nontax" }
+) {
+  return fetchBankrecs(prisma, allianceId, { ...(opts || {}), afterId });
+}
+
+
