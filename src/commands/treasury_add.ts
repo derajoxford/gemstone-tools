@@ -4,28 +4,26 @@ import {
   ChatInputCommandInteraction,
   PermissionFlagsBits,
 } from "discord.js";
-import { addToTreasury } from "../utils/treasury_store";
 import { resourceEmbed } from "../lib/embeds";
-import { RESOURCE_KEYS } from "../lib/pnw.js"; // validates keys users provide
+import { RESOURCE_KEYS } from "../integrations/pnw/tax.js";
+import { addToTreasury } from "../utils/treasury_store";
 
 export const data = new SlashCommandBuilder()
   .setName("treasury_add")
   .setDescription("Admin: add (or subtract) amounts to the alliance treasury (JSON payload).")
-  // REQUIRED FIRST
-  .addStringOption((o) =>
+  .addStringOption(o =>
     o
       .setName("payload")
       .setDescription('JSON like {"money":1000000,"steel":500} (negative values allowed)')
       .setRequired(true),
   )
-  // OPTIONAL AFTER
-  .addIntegerOption((o) =>
+  .addIntegerOption(o =>
     o
       .setName("alliance_id")
       .setDescription("Alliance ID (defaults to this server's linked alliance)")
       .setRequired(false),
   )
-  .addStringOption((o) =>
+  .addStringOption(o =>
     o.setName("note").setDescription("Optional note to include in the reply").setRequired(false),
   )
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
@@ -35,49 +33,29 @@ export async function execute(i: ChatInputCommandInteraction) {
   await i.deferReply({ ephemeral: true });
   try {
     const payload = i.options.getString("payload", true)!;
-    const allianceId = i.options.getInteger("alliance_id") ?? 0; // your env/linking may override 0 elsewhere
+    const allianceId = i.options.getInteger("alliance_id") ?? 0;
     const note = i.options.getString("note") ?? "";
 
-    // Parse & validate payload keys
-    const obj = JSON.parse(payload) as Record<string, unknown>;
-    if (typeof obj !== "object" || obj === null || Array.isArray(obj)) {
-      throw new Error("Payload must be a JSON object like {\"money\": 1000000, \"steel\": 500}");
+    const obj = JSON.parse(payload);
+    // Light validation: only allow known resource keys; coerce numbers
+    const clean: Record<string, number> = {};
+    for (const k of RESOURCE_KEYS) {
+      const v = Number(obj?.[k]);
+      if (Number.isFinite(v) && v !== 0) clean[k] = v;
     }
 
-    // Normalize: keep only known resource keys; coerce to numbers
-    const normalized: Record<string, number> = {};
-    const allowed = new Set(RESOURCE_KEYS as readonly string[]);
-    const unknown: string[] = [];
-
-    for (const [k, v] of Object.entries(obj)) {
-      const key = String(k).toLowerCase();
-      if (!allowed.has(key)) {
-        unknown.push(k);
-        continue;
-      }
-      const num = Number(v);
-      if (!Number.isFinite(num)) {
-        throw new Error(`Value for "${k}" must be a number.`);
-      }
-      normalized[key] = (normalized[key] ?? 0) + num;
+    if (Object.keys(clean).length === 0) {
+      throw new Error(
+        "Payload contained no valid resource keys. Valid keys: " + "`" + RESOURCE_KEYS.join("`, `") + "`",
+      );
     }
 
-    if (Object.keys(normalized).length === 0) {
-      const hint = "`" + (RESOURCE_KEYS as readonly string[]).join("`, `") + "`";
-      if (unknown.length) {
-        throw new Error(
-          `No valid resource keys provided. Unknown: ${unknown.join(", ")}.\nValid keys: ${hint}`,
-        );
-      } else {
-        throw new Error(`No resource keys provided. Valid keys: ${hint}`);
-      }
-    }
+    await addToTreasury(allianceId, clean);
 
-    await addToTreasury(allianceId, normalized);
-
-    const lines = Object.entries(normalized)
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([k, v]) => `${k.padEnd(12)} ${v >= 0 ? "+" : ""}${v.toLocaleString()}`)
+    const lines = Object.entries(clean)
+      .map(([k, v]) =>
+        `${String(k).padEnd(10)} ${Number(v) >= 0 ? "+" : ""}${Number(v).toLocaleString()}`,
+      )
       .join("\n");
 
     const embed = resourceEmbed({
@@ -87,7 +65,6 @@ export async function execute(i: ChatInputCommandInteraction) {
       color: 0x2ecc71,
       footer: note || undefined,
     });
-
     await i.editReply({ embeds: [embed] });
   } catch (err: any) {
     await i.editReply(`❌ ${err?.message ?? String(err)}`);
