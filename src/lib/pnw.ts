@@ -1,175 +1,151 @@
 // src/lib/pnw.ts
+import crypto from "node:crypto";
 import { PrismaClient } from "@prisma/client";
-import * as cryptoMod from "./crypto.js"; // correct relative path in src/lib
-const open = (cryptoMod as any).open as (cipher: string, nonce: string) => string;
 
-export type Bankrec = {
+// ---------- helpers: schema-agnostic KV (same idea as pnw_cursor) ----------
+type KVHandle = { name: string; m: any };
+function getKV(prisma: PrismaClient): KVHandle | null {
+  const candidates = [
+    "setting", "settings",
+    "kv", "kvs",
+    "keyValue", "keyvalue", "key_values",
+    "appSetting", "appSettings",
+    "config", "configs",
+  ];
+  const p: any = prisma as any;
+  for (const name of candidates) {
+    const m = p?.[name];
+    if (m && typeof m.findUnique === "function") return { name, m };
+  }
+  return null;
+}
+
+function kvKeyApiKey(aid: number) { return `pnw:api_key:${aid}`; }
+
+// ---------- crypto helpers (only used when value is explicitly "enc:") ----------
+function decryptEncGcm(value: string, secret: string): string {
+  // format: enc:<ivHex>:<cipherHex>:<tagHex>
+  const parts = value.split(":");
+  if (parts.length !== 4 || parts[0] !== "enc") {
+    // not our encrypted format, pass through as plaintext
+    return value;
+  }
+  const ivHex = parts[1], cipherHex = parts[2], tagHex = parts[3];
+  if (!ivHex || !cipherHex || !tagHex) {
+    throw new Error("Encrypted API key is missing iv/cipher/tag parts.");
+  }
+  if (!secret) {
+    throw new Error("Encrypted API key found but PNW_SECRET is not set.");
+  }
+  const iv = Buffer.from(ivHex, "hex");
+  const cipher = Buffer.from(cipherHex, "hex");
+  const tag = Buffer.from(tagHex, "hex");
+  const key = crypto.createHash("sha256").update(secret).digest(); // 32 bytes
+
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(tag);
+  const plain = Buffer.concat([decipher.update(cipher), decipher.final()]);
+  return plain.toString("utf8");
+}
+
+// ---------- API key resolution ----------
+export async function getAllianceApiKey(
+  prisma: PrismaClient,
+  allianceId: number
+): Promise<string> {
+  // 1) ENV (strongest & simplest)
+  const envKeyPerAlliance = process.env[`PNW_API_KEY_${allianceId}`];
+  if (envKeyPerAlliance && envKeyPerAlliance.trim()) return envKeyPerAlliance.trim();
+  const envKey = process.env.PNW_API_KEY;
+  if (envKey && envKey.trim()) return envKey.trim();
+
+  // 2) DB (schema-agnostic)
+  const kv = getKV(prisma);
+  if (!kv) {
+    throw new Error(
+      "No settings/kv model in Prisma schema and no PNW_API_KEY env. " +
+      "Either set PNW_API_KEY(_<ALLIANCE_ID>) in .env or add a KV table."
+    );
+  }
+  const row = await kv.m.findUnique({ where: { key: kvKeyApiKey(allianceId) } }).catch(() => null);
+  const raw = (row as any)?.value ?? (row as any)?.val ?? (row as any)?.data ?? null;
+  if (!raw) {
+    throw new Error(
+      `No API key found for alliance ${allianceId}. Set env PNW_API_KEY_${allianceId} or PNW_API_KEY, ` +
+      `or store key in ${kv.name} with key="${kvKeyApiKey(allianceId)}".`
+    );
+  }
+  const str = String(raw);
+  if (str.startsWith("enc:")) {
+    const secret = process.env.PNW_SECRET ?? "";
+    return decryptEncGcm(str, secret).trim();
+  }
+  return str.trim();
+}
+
+// ---------- PnW GraphQL fetching ----------
+type Bankrec = {
   id: number;
   date: string;
-  sender_type: string;
-  sender_id: number | null;
-  receiver_type: string;
-  receiver_id: number | null;
-  note: string | null;
-  money: number;
-  coal: number;
-  oil: number;
-  uranium: number;
-  iron: number;
-  bauxite: number;
-  lead: number;
-  gasoline: number;
-  munitions: number;
-  steel: number;
-  aluminum: number;
-  food: number;
-  tax_id: number | null;
+  note?: string | null;
+  sender_id?: number | null;
+  receiver_id?: number | null;
+  sender_type?: string | null;
+  receiver_type?: string | null;
+  amount?: number | null;
+  tax_id?: number | null;
+  tax_note?: string | null;
 };
 
-export const RESOURCE_KEYS = [
-  "money","coal","oil","uranium","iron","bauxite","lead","gasoline","munitions","steel","aluminum","food",
-] as const;
-export type ResourceKey = typeof RESOURCE_KEYS[number];
-export type ResourceDelta = Record<ResourceKey, number>;
+export async function fetchAllianceBankrecsViaGQL(
+  apiKey: string,
+  params: { allianceId: number; afterId?: number | null; limit?: number; filter?: "all" | "tax" | "nontax" }
+): Promise<Bankrec[]> {
+  const { allianceId, afterId, limit = 100, filter = "all" } = params;
 
-const PNW_GQL_ENDPOINT = "https://api.politicsandwar.com/graphql";
+  const query = `
+    query AllianceBank($aid:Int!, $after:Int, $limit:Int!) {
+      alliance(id:$aid) {
+        bankRecords(afterId:$after, limit:$limit) {
+          id date note sender_id receiver_id sender_type receiver_type amount tax_id tax_note
+        }
+      }
+    }
+  `;
 
-/** 15s fetch timeout helper */
-function withTimeout(signal: AbortSignal | undefined, ms = 15000) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(new Error(`Timeout after ${ms}ms`)), ms);
-  const onAbort = () => ctrl.abort(new Error("Upstream aborted"));
-  signal?.addEventListener("abort", onAbort);
-  return {
-    signal: ctrl.signal,
-    done: () => {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
+  const body = JSON.stringify({
+    query,
+    variables: { aid: allianceId, after: afterId ?? null, limit: Math.max(1, Math.min(500, limit)) }
+  });
+
+  const res = await fetch("https://api.politicsandwar.com/graphql", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Api-Key": apiKey
     },
-  };
-}
+    body
+  });
 
-export async function getAllianceApiKey(prisma: PrismaClient, allianceId: number): Promise<string> {
-  const k = await prisma.allianceKey.findFirst({ where: { allianceId }, orderBy: { id: "desc" } });
-  if (!k) throw new Error(`No saved API key for alliance ${allianceId}`);
-  const token = open(k.encryptedApiKey, k.nonce);
-  if (!token) throw new Error("Failed to decrypt alliance API key");
-  return token;
-}
-
-export async function gqlFetch<T = any>(
-  token: string,
-  query: string,
-  variables: Record<string, any>,
-  opts?: { timeoutMs?: number }
-): Promise<T> {
-  const { signal, done } = withTimeout(undefined, opts?.timeoutMs ?? 15000);
-  try {
-    const res = await fetch(PNW_GQL_ENDPOINT, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ query, variables }),
-      signal,
-    });
-    const text = await res.text();
-    if (!res.ok) {
-      throw new Error(`PnW GraphQL HTTP ${res.status} ${res.statusText}: ${text?.slice(0, 500)}`);
-    }
-    let json: any;
-    try {
-      json = JSON.parse(text);
-    } catch {
-      throw new Error(`PnW GraphQL returned non-JSON body: ${text?.slice(0, 240)}`);
-    }
-    if (json.errors?.length) {
-      const msgs = json.errors.map((e: any) => e?.message ?? "Unknown error").join("; ");
-      throw new Error(`PnW GraphQL error(s): ${msgs}`);
-    }
-    return json.data as T;
-  } finally {
-    done();
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`PnW GraphQL HTTP ${res.status}: ${t.slice(0,200)}`);
   }
+
+  const json = await res.json();
+  const records: Bankrec[] = json?.data?.alliance?.bankRecords ?? [];
+  let filtered = records;
+  if (filter === "tax")     filtered = records.filter(r => r.tax_id != null);
+  if (filter === "nontax")  filtered = records.filter(r => r.tax_id == null);
+  return filtered;
 }
 
-const BANKRECS_QUERY = /* GraphQL */ `
-  query BankrecsSince($allianceId: Int!, $limit: Int!, $cursorId: Int) {
-    bankrecs(
-      filter: {
-        OR: [
-          { receiver_type: "alliance", receiver_id: $allianceId }
-          { sender_type: "alliance", sender_id: $allianceId }
-        ]
-        id_gt: $cursorId
-      }
-      first: $limit
-      orderBy: { id: ASC }
-    ) {
-      pageInfo { hasNextPage endCursor }
-      nodes {
-        id date sender_type sender_id receiver_type receiver_id note
-        money coal oil uranium iron bauxite lead gasoline munitions steel aluminum food
-        tax_id
-      }
-    }
-  }
-`;
-
-/**
- * Fetch bankrecs that involve the alliance, then locally enforce:
- *  - id > sinceId
- *  - tax_id > 0   (strict tax-only)
- */
-export async function fetchBankrecsSince(
+// convenience wrapper used by commands & index
+export async function fetchBankrecs(
   prisma: PrismaClient,
   allianceId: number,
-  sinceId: number | null,
-  pageSize = 500,
-  hardCap = 5000
+  opts?: { afterId?: number | null; limit?: number; filter?: "all" | "tax" | "nontax" }
 ): Promise<Bankrec[]> {
-  const token = await getAllianceApiKey(prisma, allianceId);
-  let fetched: Bankrec[] = [];
-  let localCursor = sinceId ?? 0;
-  let safety = 0;
-
-  while (true) {
-    safety++; if (safety > Math.ceil(hardCap / pageSize)) break;
-
-    const data = await gqlFetch<any>(token, BANKRECS_QUERY, { allianceId, limit: pageSize, cursorId: localCursor || 0 }, { timeoutMs: 15000 });
-    const nodes: Bankrec[] = data?.bankrecs?.nodes ?? data?.bankrecs ?? [];
-
-    const batch = nodes.filter((r) => r && typeof r.id === "number" && r.id > (sinceId ?? 0) && (r.tax_id ?? 0) > 0);
-    fetched.push(...batch);
-
-    if (!data?.bankrecs?.pageInfo?.hasNextPage) break;
-    const last = nodes[nodes.length - 1]; if (!last) break;
-    localCursor = Math.max(localCursor, Number(last.id || 0));
-    if (fetched.length >= hardCap) break;
-  }
-
-  fetched.sort((a, b) => a.id - b.id);
-  return fetched;
+  const apiKey = await getAllianceApiKey(prisma, allianceId);
+  return fetchAllianceBankrecsViaGQL(apiKey, { allianceId, ...opts });
 }
-
-export function signedDeltaFor(allianceId: number, rec: Bankrec): ResourceDelta {
-  const isReceive = rec.receiver_type === "alliance" && Number(rec.receiver_id) === Number(allianceId);
-  const isSend    = rec.sender_type   === "alliance" && Number(rec.sender_id)   === Number(allianceId);
-  const sign = isReceive ? 1 : isSend ? -1 : 0;
-  const out = {} as ResourceDelta;
-  for (const k of RESOURCE_KEYS) out[k] = sign * Number((rec as any)[k] || 0);
-  return out;
-}
-
-export function sumDelta(a: ResourceDelta, b: ResourceDelta): ResourceDelta {
-  const out = {} as ResourceDelta;
-  for (const k of RESOURCE_KEYS) out[k] = Number(a[k] || 0) + Number(b[k] || 0);
-  return out;
-}
-export function zeroDelta(): ResourceDelta {
-  const out = {} as ResourceDelta;
-  for (const k of RESOURCE_KEYS) out[k] = 0;
-  return out;
-}
-
-/* ---------- Back-compat named exports (aliases expected elsewhere) ---------- */
-export const fetchAllianceBankrecsViaGQL = fetchBankrecsSince; // used by pnw_tax_ids.ts
-export const fetchBankrecs = fetchBankrecsSince;               // used by index.ts
