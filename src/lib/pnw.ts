@@ -2,8 +2,54 @@
 import crypto from "node:crypto";
 import { PrismaClient } from "@prisma/client";
 
-// ---------- helpers: schema-agnostic KV (same idea as pnw_cursor) ----------
+/* -------------------------------------------------------------------------- */
+/*  Resource helpers                                                          */
+/* -------------------------------------------------------------------------- */
+
+export const RESOURCE_KEYS = [
+  "money",
+  "food",
+  "coal",
+  "oil",
+  "uranium",
+  "iron",
+  "bauxite",
+  "lead",
+  "gasoline",
+  "munitions",
+  "steel",
+  "aluminum",
+] as const;
+
+export type ResourceKey = typeof RESOURCE_KEYS[number];
+export type ResourceDelta = Partial<Record<ResourceKey, number>>;
+
+export function zeroDelta(): ResourceDelta {
+  const d: ResourceDelta = {};
+  for (const k of RESOURCE_KEYS) d[k] = 0;
+  return d;
+}
+
+export function sumDelta(a: ResourceDelta, b: ResourceDelta): ResourceDelta {
+  const out: ResourceDelta = {};
+  for (const k of RESOURCE_KEYS) out[k] = (a[k] ?? 0) + (b[k] ?? 0);
+  return out;
+}
+
+export function signedDeltaFor(delta: ResourceDelta): string {
+  // Pretty “+1,234 / -56” style string for logs/embeds if needed
+  return RESOURCE_KEYS
+    .filter(k => (delta[k] ?? 0) !== 0)
+    .map(k => `${k}: ${(delta[k] ?? 0) >= 0 ? "+" : ""}${Number(delta[k] ?? 0).toLocaleString()}`)
+    .join(", ");
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Generic KV handle (so we don’t depend on a specific table name)           */
+/* -------------------------------------------------------------------------- */
+
 type KVHandle = { name: string; m: any };
+
 function getKV(prisma: PrismaClient): KVHandle | null {
   const candidates = [
     "setting", "settings",
@@ -20,23 +66,24 @@ function getKV(prisma: PrismaClient): KVHandle | null {
   return null;
 }
 
-function kvKeyApiKey(aid: number) { return `pnw:api_key:${aid}`; }
+function kvKeyApiKey(aid: number) {
+  return `pnw:api_key:${aid}`;
+}
 
-// ---------- crypto helpers (only used when value is explicitly "enc:") ----------
+/* -------------------------------------------------------------------------- */
+/*  Optional encryption support for stored keys (enc:<iv>:<cipher>:<tag>)     */
+/* -------------------------------------------------------------------------- */
+
 function decryptEncGcm(value: string, secret: string): string {
   // format: enc:<ivHex>:<cipherHex>:<tagHex>
   const parts = value.split(":");
-  if (parts.length !== 4 || parts[0] !== "enc") {
-    // not our encrypted format, pass through as plaintext
-    return value;
-  }
+  if (parts.length !== 4 || parts[0] !== "enc") return value; // passthrough (plaintext)
   const ivHex = parts[1], cipherHex = parts[2], tagHex = parts[3];
   if (!ivHex || !cipherHex || !tagHex) {
     throw new Error("Encrypted API key is missing iv/cipher/tag parts.");
   }
-  if (!secret) {
-    throw new Error("Encrypted API key found but PNW_SECRET is not set.");
-  }
+  if (!secret) throw new Error("Encrypted API key found but PNW_SECRET is not set.");
+
   const iv = Buffer.from(ivHex, "hex");
   const cipher = Buffer.from(cipherHex, "hex");
   const tag = Buffer.from(tagHex, "hex");
@@ -48,31 +95,37 @@ function decryptEncGcm(value: string, secret: string): string {
   return plain.toString("utf8");
 }
 
-// ---------- API key resolution ----------
+/* -------------------------------------------------------------------------- */
+/*  Resolve the Alliance API key                                              */
+/*    Priority:                                                               */
+/*      1) env PNW_API_KEY_<AID>                                              */
+/*      2) env PNW_API_KEY                                                    */
+/*      3) DB KV row key = "pnw:api_key:<AID>"                                 */
+/* -------------------------------------------------------------------------- */
+
 export async function getAllianceApiKey(
   prisma: PrismaClient,
   allianceId: number
 ): Promise<string> {
-  // 1) ENV (per-alliance, then global)
-  const envKeyPerAlliance = process.env[`PNW_API_KEY_${allianceId}`];
-  if (envKeyPerAlliance && envKeyPerAlliance.trim()) return envKeyPerAlliance.trim();
-  const envKey = process.env.PNW_API_KEY;
-  if (envKey && envKey.trim()) return envKey.trim();
+  const envPerAid = process.env[`PNW_API_KEY_${allianceId}`];
+  if (envPerAid && envPerAid.trim()) return envPerAid.trim();
 
-  // 2) DB (schema-agnostic KV)
+  const envAny = process.env.PNW_API_KEY;
+  if (envAny && envAny.trim()) return envAny.trim();
+
   const kv = getKV(prisma);
   if (!kv) {
     throw new Error(
-      "No settings/kv model in Prisma schema and no PNW_API_KEY env. " +
-      "Either set PNW_API_KEY(_<ALLIANCE_ID>) in .env or add a KV table."
+      "No KV/Settings model found and no PNW_API_KEY env present. " +
+      "Set PNW_API_KEY(_<ALLIANCE_ID>) in .env or add a KV table."
     );
   }
   const row = await kv.m.findUnique({ where: { key: kvKeyApiKey(allianceId) } }).catch(() => null);
   const raw = (row as any)?.value ?? (row as any)?.val ?? (row as any)?.data ?? null;
   if (!raw) {
     throw new Error(
-      `No API key found for alliance ${allianceId}. Set env PNW_API_KEY_${allianceId} or PNW_API_KEY, ` +
-      `or store key in ${kv.name} with key="${kvKeyApiKey(allianceId)}".`
+      `No API key found for alliance ${allianceId}. ` +
+      `Set env PNW_API_KEY_${allianceId} or PNW_API_KEY, or store it in ${kv.name} with key="${kvKeyApiKey(allianceId)}".`
     );
   }
   const str = String(raw);
@@ -83,7 +136,10 @@ export async function getAllianceApiKey(
   return str.trim();
 }
 
-// ---------- PnW GraphQL fetching ----------
+/* -------------------------------------------------------------------------- */
+/*  PnW GraphQL                                                               */
+/* -------------------------------------------------------------------------- */
+
 export type Bankrec = {
   id: number;
   date: string;
@@ -118,29 +174,29 @@ export async function fetchAllianceBankrecsViaGQL(
     variables: { aid: allianceId, after: afterId ?? null, limit: Math.max(1, Math.min(500, limit)) }
   });
 
-  const res = await fetch("https://api.politicsandwar.com/graphql", {
+  // IMPORTANT: PnW expects the API key in the query string, not a header
+  const url = "https://api.politicsandwar.com/graphql?api_key=" + encodeURIComponent(apiKey);
+  const res = await fetch(url, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Api-Key": apiKey
-    },
+    headers: { "Content-Type": "application/json" },
     body
   });
 
   if (!res.ok) {
     const t = await res.text().catch(() => "");
-    throw new Error(`PnW GraphQL HTTP ${res.status}: ${t.slice(0,200)}`);
+    throw new Error(`PnW GraphQL HTTP ${res.status}: ${t.slice(0, 200)}`);
   }
 
   const json = await res.json();
   const records: Bankrec[] = json?.data?.alliance?.bankRecords ?? [];
+
   let filtered = records;
-  if (filter === "tax")     filtered = records.filter(r => r.tax_id != null);
-  if (filter === "nontax")  filtered = records.filter(r => r.tax_id == null);
+  if (filter === "tax") filtered = records.filter(r => r.tax_id != null);
+  if (filter === "nontax") filtered = records.filter(r => r.tax_id == null);
   return filtered;
 }
 
-// convenience wrappers used by commands & index
+/** Convenience wrapper used by commands & index */
 export async function fetchBankrecs(
   prisma: PrismaClient,
   allianceId: number,
@@ -148,14 +204,4 @@ export async function fetchBankrecs(
 ): Promise<Bankrec[]> {
   const apiKey = await getAllianceApiKey(prisma, allianceId);
   return fetchAllianceBankrecsViaGQL(apiKey, { allianceId, ...opts });
-}
-
-// tiny helper because some files import this name specifically
-export async function fetchBankrecsSince(
-  prisma: PrismaClient,
-  allianceId: number,
-  afterId: number | null,
-  opts?: { limit?: number; filter?: "all" | "tax" | "nontax" }
-): Promise<Bankrec[]> {
-  return fetchBankrecs(prisma, allianceId, { afterId, ...(opts ?? {}) });
 }
