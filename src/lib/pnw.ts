@@ -2,9 +2,10 @@
 import crypto from "node:crypto";
 import { PrismaClient } from "@prisma/client";
 
-// ---------- Resources (make available to everyone importing from lib/pnw.js) ----------
+/** ---------- resources (needed by commands/utils) ---------- */
 export const RESOURCE_KEYS = [
   "money",
+  "food",
   "coal",
   "oil",
   "uranium",
@@ -15,13 +16,13 @@ export const RESOURCE_KEYS = [
   "munitions",
   "steel",
   "aluminum",
-  "food",
+  "credits",
 ] as const;
 
 export type ResourceKey = typeof RESOURCE_KEYS[number];
 export type ResourceDelta = Partial<Record<ResourceKey, number>>;
 
-// ---------- helpers: schema-agnostic KV (same idea as pnw_cursor) ----------
+/** ---------- helpers: schema-agnostic KV (same idea as pnw_cursor) ---------- */
 type KVHandle = { name: string; m: any };
 function getKV(prisma: PrismaClient): KVHandle | null {
   const candidates = [
@@ -41,12 +42,11 @@ function getKV(prisma: PrismaClient): KVHandle | null {
 
 function kvKeyApiKey(aid: number) { return `pnw:api_key:${aid}`; }
 
-// ---------- crypto helpers (only used when value is explicitly "enc:") ----------
+/** ---------- crypto helpers (only used when value is explicitly "enc:") ---------- */
 function decryptEncGcm(value: string, secret: string): string {
   // format: enc:<ivHex>:<cipherHex>:<tagHex>
   const parts = value.split(":");
   if (parts.length !== 4 || parts[0] !== "enc") {
-    // not our encrypted format, pass through as plaintext
     return value;
   }
   const ivHex = parts[1], cipherHex = parts[2], tagHex = parts[3];
@@ -59,7 +59,7 @@ function decryptEncGcm(value: string, secret: string): string {
   const iv = Buffer.from(ivHex, "hex");
   const cipher = Buffer.from(cipherHex, "hex");
   const tag = Buffer.from(tagHex, "hex");
-  const key = crypto.createHash("sha256").update(secret).digest(); // 32 bytes
+  const key = crypto.createHash("sha256").update(secret).digest();
 
   const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
   decipher.setAuthTag(tag);
@@ -67,18 +67,16 @@ function decryptEncGcm(value: string, secret: string): string {
   return plain.toString("utf8");
 }
 
-// ---------- API key resolution ----------
+/** ---------- API key resolution ---------- */
 export async function getAllianceApiKey(
   prisma: PrismaClient,
   allianceId: number
 ): Promise<string> {
-  // 1) ENV (strongest & simplest)
   const envKeyPerAlliance = process.env[`PNW_API_KEY_${allianceId}`];
   if (envKeyPerAlliance && envKeyPerAlliance.trim()) return envKeyPerAlliance.trim();
   const envKey = process.env.PNW_API_KEY;
   if (envKey && envKey.trim()) return envKey.trim();
 
-  // 2) DB (schema-agnostic)
   const kv = getKV(prisma);
   if (!kv) {
     throw new Error(
@@ -102,8 +100,8 @@ export async function getAllianceApiKey(
   return str.trim();
 }
 
-// ---------- PnW GraphQL fetching ----------
-type Bankrec = {
+/** ---------- PnW GraphQL fetching ---------- */
+export type Bankrec = {
   id: number;
   date: string;
   note?: string | null;
@@ -152,30 +150,4 @@ export async function fetchAllianceBankrecsViaGQL(
   }
 
   const json = await res.json();
-  const records: Bankrec[] = json?.data?.alliance?.bankRecords ?? [];
-  let filtered = records;
-  if (filter === "tax")     filtered = records.filter(r => r.tax_id != null);
-  if (filter === "nontax")  filtered = records.filter(r => r.tax_id == null);
-  return filtered;
-}
-
-// convenience wrapper used by commands & index
-export async function fetchBankrecs(
-  prisma: PrismaClient,
-  allianceId: number,
-  opts?: { afterId?: number | null; limit?: number; filter?: "all" | "tax" | "nontax" }
-): Promise<Bankrec[]> {
-  const apiKey = await getAllianceApiKey(prisma, allianceId);
-  return fetchAllianceBankrecsViaGQL(apiKey, { allianceId, ...opts });
-}
-
-// small compatibility wrapper for callers expecting "Since"
-export async function fetchBankrecsSince(
-  prisma: PrismaClient,
-  allianceId: number,
-  afterId: number | null,
-  filter: "all" | "tax" | "nontax" = "all",
-  limit = 100
-): Promise<Bankrec[]> {
-  return fetchBankrecs(prisma, allianceId, { afterId, limit, filter });
-}
+  con
