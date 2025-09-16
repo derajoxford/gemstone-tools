@@ -1,46 +1,23 @@
-import { PrismaClient } from "@prisma/client";
-import { ResourceDelta, RESOURCE_KEYS } from "../lib/pnw.js";
+// src/utils/treasury.ts
+import { ResourceDelta, RESOURCE_KEYS } from "../integrations/pnw/tax.js";
 
-/**
- * Fetches (or initializes) the AllianceTreasury row for an alliance.
- * Assumes the schema has a JSON field `balances` holding resource totals.
- */
-export async function getTreasury(
-  prisma: PrismaClient,
-  allianceId: number
-): Promise<{ id: number; allianceId: number; balances: Record<string, number> }> {
-  let t = await prisma.allianceTreasury.findUnique({ where: { allianceId } });
-  if (!t) {
-    t = await prisma.allianceTreasury.create({
-      data: { allianceId, balances: {} },
-    });
+type Bag = Partial<Record<string, number>>;
+
+export function coerceDelta(obj: any): ResourceDelta {
+  const out: Partial<Record<string, number>> = {};
+  for (const k of RESOURCE_KEYS) {
+    const v = Number(obj?.[k]);
+    if (Number.isFinite(v) && v !== 0) out[k] = v;
   }
-  // Ensure all keys exist
-  const b = { ...(t.balances || {}) };
-  for (const k of RESOURCE_KEYS) if (typeof b[k] !== "number") b[k] = 0;
-  return { id: t.id, allianceId: t.allianceId, balances: b };
+  return out as ResourceDelta;
 }
 
-/**
- * Adds a signed delta to the treasury balances and writes it back.
- * Optionally you could log a TreasuryEvent row here as well.
- */
-export async function addToTreasury(
-  prisma: PrismaClient,
-  allianceId: number,
-  delta: ResourceDelta,
-  note?: string
-) {
-  const t = await getTreasury(prisma, allianceId);
-  const next = { ...t.balances };
+export function applyDelta(bag: Bag, delta: ResourceDelta): Bag {
   for (const k of RESOURCE_KEYS) {
-    next[k] = Number(next[k] || 0) + Number(delta[k] || 0);
+    const d = Number((delta as any)[k] ?? 0);
+    if (!Number.isFinite(d) || d === 0) continue;
+    const curr = Number(bag[k] ?? 0);
+    bag[k] = curr + d;
   }
-  await prisma.allianceTreasury.update({
-    where: { allianceId },
-    data: { balances: next },
-  });
-
-  // Optional: write a simple audit row if you have a model for it.
-  // await prisma.treasuryEvent.create({ data: { allianceId, delta, note: note ?? null } });
+  return bag;
 }
