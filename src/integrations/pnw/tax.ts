@@ -1,72 +1,55 @@
 // src/integrations/pnw/tax.ts
-import { PrismaClient } from "@prisma/client";
-import {
-  Bankrec,
-  fetchBankrecsSince,
-  RESOURCE_KEYS,
-  ResourceDelta,
-  signedDeltaFor,
-  sumDelta,
-  zeroDelta,
-} from "../../lib/pnw.js";
-import { readTaxCursor, writeTaxCursor } from "../../utils/pnw_cursor.js";
-import { addToTreasury } from "../../utils/treasury.js";
 
-export type PreviewResult = {
-  count: number;
-  newestId: number | null;
-  delta: ResourceDelta;
-  sample: Bankrec[];
-};
+// ---- Resource types & helpers kept here (single source of truth) ----
+export const RESOURCE_KEYS = [
+  "money",
+  "food",
+  "coal",
+  "oil",
+  "uranium",
+  "lead",
+  "iron",
+  "bauxite",
+  "gasoline",
+  "munitions",
+  "steel",
+  "aluminum",
+] as const;
 
-/** Preview using the stored cursor (does not mutate). */
-export async function previewTaxes(
-  prisma: PrismaClient,
-  allianceId: number
-): Promise<PreviewResult> {
-  const sinceId = await readTaxCursor(prisma, allianceId);
-  const rows = await fetchBankrecsSince(prisma, allianceId, sinceId, 500, 5000);
+export type ResourceKey = typeof RESOURCE_KEYS[number];
+export type ResourceDelta = Partial<Record<ResourceKey, number>>;
 
-  let delta = zeroDelta();
-  let newestId: number | null = sinceId ?? null;
+export function zeroDelta(): ResourceDelta {
+  const z: Partial<Record<ResourceKey, number>> = {};
+  for (const k of RESOURCE_KEYS) z[k] = 0;
+  return z;
+}
 
-  for (const r of rows) {
-    const d = signedDeltaFor(allianceId, r); // + if alliance is receiver, - if sender
-    delta = sumDelta(delta, d);
-    if (newestId === null || r.id > newestId) newestId = r.id;
+export function sumDelta(...items: ResourceDelta[]): ResourceDelta {
+  const out = zeroDelta();
+  for (const it of items) {
+    for (const k of RESOURCE_KEYS) {
+      const v = Number((it as any)[k] ?? 0);
+      if (Number.isFinite(v) && v !== 0) out[k]! += v;
+    }
   }
-
-  return {
-    count: rows.length,
-    newestId: newestId ?? null,
-    delta,
-    sample: rows.slice(-5),
-  };
+  return out;
 }
 
-/** Apply: add to treasury then advance cursor to newest processed id. */
-export async function applyTaxes(
-  prisma: PrismaClient,
-  allianceId: number
-): Promise<PreviewResult> {
-  const prev = await previewTaxes(prisma, allianceId);
-  if (prev.count === 0) return prev;
-
-  await addToTreasury(prisma, allianceId, prev.delta, `PnW taxes (bankrecs up to #${prev.newestId})`);
-  if (prev.newestId) await writeTaxCursor(prisma, allianceId, prev.newestId);
-
-  return prev;
-}
-
-/** Pretty-print the delta for embeds / logs. */
-export function formatDelta(delta: ResourceDelta): string {
+export function signedDeltaFor(delta: ResourceDelta): string {
   const lines: string[] = [];
   for (const k of RESOURCE_KEYS) {
-    const v = delta[k];
-    if (v !== 0) lines.push(`${k}: ${v}`);
+    const v = Number((delta as any)[k] ?? 0);
+    if (!Number.isFinite(v) || v === 0) continue;
+    lines.push(`${k.padEnd(10)} ${v >= 0 ? "+" : ""}${v.toLocaleString()}`);
   }
-  return lines.length ? lines.join("\n") : "(all zero)";
+  return lines.length ? "```\n" + lines.join("\n") + "\n```" : "_no change_";
 }
 
-/* ---------- Back-compat export name expected by commands/jobs ---------- */
-export const previewAllianceTaxCreditsStored = previewTaxes;
+export function formatDelta(delta: ResourceDelta): string {
+  return signedDeltaFor(delta);
+}
+
+// ---- (If this file also contains other PnW-tax-related logic in your repo,
+// keep it below; we intentionally removed any imports from ../../lib/pnw.js)
+// ----
