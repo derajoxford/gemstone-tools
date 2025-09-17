@@ -1,7 +1,7 @@
 // src/lib/pnw.ts
 import { PrismaClient } from "@prisma/client";
 
-// Use Node 18+ global fetch
+// Node 18+ global fetch
 const fetchFn: typeof fetch = (...args: Parameters<typeof fetch>) =>
   (globalThis as any).fetch(...args);
 
@@ -40,7 +40,6 @@ export function signedDeltaFor(rec: any): ResourceDelta {
   const out = zeroDelta();
   for (const k of RESOURCE_KEYS) {
     const v = rec[k] ?? 0;
-    // incoming -> positive, outgoing -> negative (2 = alliance)
     out[k] = rec.receiver_type === 2 ? v : -v;
   }
   return out;
@@ -61,7 +60,7 @@ async function resolveApiKey(
     const fromDb = (keyRec as any)?.decrypted || (keyRec as any)?.apiKey;
     if (fromDb && String(fromDb).trim()) return String(fromDb).trim();
   } catch {
-    // ignore prisma errors; we still try env
+    // ignore prisma errors; still try env
   }
   const envKey =
     process.env[`PNW_API_KEY_${allianceId}`] || process.env.PNW_API_KEY || "";
@@ -75,22 +74,26 @@ async function resolveApiKey(
 async function postGql(
   apiKey: string,
   query: string,
-  variables: Record<string, any>,
-  opts?: { minimal?: boolean }
+  variables?: Record<string, any>
 ) {
   const url =
     "https://api.politicsandwar.com/graphql?api_key=" +
     encodeURIComponent(apiKey);
 
+  const body =
+    variables && Object.keys(variables).length
+      ? JSON.stringify({ query, variables })
+      : JSON.stringify({ query });
+
   const res = await fetchFn(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query, variables }),
+    body,
   });
 
   const text = await res.text();
+
   if (!res.ok) {
-    // Bubble up a trimmed error; Discord messages have limits.
     throw new Error(`PnW GraphQL HTTP ${res.status}: ${text.slice(0, 200)}`);
   }
 
@@ -102,15 +105,22 @@ async function postGql(
   }
 
   if (json.errors) {
-    // Don't retry for GraphQL-level errors; surface them.
     throw new Error("PnW GraphQL error: " + JSON.stringify(json.errors));
   }
 
   return json;
 }
 
+// A tiny nations probe to separate “PnW up” vs “alliances resolver broken”
+async function probeNations(apiKey: string) {
+  const q = `{ nations(first:1){ data { id nation_name } } }`;
+  const j = await postGql(apiKey, q);
+  const ok = !!j?.data?.nations?.data?.length;
+  return ok;
+}
+
 // ---------------------------
-// GraphQL Bankrec Fetch (+retry)
+// GraphQL Bankrec Fetch (+diagnostic fallbacks)
 // ---------------------------
 export async function fetchAllianceBankrecsViaGQL(
   prisma: PrismaClient,
@@ -124,11 +134,8 @@ export async function fetchAllianceBankrecsViaGQL(
   const apiKey = await resolveApiKey(prisma, allianceId);
 
   const limit = opts.limit ?? 50;
-  const afterId = opts.afterId;
-
-  // Build variables WITHOUT undefineds — some servers 500 on undefined.
   const variables: Record<string, any> = { aid: allianceId, limit };
-  if (afterId) variables.afterId = afterId;
+  if (opts.afterId) variables.afterId = opts.afterId; // omit if undefined
 
   // Full selection set (normal path)
   const fullQuery = `
@@ -163,45 +170,20 @@ export async function fetchAllianceBankrecsViaGQL(
       }
     }`;
 
-  // Minimal selection set (retry path)
-  const minimalQuery = `
-    query($aid:Int!,$limit:Int){
-      alliances(ids:[$aid]){
-        data{
-          id
-          bankrecs(limit:$limit){
-            id
-            date
-            note
-            tax_id
-          }
-        }
+  // Minimal alliances query, literal ID, no variables
+  const alliancesPing = `
+    {
+      alliances(ids:[${allianceId}]){
+        data { id }
       }
     }`;
 
-  // Try full query; if HTTP 500, retry minimal once.
-  let json: any;
   try {
-    json = await postGql(apiKey, fullQuery, variables);
-  } catch (e: any) {
-    const msg = String(e?.message || e);
-    const is500 = /HTTP 500/i.test(msg);
-    if (!is500) throw e;
+    const json = await postGql(apiKey, fullQuery, variables);
+    const alliance = json.data?.alliances?.data?.[0];
+    if (!alliance) return [];
 
-    // Retry minimal (without after_id too, to be extra safe)
-    const minimalVars: Record<string, any> = { aid: allianceId, limit };
-    const j2 = await postGql(apiKey, minimalQuery, minimalVars);
-
-    const allianceLite = j2.data?.alliances?.data?.[0];
-    if (!allianceLite) return [];
-
-    const liteRecs: any[] = allianceLite.bankrecs || [];
-
-    // If caller only needs minimal (e.g., to avoid server errors), return now
-    // Otherwise, try to fetch the full detail in a second step by IDs, but
-    // since the schema doesn’t provide an id-lookup for bankrecs, we’ll
-    // just return the minimal set to keep things reliable.
-    let recs = liteRecs;
+    let recs: any[] = alliance.bankrecs || [];
 
     if (opts.filter === "tax") {
       recs = recs.filter((r) => Number(r.tax_id) > 0);
@@ -210,20 +192,44 @@ export async function fetchAllianceBankrecsViaGQL(
     }
 
     return recs;
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    const is500 = /HTTP 500/i.test(msg);
+    if (!is500) throw e;
+
+    // Step 1: is the alliances resolver itself broken?
+    try {
+      await postGql(apiKey, alliancesPing);
+      // If this succeeds, it's not the alliances root (rare), rethrow original
+      throw e;
+    } catch (e2: any) {
+      const msg2 = String(e2?.message || e2);
+      const isAlliances500 = /HTTP 500/i.test(msg2);
+      if (!isAlliances500) {
+        // A different error; bubble that up
+        throw e2;
+      }
+      // Step 2: probe nations to confirm API is up but alliances path is failing
+      try {
+        const nationsOk = await probeNations(apiKey);
+        if (nationsOk) {
+          throw new Error(
+            "PnW GraphQL ‘alliances’ resolver is returning 500 (server-side). " +
+              "API itself is reachable (nations OK), but bank records cannot be retrieved right now."
+          );
+        } else {
+          throw new Error(
+            "PnW GraphQL appears to be failing right now (server-side 500)."
+          );
+        }
+      } catch (probeErr: any) {
+        // If even the probe blew up unexpectedly, just return a concise message
+        throw new Error(
+          "PnW GraphQL returned 500 and health probe could not complete."
+        );
+      }
+    }
   }
-
-  const alliance = json.data?.alliances?.data?.[0];
-  if (!alliance) return [];
-
-  let recs: any[] = alliance.bankrecs || [];
-
-  if (opts.filter === "tax") {
-    recs = recs.filter((r) => Number(r.tax_id) > 0);
-  } else if (opts.filter === "nontax") {
-    recs = recs.filter((r) => Number(r.tax_id) === 0);
-  }
-
-  return recs;
 }
 
 // ---------------------------
