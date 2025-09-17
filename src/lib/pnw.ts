@@ -27,7 +27,7 @@ export type ResourceKey = typeof RESOURCE_KEYS[number];
 export type ResourceDelta = Record<ResourceKey, number>;
 
 export function zeroDelta(): ResourceDelta {
-  return Object.fromEntries(RESOURCE_KEYS.map(k => [k, 0])) as ResourceDelta;
+  return Object.fromEntries(RESOURCE_KEYS.map((k) => [k, 0])) as ResourceDelta;
 }
 
 export function sumDelta(deltas: ResourceDelta[]): ResourceDelta {
@@ -49,7 +49,10 @@ export function signedDeltaFor(rec: any): ResourceDelta {
 // ---------------------------
 // API key resolver (DB -> ENV)
 // ---------------------------
-async function resolveApiKey(prisma: PrismaClient, allianceId: number): Promise<string> {
+async function resolveApiKey(
+  prisma: PrismaClient,
+  allianceId: number
+): Promise<string> {
   try {
     const keyRec = await prisma.allianceKey.findFirst({
       where: { allianceId },
@@ -61,31 +64,80 @@ async function resolveApiKey(prisma: PrismaClient, allianceId: number): Promise<
     // ignore prisma errors; we still try env
   }
   const envKey =
-    process.env[`PNW_API_KEY_${allianceId}`] ||
-    process.env.PNW_API_KEY ||
-    "";
+    process.env[`PNW_API_KEY_${allianceId}`] || process.env.PNW_API_KEY || "";
   if (envKey.trim()) return envKey.trim();
   throw new Error("Alliance key record missing usable apiKey");
 }
 
 // ---------------------------
-// GraphQL Bankrec Fetch
+// Internal: perform GQL fetch
+// ---------------------------
+async function postGql(
+  apiKey: string,
+  query: string,
+  variables: Record<string, any>,
+  opts?: { minimal?: boolean }
+) {
+  const url =
+    "https://api.politicsandwar.com/graphql?api_key=" +
+    encodeURIComponent(apiKey);
+
+  const res = await fetchFn(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+
+  const text = await res.text();
+  if (!res.ok) {
+    // Bubble up a trimmed error; Discord messages have limits.
+    throw new Error(`PnW GraphQL HTTP ${res.status}: ${text.slice(0, 200)}`);
+  }
+
+  let json: any;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error(`PnW GraphQL parse error: ${text.slice(0, 200)}`);
+  }
+
+  if (json.errors) {
+    // Don't retry for GraphQL-level errors; surface them.
+    throw new Error("PnW GraphQL error: " + JSON.stringify(json.errors));
+  }
+
+  return json;
+}
+
+// ---------------------------
+// GraphQL Bankrec Fetch (+retry)
 // ---------------------------
 export async function fetchAllianceBankrecsViaGQL(
   prisma: PrismaClient,
   allianceId: number,
-  opts: { afterId?: string; limit?: number; filter?: "all" | "tax" | "nontax" } = {}
+  opts: {
+    afterId?: string;
+    limit?: number;
+    filter?: "all" | "tax" | "nontax";
+  } = {}
 ) {
   const apiKey = await resolveApiKey(prisma, allianceId);
 
-  const { afterId, limit = 50 } = opts;
-  const query = `
+  const limit = opts.limit ?? 50;
+  const afterId = opts.afterId;
+
+  // Build variables WITHOUT undefineds — some servers 500 on undefined.
+  const variables: Record<string, any> = { aid: allianceId, limit };
+  if (afterId) variables.afterId = afterId;
+
+  // Full selection set (normal path)
+  const fullQuery = `
     query($aid:Int!,$limit:Int,$afterId:ID){
       alliances(ids:[$aid]){
         data{
           id
           name
-          bankrecs(limit:$limit,after_id:$afterId){
+          bankrecs(limit:$limit, after_id:$afterId){
             id
             date
             note
@@ -111,26 +163,54 @@ export async function fetchAllianceBankrecsViaGQL(
       }
     }`;
 
-  const body = JSON.stringify({
-    query,
-    variables: { aid: allianceId, limit, afterId },
-  });
+  // Minimal selection set (retry path)
+  const minimalQuery = `
+    query($aid:Int!,$limit:Int){
+      alliances(ids:[$aid]){
+        data{
+          id
+          bankrecs(limit:$limit){
+            id
+            date
+            note
+            tax_id
+          }
+        }
+      }
+    }`;
 
-  // PnW requires api_key in query string
-  const url = "https://api.politicsandwar.com/graphql?api_key=" + encodeURIComponent(apiKey);
-  const res = await fetchFn(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body,
-  });
+  // Try full query; if HTTP 500, retry minimal once.
+  let json: any;
+  try {
+    json = await postGql(apiKey, fullQuery, variables);
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    const is500 = /HTTP 500/i.test(msg);
+    if (!is500) throw e;
 
-  if (!res.ok) {
-    const t = await res.text().catch(() => "");
-    throw new Error(`PnW GraphQL HTTP ${res.status}: ${t.slice(0, 200)}`);
+    // Retry minimal (without after_id too, to be extra safe)
+    const minimalVars: Record<string, any> = { aid: allianceId, limit };
+    const j2 = await postGql(apiKey, minimalQuery, minimalVars);
+
+    const allianceLite = j2.data?.alliances?.data?.[0];
+    if (!allianceLite) return [];
+
+    const liteRecs: any[] = allianceLite.bankrecs || [];
+
+    // If caller only needs minimal (e.g., to avoid server errors), return now
+    // Otherwise, try to fetch the full detail in a second step by IDs, but
+    // since the schema doesn’t provide an id-lookup for bankrecs, we’ll
+    // just return the minimal set to keep things reliable.
+    let recs = liteRecs;
+
+    if (opts.filter === "tax") {
+      recs = recs.filter((r) => Number(r.tax_id) > 0);
+    } else if (opts.filter === "nontax") {
+      recs = recs.filter((r) => Number(r.tax_id) === 0);
+    }
+
+    return recs;
   }
-
-  const json = await res.json();
-  if (json.errors) throw new Error("PnW GraphQL error: " + JSON.stringify(json.errors));
 
   const alliance = json.data?.alliances?.data?.[0];
   if (!alliance) return [];
@@ -138,9 +218,9 @@ export async function fetchAllianceBankrecsViaGQL(
   let recs: any[] = alliance.bankrecs || [];
 
   if (opts.filter === "tax") {
-    recs = recs.filter(r => Number(r.tax_id) > 0);
+    recs = recs.filter((r) => Number(r.tax_id) > 0);
   } else if (opts.filter === "nontax") {
-    recs = recs.filter(r => Number(r.tax_id) === 0);
+    recs = recs.filter((r) => Number(r.tax_id) === 0);
   }
 
   return recs;
@@ -152,7 +232,11 @@ export async function fetchAllianceBankrecsViaGQL(
 export async function fetchBankrecs(
   prisma: PrismaClient,
   allianceId: number,
-  opts?: { afterId?: string; limit?: number; filter?: "all" | "tax" | "nontax" }
+  opts?: {
+    afterId?: string;
+    limit?: number;
+    filter?: "all" | "tax" | "nontax";
+  }
 ) {
   return fetchAllianceBankrecsViaGQL(prisma, allianceId, opts);
 }
