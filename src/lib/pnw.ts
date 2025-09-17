@@ -2,7 +2,14 @@
 import crypto from "node:crypto";
 import { PrismaClient } from "@prisma/client";
 
-// ---------- helpers: schema-agnostic KV (same idea as pnw_cursor) ----------
+/**
+ * ---------------------------
+ * Simple schema-agnostic KV
+ * ---------------------------
+ * We probe for a reasonable key/value model so new users don't have to rename code.
+ * Any model that exposes findUnique({ where: { key } }) and stores the value under
+ * one of value/val/data will work.
+ */
 type KVHandle = { name: string; m: any };
 function getKV(prisma: PrismaClient): KVHandle | null {
   const candidates = [
@@ -19,24 +26,27 @@ function getKV(prisma: PrismaClient): KVHandle | null {
   }
   return null;
 }
-
 function kvKeyApiKey(aid: number) { return `pnw:api_key:${aid}`; }
 
-// ---------- crypto helpers (only used when value is explicitly "enc:") ----------
+/**
+ * ---------------------------
+ * Crypto helper (optional)
+ * ---------------------------
+ * Only used if a stored key begins with "enc:<iv>:<cipher>:<tag>" and PNW_SECRET is set.
+ */
 function decryptEncGcm(value: string, secret: string): string {
   // format: enc:<ivHex>:<cipherHex>:<tagHex>
   const parts = value.split(":");
-  if (parts.length !== 4 || parts[0] !== "enc") {
-    // not our encrypted format, pass through as plaintext
-    return value;
-  }
-  const ivHex = parts[1], cipherHex = parts[2], tagHex = parts[3];
+  if (parts.length !== 4 || parts[0] !== "enc") return value; // not our format, pass-through
+
+  const [, ivHex, cipherHex, tagHex] = parts;
   if (!ivHex || !cipherHex || !tagHex) {
     throw new Error("Encrypted API key is missing iv/cipher/tag parts.");
   }
   if (!secret) {
     throw new Error("Encrypted API key found but PNW_SECRET is not set.");
   }
+
   const iv = Buffer.from(ivHex, "hex");
   const cipher = Buffer.from(cipherHex, "hex");
   const tag = Buffer.from(tagHex, "hex");
@@ -48,18 +58,26 @@ function decryptEncGcm(value: string, secret: string): string {
   return plain.toString("utf8");
 }
 
-// ---------- API key resolution ----------
+/**
+ * ---------------------------
+ * API key resolution
+ * ---------------------------
+ * Priority:
+ *   1) PNW_API_KEY_<ALLIANCE_ID>
+ *   2) PNW_API_KEY
+ *   3) KV row under key "pnw:api_key:<ALLIANCE_ID>"
+ *      (value may be plaintext or enc:<iv>:<cipher>:<tag> if PNW_SECRET is configured)
+ */
 export async function getAllianceApiKey(
   prisma: PrismaClient,
   allianceId: number
 ): Promise<string> {
-  // 1) ENV (strongest & simplest)
   const envKeyPerAlliance = process.env[`PNW_API_KEY_${allianceId}`];
   if (envKeyPerAlliance && envKeyPerAlliance.trim()) return envKeyPerAlliance.trim();
+
   const envKey = process.env.PNW_API_KEY;
   if (envKey && envKey.trim()) return envKey.trim();
 
-  // 2) DB (schema-agnostic KV)
   const kv = getKV(prisma);
   if (!kv) {
     throw new Error(
@@ -83,38 +101,48 @@ export async function getAllianceApiKey(
   return str.trim();
 }
 
-// ---------- Types aligned to current schema ----------
+/**
+ * ---------------------------
+ * Types
+ * ---------------------------
+ */
 export type Bankrec = {
-  id: string;                 // comes back as string
-  date: string;               // ISO string
+  id: string;                 // comes back as string from API
+  date: string;
   note?: string | null;
-  tax_id?: string | null;     // string "0" when not a tax record
-  sender_type?: number | null;
-  receiver_type?: number | null;
   sender_id?: string | null;
   receiver_id?: string | null;
+  sender_type?: number | null;
+  receiver_type?: number | null;
+  tax_id?: string | number | null; // non-zero => tax bracket id
 };
 
-type FetchOpts = {
-  allianceId: number;
-  afterId?: number | null;        // client-side filter
-  limit?: number;                 // 1..500
-  filter?: "all" | "tax" | "nontax";
-};
-
-// ---------- PnW GraphQL fetching (new schema) ----------
+/**
+ * ---------------------------
+ * GraphQL fetch
+ * ---------------------------
+ * Important: PnW GraphQL expects the API key as a *query param* (?api_key=xxx)
+ * for POSTs. Using only the X-Api-Key header can yield 401s.
+ *
+ * Also: schema notes
+ *   - top field is "alliances", not "alliance"
+ *   - alliances(...) returns a paginator with "data"
+ *   - bankrecs(...) is the field for bank records
+ *   - There is no "amount" here; we only get meta fields (note, tax_id, etc.)
+ */
 export async function fetchAllianceBankrecsViaGQL(
   apiKey: string,
-  { allianceId, afterId, limit = 100, filter = "all" }: FetchOpts
+  params: { allianceId: number; afterId?: number | null; limit?: number; filter?: "all" | "tax" | "nontax" }
 ): Promise<Bankrec[]> {
-  const ids = [allianceId];
+  const { allianceId, afterId, limit = 100, filter = "all" } = params;
+
   const query = `
-    query($ids:[Int!]) {
-      alliances(id:$ids) {
+    query AllianceBank($aid:Int!, $after:Int, $limit:Int!) {
+      alliances(id: [$aid]) {
         data {
           id
           name
-          bankrecs(limit:${Math.max(1, Math.min(500, limit))}) {
+          bankrecs(limit: $limit, after_id: $after) {
             id
             date
             note
@@ -129,10 +157,17 @@ export async function fetchAllianceBankrecsViaGQL(
     }
   `;
 
-  const res = await fetch(`https://api.politicsandwar.com/graphql?api_key=${apiKey}`, {
+  const body = JSON.stringify({
+    query,
+    variables: { aid: allianceId, after: afterId ?? null, limit: Math.max(1, Math.min(500, limit)) }
+  });
+
+  const res = await fetch(`https://api.politicsandwar.com/graphql?api_key=${encodeURIComponent(apiKey)}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query, variables: { ids } }),
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body
   });
 
   if (!res.ok) {
@@ -140,23 +175,22 @@ export async function fetchAllianceBankrecsViaGQL(
     throw new Error(`PnW GraphQL HTTP ${res.status}: ${t.slice(0, 200)}`);
   }
 
-  const json: any = await res.json();
+  const json = await res.json();
   const records: Bankrec[] = json?.data?.alliances?.data?.[0]?.bankrecs ?? [];
 
-  // Optional filters
+  // Normalize / filter by tax flag (non-zero = tax bracket id)
+  const isTax = (v: any) => v != null && v !== 0 && v !== "0";
   let filtered = records;
-  if (filter === "tax")     filtered = records.filter(r => r.tax_id && r.tax_id !== "0");
-  if (filter === "nontax")  filtered = records.filter(r => !r.tax_id || r.tax_id === "0");
-
-  if (afterId != null) {
-    const n = Number(afterId);
-    filtered = filtered.filter(r => Number(r.id) > n);
-  }
-
+  if (filter === "tax")     filtered = records.filter(r => isTax(r?.tax_id));
+  if (filter === "nontax")  filtered = records.filter(r => !isTax(r?.tax_id));
   return filtered;
 }
 
-// ---------- convenience wrappers used by commands & index ----------
+/**
+ * ---------------------------
+ * Convenience wrapper used by commands & jobs
+ * ---------------------------
+ */
 export async function fetchBankrecs(
   prisma: PrismaClient,
   allianceId: number,
@@ -164,14 +198,4 @@ export async function fetchBankrecs(
 ): Promise<Bankrec[]> {
   const apiKey = await getAllianceApiKey(prisma, allianceId);
   return fetchAllianceBankrecsViaGQL(apiKey, { allianceId, ...opts });
-}
-
-export async function fetchBankrecsSince(
-  prisma: PrismaClient,
-  allianceId: number,
-  afterId: number,
-  filter: "all" | "tax" | "nontax" = "all",
-  limit = 100
-): Promise<Bankrec[]> {
-  return fetchBankrecs(prisma, allianceId, { afterId, filter, limit });
 }
