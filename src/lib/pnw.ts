@@ -1,7 +1,7 @@
 // src/lib/pnw.ts
 import { PrismaClient } from "@prisma/client";
 
-// Use Node 18+ global fetch (no node-fetch dependency)
+// Use Node 18+ global fetch
 const fetchFn: typeof fetch = (...args: Parameters<typeof fetch>) =>
   (globalThis as any).fetch(...args);
 
@@ -32,9 +32,7 @@ export function zeroDelta(): ResourceDelta {
 
 export function sumDelta(deltas: ResourceDelta[]): ResourceDelta {
   const out = zeroDelta();
-  for (const d of deltas) {
-    for (const k of RESOURCE_KEYS) out[k] += d[k];
-  }
+  for (const d of deltas) for (const k of RESOURCE_KEYS) out[k] += d[k];
   return out;
 }
 
@@ -49,6 +47,28 @@ export function signedDeltaFor(rec: any): ResourceDelta {
 }
 
 // ---------------------------
+// API key resolver (DB -> ENV)
+// ---------------------------
+async function resolveApiKey(prisma: PrismaClient, allianceId: number): Promise<string> {
+  try {
+    const keyRec = await prisma.allianceKey.findFirst({
+      where: { allianceId },
+      orderBy: { id: "desc" },
+    });
+    const fromDb = (keyRec as any)?.decrypted || (keyRec as any)?.apiKey;
+    if (fromDb && String(fromDb).trim()) return String(fromDb).trim();
+  } catch {
+    // ignore prisma errors; we still try env
+  }
+  const envKey =
+    process.env[`PNW_API_KEY_${allianceId}`] ||
+    process.env.PNW_API_KEY ||
+    "";
+  if (envKey.trim()) return envKey.trim();
+  throw new Error("Alliance key record missing usable apiKey");
+}
+
+// ---------------------------
 // GraphQL Bankrec Fetch
 // ---------------------------
 export async function fetchAllianceBankrecsViaGQL(
@@ -56,13 +76,7 @@ export async function fetchAllianceBankrecsViaGQL(
   allianceId: number,
   opts: { afterId?: string; limit?: number; filter?: "all" | "tax" | "nontax" } = {}
 ) {
-  const keyRec = await prisma.allianceKey.findFirst({
-    where: { allianceId },
-    orderBy: { id: "desc" },
-  });
-  if (!keyRec) throw new Error(`No API key stored for alliance ${allianceId}`);
-  const apiKey = (keyRec as any).decrypted || keyRec.apiKey || null;
-  if (!apiKey) throw new Error(`Alliance key record missing usable apiKey`);
+  const apiKey = await resolveApiKey(prisma, allianceId);
 
   const { afterId, limit = 50 } = opts;
   const query = `
@@ -102,7 +116,7 @@ export async function fetchAllianceBankrecsViaGQL(
     variables: { aid: allianceId, limit, afterId },
   });
 
-  // PnW requires api_key in the query string (header is ignored)
+  // PnW requires api_key in query string
   const url = "https://api.politicsandwar.com/graphql?api_key=" + encodeURIComponent(apiKey);
   const res = await fetchFn(url, {
     method: "POST",
@@ -116,9 +130,7 @@ export async function fetchAllianceBankrecsViaGQL(
   }
 
   const json = await res.json();
-  if (json.errors) {
-    throw new Error("PnW GraphQL error: " + JSON.stringify(json.errors));
-  }
+  if (json.errors) throw new Error("PnW GraphQL error: " + JSON.stringify(json.errors));
 
   const alliance = json.data?.alliances?.data?.[0];
   if (!alliance) return [];
