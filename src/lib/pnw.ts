@@ -1,6 +1,9 @@
 // src/lib/pnw.ts
-import fetch from "node-fetch";
 import { PrismaClient } from "@prisma/client";
+
+// Use Node 18+ global fetch (no node-fetch dependency)
+const fetchFn: typeof fetch = (...args: Parameters<typeof fetch>) =>
+  (globalThis as any).fetch(...args);
 
 // ---------------------------
 // Resource Keys + Delta Utils
@@ -39,7 +42,7 @@ export function signedDeltaFor(rec: any): ResourceDelta {
   const out = zeroDelta();
   for (const k of RESOURCE_KEYS) {
     const v = rec[k] ?? 0;
-    // incoming -> positive, outgoing -> negative
+    // incoming -> positive, outgoing -> negative (2 = alliance)
     out[k] = rec.receiver_type === 2 ? v : -v;
   }
   return out;
@@ -58,12 +61,12 @@ export async function fetchAllianceBankrecsViaGQL(
     orderBy: { id: "desc" },
   });
   if (!keyRec) throw new Error(`No API key stored for alliance ${allianceId}`);
-  const apiKey = keyRec.decrypted || keyRec.apiKey || null;
+  const apiKey = (keyRec as any).decrypted || keyRec.apiKey || null;
   if (!apiKey) throw new Error(`Alliance key record missing usable apiKey`);
 
   const { afterId, limit = 50 } = opts;
   const query = `
-    query($aid:Int!,$limit:Int){
+    query($aid:Int!,$limit:Int,$afterId:ID){
       alliances(ids:[$aid]){
         data{
           id
@@ -99,9 +102,9 @@ export async function fetchAllianceBankrecsViaGQL(
     variables: { aid: allianceId, limit, afterId },
   });
 
-  // ---- FIX: use URL param for api_key, PnW ignores headers ----
+  // PnW requires api_key in the query string (header is ignored)
   const url = "https://api.politicsandwar.com/graphql?api_key=" + encodeURIComponent(apiKey);
-  const res = await fetch(url, {
+  const res = await fetchFn(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body,
@@ -109,13 +112,7 @@ export async function fetchAllianceBankrecsViaGQL(
 
   if (!res.ok) {
     const t = await res.text().catch(() => "");
-    if (res.status === 500) {
-      throw new Error(
-        `PnW GraphQL HTTP 500 on alliances/bankrecs (server error).\n` +
-        `Raw: ${t.slice(0,200)}`
-      );
-    }
-    throw new Error(`PnW GraphQL HTTP ${res.status}: ${t.slice(0,200)}`);
+    throw new Error(`PnW GraphQL HTTP ${res.status}: ${t.slice(0, 200)}`);
   }
 
   const json = await res.json();
