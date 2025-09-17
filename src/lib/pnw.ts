@@ -85,3 +85,73 @@ export async function fetchAllianceBankrecsViaGQL(
             bauxite
             lead
             gasoline
+            munitions
+            steel
+            aluminum
+            food
+          }
+        }
+      }
+    }`;
+
+  const body = JSON.stringify({
+    query,
+    variables: { aid: allianceId, limit, afterId },
+  });
+
+  // ---- FIX: use URL param for api_key, PnW ignores headers ----
+  const url = "https://api.politicsandwar.com/graphql?api_key=" + encodeURIComponent(apiKey);
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body,
+  });
+
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    if (res.status === 500) {
+      throw new Error(
+        `PnW GraphQL HTTP 500 on alliances/bankrecs (server error).\n` +
+        `Raw: ${t.slice(0,200)}`
+      );
+    }
+    throw new Error(`PnW GraphQL HTTP ${res.status}: ${t.slice(0,200)}`);
+  }
+
+  const json = await res.json();
+  if (json.errors) {
+    throw new Error("PnW GraphQL error: " + JSON.stringify(json.errors));
+  }
+
+  const alliance = json.data?.alliances?.data?.[0];
+  if (!alliance) return [];
+
+  let recs: any[] = alliance.bankrecs || [];
+
+  if (opts.filter === "tax") {
+    recs = recs.filter(r => Number(r.tax_id) > 0);
+  } else if (opts.filter === "nontax") {
+    recs = recs.filter(r => Number(r.tax_id) === 0);
+  }
+
+  return recs;
+}
+
+// ---------------------------
+// Convenience wrappers
+// ---------------------------
+export async function fetchBankrecs(
+  prisma: PrismaClient,
+  allianceId: number,
+  opts?: { afterId?: string; limit?: number; filter?: "all" | "tax" | "nontax" }
+) {
+  return fetchAllianceBankrecsViaGQL(prisma, allianceId, opts);
+}
+
+export async function fetchBankrecsSince(
+  prisma: PrismaClient,
+  allianceId: number,
+  afterId: string
+) {
+  return fetchAllianceBankrecsViaGQL(prisma, allianceId, { afterId });
+}
