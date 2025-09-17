@@ -99,36 +99,61 @@ export async function fetchAllianceBankrecsViaGQL(
 ): Promise<Bankrec[]> {
   const { allianceId, afterId, limit = 100, filter = "all" } = params;
 
-  const query = `
-    query AllianceBank($aid:Int!, $after:Int, $limit:Int!) {
-      alliances(ids: [$aid]) {
-        data {
-          id
-          name
-          bankrecs(after_id: $after, limit: $limit) {
+  // Build query so that we DO NOT declare or pass $after unless we actually have a value.
+  const hasAfter = typeof afterId === "number" && Number.isFinite(afterId);
+
+  const query = hasAfter
+    ? `
+      query AllianceBank($aid:Int!, $after:Int!, $limit:Int!) {
+        alliances(ids: [$aid]) {
+          data {
             id
-            date
-            note
-            tax_id
-            sender_type
-            receiver_type
-            sender_id
-            receiver_id
+            name
+            bankrecs(after_id: $after, limit: $limit) {
+              id
+              date
+              note
+              tax_id
+              sender_type
+              receiver_type
+              sender_id
+              receiver_id
+            }
           }
         }
       }
-    }
-  `;
+    `
+    : `
+      query AllianceBank($aid:Int!, $limit:Int!) {
+        alliances(ids: [$aid]) {
+          data {
+            id
+            name
+            bankrecs(limit: $limit) {
+              id
+              date
+              note
+              tax_id
+              sender_type
+              receiver_type
+              sender_id
+              receiver_id
+            }
+          }
+        }
+      }
+    `;
 
-  const body = JSON.stringify({
-    query,
-    variables: { aid: allianceId, after: afterId ?? null, limit: Math.max(1, Math.min(500, limit)) }
-  });
+  const variables: Record<string, any> = {
+    aid: allianceId,
+    limit: Math.max(1, Math.min(500, limit)),
+  };
+  if (hasAfter) variables.after = afterId;
 
   const res = await fetch(`https://api.politicsandwar.com/graphql?api_key=${apiKey}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body
+    body: JSON.stringify({ query, variables }),
   });
 
   if (!res.ok) {
