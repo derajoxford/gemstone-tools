@@ -2,79 +2,84 @@
 import {
   SlashCommandBuilder,
   ChatInputCommandInteraction,
-  EmbedBuilder,
+  PermissionFlagsBits,
 } from "discord.js";
 import { PrismaClient } from "@prisma/client";
-import { fetchBankrecsSince } from "../lib/pnw.js";
-import { readTaxCursor } from "../utils/pnw_cursor.js";
+import { fetchBankrecs, type Bankrec } from "../lib/pnw.js";
 
 const prisma = new PrismaClient();
 
 export const data = new SlashCommandBuilder()
   .setName("pnw_bankpeek")
-  .setDescription("Debug: fetch recent bankrecs from PnW GQL for an alliance")
-  .setDefaultMemberPermissions(0)
-  .setDMPermission(false)
-  .addIntegerOption((opt) =>
-    opt.setName("alliance_id").setDescription("Alliance ID").setRequired(true)
+  .setDescription("Fetch recent alliance bank records (optionally filter to tax/non-tax).")
+  .addIntegerOption(o =>
+    o
+      .setName("alliance_id")
+      .setDescription("Alliance ID")
+      .setRequired(true),
   )
-  .addIntegerOption((opt) =>
-    opt.setName("limit").setDescription("Rows to fetch (default 100, max 500)").setRequired(false)
+  .addIntegerOption(o =>
+    o
+      .setName("after_id")
+      .setDescription("Only records after this bankrec ID (optional)")
+      .setRequired(false),
   )
-  .addStringOption((opt) =>
-    opt
+  .addStringOption(o =>
+    o
       .setName("filter")
-      .setDescription("Optional filter")
-      .addChoices({ name: "tax", value: "tax" })
-      .setRequired(false)
-  );
-
-export async function execute(interaction: ChatInputCommandInteraction) {
-  const allianceId = interaction.options.getInteger("alliance_id", true);
-  const limit = Math.min(500, Math.max(1, interaction.options.getInteger("limit") ?? 100));
-
-  try {
-    await interaction.deferReply({ ephemeral: true });
-
-    const sinceId = await readTaxCursor(prisma, allianceId);
-    const rows = await fetchBankrecsSince(prisma, allianceId, sinceId, 500, 5000);
-    const last = rows.slice(-limit);
-
-    const lines = last.map(
-      (r) =>
-        `#${r.id}  tax_id=${r.tax_id}  ${r.sender_type}:${r.sender_id} → ${r.receiver_type}:${r.receiver_id}` +
-        `  money=${r.money} steel=${r.steel} gas=${r.gasoline} munis=${r.munitions}`
-    );
-
-    const embed = new EmbedBuilder()
-      .setTitle(`Bankpeek — Alliance ${allianceId}`)
-      .setDescription(
-        lines.length
-          ? "```txt\n" + lines.join("\n").slice(0, 3900) + (lines.join("\n").length > 3900 ? "\n…(truncated)" : "") + "\n```"
-          : "(no tax rows since cursor)"
+      .setDescription("Filter: all | tax | nontax")
+      .setChoices(
+        { name: "all", value: "all" },
+        { name: "tax", value: "tax" },
+        { name: "nontax", value: "nontax" },
       )
-      .addFields(
-        { name: "Since Cursor", value: String(sinceId ?? "none"), inline: true },
-        { name: "Fetched (tax)", value: String(rows.length), inline: true }
-      );
+      .setRequired(false),
+  )
+  .addIntegerOption(o =>
+    o
+      .setName("limit")
+      .setDescription("Max rows (default 50, max 200)")
+      .setRequired(false),
+  )
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+  .setDMPermission(false);
 
-    await interaction.editReply({ embeds: [embed] });
-  } catch (err: any) {
-    const msg = (err && err.message) ? err.message : String(err);
-    await safeReply(interaction, `PnW GraphQL error: ${msg.slice(0, 1800)}`);
-  }
-}
-
-async function safeReply(interaction: ChatInputCommandInteraction, content: string) {
+export async function execute(i: ChatInputCommandInteraction) {
+  await i.deferReply({ ephemeral: true });
   try {
-    if (interaction.deferred || interaction.replied) {
-      await interaction.editReply({ content });
-    } else {
-      await interaction.reply({ content, ephemeral: true });
+    const allianceId = i.options.getInteger("alliance_id", true)!;
+    const afterId = i.options.getInteger("after_id") ?? null;
+    const filter = (i.options.getString("filter") as "all" | "tax" | "nontax" | null) ?? "all";
+    const limitRaw = i.options.getInteger("limit") ?? 50;
+    const limit = Math.max(1, Math.min(200, limitRaw));
+
+    const rows: Bankrec[] = await fetchBankrecs(prisma, allianceId, { afterId, filter, limit });
+
+    if (!rows.length) {
+      await i.editReply(`No bank records found (alliance ${allianceId}${afterId ? `, after ${afterId}` : ""}, filter=${filter}).`);
+      return;
     }
-  } catch {
-    // swallow; nothing else we can do
+
+    // Show a compact preview (most recent first)
+    const sample = rows
+      .slice()
+      .reverse()
+      .map(r => {
+        const t = r.tax_id != null ? "TAX" : "NT";
+        const amt = (r.amount ?? 0).toLocaleString();
+        const note = (r.note ?? "").replace(/\s+/g, " ").slice(0, 80);
+        return `${r.id} • ${r.date} • ${t} • $${amt} • ${note}`;
+      })
+      .slice(-20) // cap display
+      .join("\n");
+
+    await i.editReply(
+      "```" +
+        `Alliance ${allianceId} • after_id=${afterId ?? "-"} • filter=${filter} • limit=${limit}\n\n` +
+        sample +
+      "```",
+    );
+  } catch (err: any) {
+    await i.editReply(`❌ ${err?.message ?? String(err)}`);
   }
 }
-
-export default { data, execute };
