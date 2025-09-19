@@ -1,209 +1,215 @@
-// src/lib/pnw_bank_ingest.ts
-import { PrismaClient } from '@prisma/client';
+/* eslint-disable @typescript-eslint/no-explicit-any */
+
+import { PrismaClient, AllianceApiKey, AllianceBankCursor } from '@prisma/client';
+import fetch from 'node-fetch';
 
 const prisma = new PrismaClient();
 
-export type BankrecRow = {
+/** PnW constants for bankrec party types (observed) */
+const PARTY_TYPE = {
+  NATION: 1,
+  ALLIANCE: 2,
+  TREASURE: 3, // etc., but we only need ALLIANCE checks here
+} as const;
+
+type BankrecRow = {
   id: string;
-  date: string;
-  note: string;
-  tax_id: string | null;
+  date?: string;
+  note?: string;
+  tax_id?: string;
   sender_type: number;
   receiver_type: number;
   sender_id: string;
   receiver_id: string;
 };
 
-export type PeekFilter = 'all' | 'tax' | 'nontax';
+type BankrecPage = {
+  data: BankrecRow[];
+  paginatorInfo?: {
+    currentPage: number;
+    hasMorePages: boolean;
+  };
+};
 
-const PNW_URL = 'https://api.politicsandwar.com/graphql';
+type GraphQLResponse<T> = {
+  data?: T;
+  errors?: Array<{ message: string }>;
+};
 
-function envInt(name: string, def: number): number {
-  const v = process.env[name];
-  const n = v ? Number(v) : NaN;
-  return Number.isFinite(n) ? n : def;
-}
+const GQL_URL = 'https://api.politicsandwar.com/graphql';
 
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-/**
- * Query the *top-level* bankrecs feed and filter for alliance involvement.
- * This path is resilient vs the alliances(...) 500s.
- */
-export async function queryAllianceBankrecs(opts: {
-  allianceId: number;
-  filter: PeekFilter;
-  afterId?: string; // exclusive lower bound
-  limit: number;    // number of rows to return (after local filtering)
-  apiKey: string;
-}) {
-  const { allianceId, filter, afterId, limit, apiKey } = opts;
-
-  // fail-fast tunables
-  const HTTP_TIMEOUT_MS = envInt('PNW_HTTP_TIMEOUT_MS', 7000);
-  const MAX_RETRIES = envInt('PNW_MAX_RETRIES', 1); // total attempts = 1 + MAX_RETRIES
-  const PAGE_SIZE = Math.min(Math.max(limit, 25), 100); // ask at least 25 to find matches
-
-  // read/update cursor
-  const cursor = await prisma.allianceBankCursor.findUnique({
+/** Load the API key for an alliance from DB (AllianceApiKey) */
+export async function getAllianceApiKey(allianceId: number): Promise<string | null> {
+  const row: AllianceApiKey | null = await prisma.allianceApiKey.findUnique({
     where: { allianceId },
   });
-
-  const effectiveAfterId = afterId ?? cursor?.lastSeenId ?? '';
-
-  let collected: BankrecRow[] = [];
-  let nextPage = 1;
-  let attempts = 0;
-
-  // keep paging until we gather enough local matches or we hit a small cap
-  while (collected.length < limit && nextPage <= 12) {
-    const pageData = await fetchBankrecsPage({
-      apiKey,
-      page: nextPage,
-      first: PAGE_SIZE,
-      timeoutMs: HTTP_TIMEOUT_MS,
-      retries: MAX_RETRIES,
-    });
-
-    if (!pageData) break;
-
-    // stop if server says empty
-    const rows: BankrecRow[] = pageData.data ?? [];
-    if (!rows.length) break;
-
-    // apply afterId (exclusive)
-    const cut = effectiveAfterId
-      ? rows.filter((r) => r.id > effectiveAfterId) // IDs are decimal strings; API is monotonic
-      : rows;
-
-    // filter for our alliance (type 2 means alliance)
-    const mine = cut.filter(
-      (x) =>
-        (x.sender_type === 2 && x.sender_id === String(allianceId)) ||
-        (x.receiver_type === 2 && x.receiver_id === String(allianceId)),
-    );
-
-    // apply tax/nontax
-    const filtered =
-      filter === 'all'
-        ? mine
-        : filter === 'tax'
-          ? mine.filter((x) => x.tax_id && x.tax_id !== '0')
-          : mine.filter((x) => !x.tax_id || x.tax_id === '0');
-
-    collected.push(...filtered);
-
-    // if the last item on this page is <= effectiveAfterId, we can stop early
-    const maxIdOnPage = rows[rows.length - 1]?.id ?? '';
-    if (effectiveAfterId && maxIdOnPage <= effectiveAfterId) break;
-
-    nextPage++;
-    attempts++;
-    if (attempts > 1) await sleep(250);
-  }
-
-  // sort ascending by id, return most recent last
-  collected.sort((a, b) => Number(a.id) - Number(b.id));
-
-  // update cursor to newest seen id (if we actually have newer)
-  const newest = collected.length ? collected[collected.length - 1].id : undefined;
-  if (newest && (!cursor || newest > (cursor.lastSeenId ?? ''))) {
-    await prisma.allianceBankCursor.upsert({
-      where: { allianceId },
-      update: { lastSeenId: newest },
-      create: { allianceId, lastSeenId: newest },
-    });
-  }
-
-  // trim down to exactly limit but keep recency ordering: return last N
-  const out =
-    collected.length > limit ? collected.slice(collected.length - limit) : collected;
-
-  return out;
+  return row?.apiKey ?? null;
 }
 
-async function fetchBankrecsPage(params: {
-  apiKey: string;
-  first: number;
-  page: number;
-  timeoutMs: number;
-  retries: number;
-}) {
-  const { apiKey, first, page, timeoutMs, retries } = params;
+/** Cursor helpers (ALL camelCase to match prisma schema) */
+export async function getAllianceCursor(allianceId: number): Promise<AllianceBankCursor | null> {
+  return prisma.allianceBankCursor.findUnique({ where: { allianceId } });
+}
 
-  const query = `
-    query($first:Int!,$page:Int!){
-      bankrecs(first:$first,page:$page){
-        data{
-          id
-          date
-          note
-          tax_id
-          sender_type
-          receiver_type
-          sender_id
-          receiver_id
-        }
-        paginatorInfo{
-          currentPage
-          hasMorePages
-        }
+export async function setAllianceCursor(allianceId: number, lastSeenId: string): Promise<void> {
+  await prisma.allianceBankCursor.upsert({
+    where: { allianceId },
+    update: { lastSeenId },
+    create: { allianceId, lastSeenId },
+  });
+}
+
+/** Minimal top-level bankrecs page query (no filters available server-side) */
+const BANKRECS_PAGE_QUERY = `
+  query BankrecsPage($first:Int!,$page:Int!) {
+    bankrecs(first:$first, page:$page) {
+      data {
+        id
+        date
+        note
+        tax_id
+        sender_type
+        receiver_type
+        sender_id
+        receiver_id
       }
-    }`;
+      paginatorInfo { currentPage hasMorePages }
+    }
+  }
+`;
 
-  let attempt = 0;
-  while (true) {
+/** Robust GraphQL fetch with simple retry/backoff for flaky 500/502/ECONNRESET */
+async function gql<T>(apiKey: string, query: string, variables: Record<string, any>): Promise<T> {
+  const url = `${GQL_URL}?api_key=${encodeURIComponent(apiKey)}`;
+  let lastErr: any;
+  const maxAttempts = 4;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const ac = new AbortController();
-      const to = setTimeout(() => ac.abort(), timeoutMs);
-
-      const res = await fetch(`${PNW_URL}?api_key=${encodeURIComponent(apiKey)}`, {
+      const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query, variables: { first, page } }),
-        signal: ac.signal,
+        body: JSON.stringify({ query, variables }),
       });
-
-      clearTimeout(to);
 
       const text = await res.text();
 
       if (!res.ok) {
-        // Cloudflare sometimes returns HTML 500/502; surface succinctly
-        throw new Error(`PnW GraphQL HTTP ${res.status}: ${text.slice(0, 180)}`);
+        // Cloudflare sometimes returns HTML (500 page). Surface it as-is.
+        throw new Error(`PnW GraphQL HTTP ${res.status}: ${text}`);
       }
 
-      const json = JSON.parse(text);
-      const data = json?.data?.bankrecs;
-      if (!data) return null;
+      const parsed = JSON.parse(text) as GraphQLResponse<any>;
+      if (parsed.errors?.length) {
+        throw new Error(`PnW GraphQL errors: ${parsed.errors.map(e => e.message).join('; ')}`);
+      }
 
-      return {
-        data: data.data as BankrecRow[],
-        pageInfo: data.paginatorInfo as { currentPage: number; hasMorePages: boolean },
-      };
-    } catch (err) {
-      if (attempt >= retries) throw err;
-      attempt++;
-      await sleep(300 * attempt);
+      return parsed.data as T;
+    } catch (err: any) {
+      lastErr = err;
+      // Backoff: 0.5s, 1s, 2s …
+      const waitMs = 500 * Math.pow(2, attempt - 1);
+      await new Promise(r => setTimeout(r, waitMs));
     }
   }
+
+  throw lastErr ?? new Error('PnW GraphQL failed after retries');
+}
+
+/** Predicate: does a bankrec involve this alliance? */
+function involvesAlliance(rec: BankrecRow, allianceId: number): boolean {
+  const isSenderAlliance = rec.sender_type === PARTY_TYPE.ALLIANCE && Number(rec.sender_id) === allianceId;
+  const isReceiverAlliance = rec.receiver_type === PARTY_TYPE.ALLIANCE && Number(rec.receiver_id) === allianceId;
+  return isSenderAlliance || isReceiverAlliance;
+}
+
+/** Optional subfilter: only tax or only non-tax */
+export type BankrecFilter = 'all' | 'tax' | 'nontax';
+
+function passesFilter(rec: BankrecRow, filter: BankrecFilter): boolean {
+  if (filter === 'all') return true;
+  const isTax = rec.tax_id && rec.tax_id !== '0';
+  return filter === 'tax' ? !!isTax : !isTax;
 }
 
 /**
- * Get an API key for an alliance:
- *   1) DB (alliance_api_keys)
- *   2) env PNW_API_KEY_<aid>
- *   3) env PNW_API_KEY
+ * Page through bankrecs until we gather `limit` rows for `allianceId`,
+ * honoring `afterId` (exclusive) if provided. Because the API doesn’t expose
+ * alliance filters, we scan pages and filter client-side.
  */
-export async function resolveAllianceApiKey(allianceId: number): Promise<string | null> {
-  const row = await prisma.allianceApiKey.findUnique({
-    where: { allianceId },
-    select: { apiKey: true },
-  });
-  if (row?.apiKey) return row.apiKey;
+export async function queryAllianceBankrecs(params: {
+  allianceId: number;
+  apiKey: string;
+  limit: number;
+  afterId?: string; // exclusive cursor
+  filter: BankrecFilter;
+  pageLimit?: number; // safety cap for how many pages to scan
+}): Promise<BankrecRow[]> {
+  const { allianceId, apiKey, limit, afterId, filter, pageLimit = 60 } = params;
 
-  const envKey = process.env[`PNW_API_KEY_${allianceId}`] || process.env['PNW_API_KEY'];
-  return envKey ?? null;
+  const first = 50; // per-page size
+  let page = 1;
+  const out: BankrecRow[] = [];
+
+  const seenAfterId = new Set<string>();
+  if (afterId) seenAfterId.add(afterId);
+
+  while (out.length < limit && page <= pageLimit) {
+    const data = await gql<{ bankrecs: BankrecPage }>(apiKey, BANKRECS_PAGE_QUERY, { first, page });
+    const rows = data.bankrecs?.data ?? [];
+
+    for (const rec of rows) {
+      if (afterId && rec.id === afterId) {
+        // Found the cursor id in-stream; all earlier IDs on later pages will be older.
+        continue;
+      }
+      if (!involvesAlliance(rec, allianceId)) continue;
+      if (!passesFilter(rec, filter)) continue;
+
+      // Stop if we have already passed the afterId (IDs grow over time; we treat afterId as exclusive)
+      if (afterId && rec.id <= afterId) continue;
+
+      out.push(rec);
+      if (out.length >= limit) break;
+    }
+
+    const more = data.bankrecs?.paginatorInfo?.hasMorePages;
+    if (!more) break;
+    page += 1;
+    // be polite
+    await new Promise(r => setTimeout(r, 200));
+  }
+
+  return out;
+}
+
+/**
+ * Monitor job helper:
+ * - reads alliance API key
+ * - reads cursor
+ * - fetches new rows after cursor
+ * - updates cursor to newest seen id (max)
+ */
+export async function pollAndAdvanceCursor(allianceId: number, filter: BankrecFilter = 'all'): Promise<BankrecRow[]> {
+  const apiKey = await getAllianceApiKey(allianceId);
+  if (!apiKey) throw new Error(`No API key found for alliance ${allianceId}`);
+
+  const cursor = await getAllianceCursor(allianceId);
+  const afterId = cursor?.lastSeenId;
+
+  const rows = await queryAllianceBankrecs({
+    allianceId,
+    apiKey,
+    limit: 100,
+    afterId,
+    filter,
+    pageLimit: 80,
+  });
+
+  if (rows.length) {
+    const newestId = rows.reduce((m, r) => (r.id > m ? r.id : m), afterId ?? '0');
+    await setAllianceCursor(allianceId, newestId);
+  }
+
+  return rows;
 }
