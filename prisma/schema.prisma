@@ -166,3 +166,21 @@ model AllianceBankrec {
   @@index([alliance_id_derived, date], map: "idx_alliance_bankrec_aid_date")
   @@map("alliance_bankrec")
 }
+model AllianceApiKey {
+  allianceId Int      @id
+  apiKey     String
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@map("alliance_api_keys")
+}
+
+model AllianceBankCursor {
+  allianceId Int
+  lastSeenId String
+  updatedAt  DateTime @updatedAt
+
+  @@id([allianceId])
+  @@map("alliance_bank_cursors")
+}
+
