@@ -139,3 +139,30 @@ model AllianceConfig {
   id Int @id @default(autoincrement())
   @@ignore
 }
+// ----- Phase A: Alliance Bank Cache -----
+
+model AllianceBankCursor {
+  alliance_id           Int      @id
+  last_seen_bankrec_id  String   @default("")
+  updated_at            DateTime @default(now())
+
+  @@map("alliance_bank_cursor")
+}
+
+model AllianceBankrec {
+  id                   String   @id
+  date                 DateTime
+  note                 String
+  tax_id               String
+  sender_type          Int
+  receiver_type        Int
+  sender_id            String
+  receiver_id          String
+  alliance_id_derived  Int
+  is_tax_guess         Boolean  @default(false)
+  is_ignored           Boolean  @default(false)
+  created_at           DateTime @default(now())
+
+  @@index([alliance_id_derived, date], map: "idx_alliance_bankrec_aid_date")
+  @@map("alliance_bankrec")
+}
