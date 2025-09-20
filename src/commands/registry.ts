@@ -14,6 +14,9 @@ import * as pnw_bankpeek from './pnw_bankpeek';
 import * as pnw_tax_history from './pnw_tax_history';
 import * as pnw_tax_debug from './pnw_tax_debug';
 
+// NEW: /who command
+import * as who from './who';
+
 export type CommandModule = {
   data?: { name?: string; toJSON?: () => any };
   execute?: (i: any) => Promise<any>;
@@ -34,6 +37,8 @@ export const commandModules: CommandModule[] = [
   pnw_bankpeek,
   pnw_tax_history,
   pnw_tax_debug,
+  // NEW:
+  who,
 ].filter((m) => m?.data && m?.execute);
 
 export const extraCommandsJSON = commandModules
