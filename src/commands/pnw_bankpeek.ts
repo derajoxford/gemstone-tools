@@ -1,79 +1,123 @@
-// src/commands/pnw_bankpeek.ts
-import type { ChatInputCommandInteraction } from "discord.js";
 import {
   SlashCommandBuilder,
+  ChatInputCommandInteraction,
+  bold,
+  inlineCode,
 } from "discord.js";
+
 import {
-  fetchAllianceBankrecs,
+  queryAllianceBankrecs,
+  getAllianceCursor,
+  setAllianceCursor,
   applyPeekFilter,
-  type PeekFilter,
+  type BankrecRow,
+  type BankrecFilter,
 } from "../lib/pnw_bank_ingest";
-import { getAllianceApiKey } from "../utils/secrets"; // tiny helper you already have (or env fallback)
+
+// --- helpers ---
+function toInt(x: unknown): number | null {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : null;
+}
+
+function fmtRow(r: BankrecRow): string {
+  const id = r.id;
+  const when = r.date?.replace("T", " ").replace("+00:00", "Z");
+  const s = r.sender_type === 2 ? `A:${r.sender_id}` : `N:${r.sender_id}`;
+  const t = r.receiver_type === 2 ? `A:${r.receiver_id}` : `N:${r.receiver_id}`;
+  const note = (r.note ?? "").slice(0, 140);
+  return `#${id} • ${when} • ${s} → ${t} • ${note}`;
+}
 
 export const data = new SlashCommandBuilder()
   .setName("pnw_bankpeek")
-  .setDescription("Peek recent alliance bank records")
-  .addIntegerOption(o =>
-    o.setName("alliance_id").setDescription("Alliance ID").setRequired(true))
-  .addStringOption(o =>
-    o.setName("filter")
-     .setDescription("all | tax | nontax")
-     .addChoices(
-       { name: "all", value: "all" },
-       { name: "tax", value: "tax" },
-       { name: "nontax", value: "nontax" },
-     )
-     .setRequired(false))
-  .addIntegerOption(o =>
-    o.setName("limit").setDescription("Rows (<=100)").setRequired(false))
-  .addIntegerOption(o =>
-    o.setName("after_id").setDescription("Only ids > after_id").setRequired(false));
+  .setDescription("Peek at recent alliance bank records via PnW GraphQL")
+  .addIntegerOption((opt) =>
+    opt
+      .setName("alliance_id")
+      .setDescription("Alliance ID (e.g., 14258)")
+      .setRequired(true)
+  )
+  .addStringOption((opt) =>
+    opt
+      .setName("filter")
+      .setDescription("Filter rows")
+      .addChoices(
+        { name: "all", value: "all" },
+        { name: "tax", value: "tax" },
+        { name: "nontax", value: "nontax" },
+      )
+      .setRequired(true)
+  )
+  .addIntegerOption((opt) =>
+    opt
+      .setName("limit")
+      .setDescription("Max rows to show (1-100)")
+      .setRequired(false)
+  )
+  .addIntegerOption((opt) =>
+    opt
+      .setName("after_id")
+      .setDescription("Only rows with id > after_id")
+      .setRequired(false)
+  );
 
 export async function execute(interaction: ChatInputCommandInteraction) {
-  await interaction.deferReply({ ephemeral: false });
+  await interaction.deferReply({ ephemeral: true });
 
-  const allianceId = interaction.options.getInteger("alliance_id", true);
-  const filter = (interaction.options.getString("filter") ?? "all") as PeekFilter;
-  const limit = Math.max(1, Math.min(100, interaction.options.getInteger("limit") ?? 25));
-  const afterId = interaction.options.getInteger("after_id") ?? null;
-
-  // Pull API key for this alliance (fallback to env if you do that)
-  const apiKey = await getAllianceApiKey(allianceId);
-  if (!apiKey) {
-    await interaction.editReply(`Alliance ${allianceId} • missing API key`);
-    return;
+  // pull options robustly and validate
+  const aidOpt =
+    interaction.options.getInteger("alliance_id") ??
+    interaction.options.getInteger("allianceId") ??
+    interaction.options.getInteger("aid");
+  const allianceId = toInt(aidOpt);
+  if (!allianceId) {
+    return interaction.editReply("❌ Error: Invalid alliance_id (must be a positive integer).");
   }
 
+  const filter = (interaction.options.getString("filter") ?? "all") as BankrecFilter;
+  const limit = Math.max(
+    1,
+    Math.min(toInt(interaction.options.getInteger("limit")) ?? 10, 100)
+  );
+  const afterId = toInt(interaction.options.getInteger("after_id") ?? undefined) ?? undefined;
+
   try {
-    const rows = await fetchAllianceBankrecs({
-      apiKey,
+    const rows = await queryAllianceBankrecs(
+      // pass undefined prisma so we can still work off env keys;
+      // if you want DB-backed keys, wire your prisma instance here.
+      undefined,
       allianceId,
+      filter,
       limit,
-      minId: afterId,
-    });
+      afterId ?? (await getAllianceCursor(undefined, allianceId) ?? undefined)
+    );
 
-    const filtered = applyPeekFilter(rows, filter);
-    const head = filtered.slice(0, limit);
+    const shown = rows.slice(0, limit);
+    const header =
+      `${bold(`Alliance ${allianceId}`)} • ` +
+      `after_id=${inlineCode(String(afterId ?? "-"))} • ` +
+      `filter=${inlineCode(filter)} • ` +
+      `limit=${inlineCode(String(limit))}`;
 
-    if (head.length === 0) {
-      await interaction.editReply(`Alliance ${allianceId} • after_id=${afterId ?? "—"} • filter=${filter} • limit=${limit}\n\nNo bank records found.`);
+    if (shown.length === 0) {
+      await interaction.editReply(`${header}\n\nNo bank records found.`);
       return;
     }
 
-    const lines = head.map(r => {
-      const when = new Date(r.date).toISOString().replace("T", " ").replace(".000Z", "Z");
-      const note = (r.note ?? "").replaceAll("\n", " ").slice(0, 120);
-      return `• #${r.id} — ${when} — s(${r.sender_type}:${r.sender_id}) → r(${r.receiver_type}:${r.receiver_id}) — ${note}`;
-    });
+    const newest = toInt(shown[0]?.id) ?? null; // Graph returns newest-first
+    if (newest != null) {
+      // best-effort cursor save (safe no-op if no DB wired)
+      await setAllianceCursor(undefined, allianceId, newest);
+    }
 
-    await interaction.editReply(
-      [
-        `Alliance ${allianceId} • after_id=${afterId ?? "—"} • filter=${filter} • limit=${limit}`,
-        "",
-        ...lines,
-      ].join("\n")
-    );
-  } catch (err: any) {
-    await interaction.editReply(`Alliance ${allianceId} • error: ${err?.message ?? String(err)}`);
+    const body = shown.map(fmtRow).join("\n");
+    await interaction.editReply(`${header}\n\n${body}`);
+  } catch (e: any) {
+    await interaction.editReply(`❌ Error: ${e?.message ?? String(e)}`);
   }
 }
+
+export const commandMeta = {
+  name: "pnw_bankpeek",
+};
