@@ -1,123 +1,89 @@
+// src/commands/pnw_bankpeek.ts
 import {
   SlashCommandBuilder,
   ChatInputCommandInteraction,
-  bold,
-  inlineCode,
+  EmbedBuilder,
 } from "discord.js";
-
 import {
   queryAllianceBankrecs,
-  getAllianceCursor,
-  setAllianceCursor,
-  applyPeekFilter,
-  type BankrecRow,
-  type BankrecFilter,
+  BankrecFilter,
 } from "../lib/pnw_bank_ingest";
 
-// --- helpers ---
-function toInt(x: unknown): number | null {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : null;
-}
-
-function fmtRow(r: BankrecRow): string {
-  const id = r.id;
-  const when = r.date?.replace("T", " ").replace("+00:00", "Z");
-  const s = r.sender_type === 2 ? `A:${r.sender_id}` : `N:${r.sender_id}`;
-  const t = r.receiver_type === 2 ? `A:${r.receiver_id}` : `N:${r.receiver_id}`;
-  const note = (r.note ?? "").slice(0, 140);
-  return `#${id} • ${when} • ${s} → ${t} • ${note}`;
+// Helper to coerce the filter safely
+function parseFilter(raw?: string | null): BankrecFilter {
+  const v = (raw || "").toLowerCase();
+  if (v === "tax") return BankrecFilter.TAX;
+  return BankrecFilter.ALL;
 }
 
 export const data = new SlashCommandBuilder()
   .setName("pnw_bankpeek")
-  .setDescription("Peek at recent alliance bank records via PnW GraphQL")
-  .addIntegerOption((opt) =>
-    opt
+  .setDescription("Show recent alliance bank/tax records (PnW)")
+  .addIntegerOption((o) =>
+    o
       .setName("alliance_id")
-      .setDescription("Alliance ID (e.g., 14258)")
+      .setDescription("PnW alliance ID (e.g. 14258)")
       .setRequired(true)
   )
-  .addStringOption((opt) =>
-    opt
+  .addStringOption((o) =>
+    o
       .setName("filter")
-      .setDescription("Filter rows")
+      .setDescription("Which records to show")
       .addChoices(
-        { name: "all", value: "all" },
-        { name: "tax", value: "tax" },
-        { name: "nontax", value: "nontax" },
+        { name: "all (bankrecs)", value: "all" },
+        { name: "tax (taxrecs)", value: "tax" },
       )
-      .setRequired(true)
   )
-  .addIntegerOption((opt) =>
-    opt
+  .addIntegerOption((o) =>
+    o
       .setName("limit")
-      .setDescription("Max rows to show (1-100)")
-      .setRequired(false)
-  )
-  .addIntegerOption((opt) =>
-    opt
-      .setName("after_id")
-      .setDescription("Only rows with id > after_id")
-      .setRequired(false)
+      .setDescription("How many rows (default 10, max 50)")
   );
 
 export async function execute(interaction: ChatInputCommandInteraction) {
-  await interaction.deferReply({ ephemeral: true });
+  const allianceId = interaction.options.getInteger("alliance_id", true);
+  const limitRaw = interaction.options.getInteger("limit", false) ?? 10;
+  const limit = Math.max(1, Math.min(50, limitRaw));
+  const filter = parseFilter(interaction.options.getString("filter", false));
 
-  // pull options robustly and validate
-  const aidOpt =
-    interaction.options.getInteger("alliance_id") ??
-    interaction.options.getInteger("allianceId") ??
-    interaction.options.getInteger("aid");
-  const allianceId = toInt(aidOpt);
-  if (!allianceId) {
-    return interaction.editReply("❌ Error: Invalid alliance_id (must be a positive integer).");
-  }
-
-  const filter = (interaction.options.getString("filter") ?? "all") as BankrecFilter;
-  const limit = Math.max(
-    1,
-    Math.min(toInt(interaction.options.getInteger("limit")) ?? 10, 100)
-  );
-  const afterId = toInt(interaction.options.getInteger("after_id") ?? undefined) ?? undefined;
+  await interaction.deferReply({ ephemeral: false });
 
   try {
-    const rows = await queryAllianceBankrecs(
-      // pass undefined prisma so we can still work off env keys;
-      // if you want DB-backed keys, wire your prisma instance here.
-      undefined,
-      allianceId,
-      filter,
-      limit,
-      afterId ?? (await getAllianceCursor(undefined, allianceId) ?? undefined)
-    );
+    // IMPORTANT: use positional args (number, limit, filter) to avoid the undefined-object bug
+    const rows = await queryAllianceBankrecs(allianceId, limit, filter);
 
-    const shown = rows.slice(0, limit);
-    const header =
-      `${bold(`Alliance ${allianceId}`)} • ` +
-      `after_id=${inlineCode(String(afterId ?? "-"))} • ` +
-      `filter=${inlineCode(filter)} • ` +
-      `limit=${inlineCode(String(limit))}`;
-
-    if (shown.length === 0) {
-      await interaction.editReply(`${header}\n\nNo bank records found.`);
+    if (!rows || rows.length === 0) {
+      await interaction.editReply(
+        `Alliance **${allianceId}** • filter=\`${filter}\` • limit=${limit}\n\n_No records found._`
+      );
       return;
     }
 
-    const newest = toInt(shown[0]?.id) ?? null; // Graph returns newest-first
-    if (newest != null) {
-      // best-effort cursor save (safe no-op if no DB wired)
-      await setAllianceCursor(undefined, allianceId, newest);
-    }
+    const lines = rows.map((x) => {
+      const sT = Number(x.sender_type);
+      const rT = Number(x.receiver_type);
+      const sId = String(x.sender_id);
+      const rId = String(x.receiver_id);
+      const note = x.note ?? "";
+      const ts = new Date(x.date).toISOString().replace("T", " ").replace(".000Z", "Z");
+      return `• **${x.id}** — ${ts} — S:${sT}/${sId} → R:${rT}/${rId} — _${note}_`;
+    });
 
-    const body = shown.map(fmtRow).join("\n");
-    await interaction.editReply(`${header}\n\n${body}`);
-  } catch (e: any) {
-    await interaction.editReply(`❌ Error: ${e?.message ?? String(e)}`);
+    const title =
+      filter === BankrecFilter.TAX
+        ? `Alliance ${allianceId} • taxrecs • limit=${limit}`
+        : `Alliance ${allianceId} • bankrecs • limit=${limit}`;
+
+    const embed = new EmbedBuilder()
+      .setTitle(title)
+      .setDescription(lines.join("\n").slice(0, 4000))
+      .setTimestamp(new Date());
+
+    await interaction.editReply({ embeds: [embed] });
+  } catch (err: any) {
+    const msg =
+      err?.message ??
+      (typeof err === "string" ? err : "Unknown error");
+    await interaction.editReply(`❌ Error: ${msg}`);
   }
 }
-
-export const commandMeta = {
-  name: "pnw_bankpeek",
-};
