@@ -13,7 +13,7 @@ import * as pnw_tax_ids from "./pnw_tax_ids";
 import * as pnw_bankpeek from './pnw_bankpeek'; 
 import * as pnw_tax_history from './pnw_tax_history';
 import * as pnw_tax_debug from './pnw_tax_debug';
-
+import * as pnw_tax_sync from './pnw_tax_sync';
 // NEW: /who command
 import * as who from './who';
 
@@ -39,6 +39,7 @@ export const commandModules: CommandModule[] = [
   pnw_tax_debug,
   // NEW:
   who,
+  pnw_tax_sync, 
 ].filter((m) => m?.data && m?.execute);
 
 export const extraCommandsJSON = commandModules
