@@ -17,10 +17,10 @@ enum WithdrawStatus {
 }
 
 model Alliance {
-  id              Int        @id                 // PnW alliance id
+  id              Int        @id
   guildId         String?
   name            String?
-  reviewChannelId String?    // channel to post approval buttons
+  reviewChannelId String?
   createdAt       DateTime   @default(now())
   updatedAt       DateTime   @updatedAt
   lastBankrecId   Int?
@@ -28,8 +28,6 @@ model Alliance {
   keys            AllianceKey[]
   members         Member[]
   bankrecs        Bankrec[]
-
-  // 1:1 link to treasury
   treasury        AllianceTreasury?
 }
 
@@ -40,7 +38,7 @@ model AllianceKey {
   encryptedBotKey  Bytes?
   nonceApi         Bytes
   nonceBot         Bytes?
-  addedBy          String   // discord user id
+  addedBy          String
   createdAt        DateTime @default(now())
   alliance         Alliance @relation(fields: [allianceId], references: [id])
 }
@@ -48,7 +46,7 @@ model AllianceKey {
 model Member {
   id          Int      @id @default(autoincrement())
   allianceId  Int
-  discordId   String   // discord user id
+  discordId   String
   nationId    Int
   nationName  String
   createdAt   DateTime @default(now())
@@ -80,7 +78,7 @@ model Safekeeping {
 }
 
 model Bankrec {
-  id           Int      @id            // bankrec id from PnW
+  id           Int      @id
   allianceId   Int
   date         DateTime
   note         String?
@@ -110,9 +108,9 @@ model WithdrawalRequest {
   memberId    Int
   status      WithdrawStatus  @default(PENDING)
   payload     Json
-  createdBy   String          // discord user id
-  reviewerId  String?         // discord user id
-  bankrecPaid Int?            // bankrec id once paid
+  createdBy   String
+  reviewerId  String?
+  bankrecPaid Int?
   createdAt   DateTime        @default(now())
   updatedAt   DateTime        @updatedAt
 }
@@ -127,8 +125,7 @@ model AllianceTreasury {
 }
 
 //
-// Legacy tables we do NOT want Prisma to manage or drop.
-// Keeping them ignored prevents `db push` from proposing to delete them.
+// Legacy ignored tables
 //
 model Setting {
   id Int @id @default(autoincrement())
@@ -139,16 +136,10 @@ model AllianceConfig {
   id Int @id @default(autoincrement())
   @@ignore
 }
-// ----- Phase A: Alliance Bank Cache -----
 
-model AllianceBankCursor {
-  alliance_id           Int      @id
-  last_seen_bankrec_id  String   @default("")
-  updated_at            DateTime @default(now())
-
-  @@map("alliance_bank_cursor")
-}
-
+//
+// Alliance banking cache
+//
 model AllianceBankrec {
   id                   String   @id
   date                 DateTime
@@ -166,6 +157,7 @@ model AllianceBankrec {
   @@index([alliance_id_derived, date], map: "idx_alliance_bankrec_aid_date")
   @@map("alliance_bankrec")
 }
+
 model AllianceApiKey {
   allianceId Int      @id
   apiKey     String
@@ -184,3 +176,11 @@ model AllianceBankCursor {
   @@map("alliance_bank_cursors")
 }
 
+model AllianceTaxCursor {
+  allianceId Int
+  lastSeenId String
+  updatedAt  DateTime @updatedAt
+
+  @@id([allianceId])
+  @@map("alliance_tax_cursors")
+}
