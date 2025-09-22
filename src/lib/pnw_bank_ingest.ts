@@ -1,107 +1,159 @@
 // src/lib/pnw_bank_ingest.ts
-import fetch from "node-fetch";
+// Back-compat shim to satisfy old command imports and route to working GraphQL shapes.
+// Uses Node 20 global fetch (no node-fetch needed).
 
-export interface BankrecRow {
-  id: string;               // numeric string
-  date: string;             // ISO
-  note: string | null;
-  sender_type: number;      // 1=nation, 2=alliance, 3=trade?
-  sender_id: string;
-  receiver_type: number;
-  receiver_id: string;
+import { PrismaClient } from "@prisma/client";
+const prisma = new PrismaClient();
+
+// Minimal filter enum to match existing command imports.
+export enum BankrecFilter {
+  ALL = "all",
+  TAX = "tax",
 }
 
-export interface FetchOpts {
-  apiKey: string;
-  allianceId: number;
-  limit?: number;           // default 50
-  minId?: number | null;    // fetch rows with id > minId (cursor)
-  timeoutMs?: number;       // default 15000
-}
+// Helper: pick API key from env or DB (AllianceApiKey) if present.
+export async function getAllianceApiKey(allianceId: number): Promise<string> {
+  const envKey =
+    process.env[`PNW_API_KEY_${allianceId}`] ||
+    process.env.PNW_API_KEY ||
+    null;
 
-/**
- * Fetch alliance-scoped bankrecs via GraphQL v3
- * Shape: alliances(id:[ID]) { data { bankrecs(limit: L, min_id: X?) { ... } } }
- */
-export async function fetchAllianceBankrecs(opts: FetchOpts): Promise<BankrecRow[]> {
-  const {
-    apiKey,
-    allianceId,
-    limit = 50,
-    minId = null,
-    timeoutMs = 15000,
-  } = opts;
+  if (envKey) return envKey;
 
-  const url = "https://api.politicsandwar.com/graphql?api_key=" + encodeURIComponent(apiKey);
-
-  const query = `
-    query ($aid:[Int!], $limit:Int!, $min:Int) {
-      alliances(id:$aid) {
-        data {
-          id
-          name
-          bankrecs(limit:$limit, min_id:$min) {
-            id
-            date
-            note
-            sender_type
-            sender_id
-            receiver_type
-            receiver_id
-          }
-        }
-      }
-    }`;
-
-  const body = JSON.stringify({
-    query,
-    variables: { aid: [allianceId], limit, min: minId ?? undefined },
-  });
-
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
-
+  // Optional fallback to DB
   try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body,
-      signal: controller.signal,
+    const row = await prisma.allianceApiKey.findUnique({
+      where: { allianceId },
     });
+    if (row?.apiKey) return row.apiKey;
+  } catch {
+    // ignore if table not present / prisma not migrated
+  }
 
-    const text = await res.text();
-    if (!res.ok) {
-      throw new Error(`PnW GraphQL HTTP ${res.status}: ${text.slice(0, 400)}`);
-    }
+  throw new Error(
+    `No API key found. Set PNW_API_KEY_${allianceId} or PNW_API_KEY (or insert into AllianceApiKey).`
+  );
+}
 
-    const json: any = JSON.parse(text);
-    if (json.errors?.length) {
-      throw new Error(`PnW GraphQL errors: ${JSON.stringify(json.errors).slice(0, 400)}`);
-    }
-
-    const alliance = json?.data?.alliances?.data?.[0];
-    const rows: BankrecRow[] = alliance?.bankrecs ?? [];
-    return rows ?? [];
-  } catch (err) {
-    // Bubble up for caller to decide (command or cron can log)
-    throw err;
-  } finally {
-    clearTimeout(t);
+// Cursor helpers backed by AllianceBankCursor (new schema)
+export async function getAllianceCursor(allianceId: number): Promise<string | null> {
+  try {
+    const cur = await prisma.allianceBankCursor.findUnique({
+      where: { allianceId },
+    });
+    return cur?.lastSeenId ?? null;
+  } catch {
+    return null;
   }
 }
 
-/** Simple filters the command already expects */
-export type PeekFilter = "all" | "tax" | "nontax";
-
-/** True if a row is “tax” by our heuristic */
-export function isTaxRow(r: BankrecRow): boolean {
-  // Heuristic: tax deposits are nation -> alliance
-  // (sender_type=1 nation, receiver_type=2 alliance)
-  return r.sender_type === 1 && r.receiver_type === 2;
+export async function setAllianceCursor(allianceId: number, id: string | number | null): Promise<void> {
+  const lastSeenId = id == null ? "" : String(id);
+  await prisma.allianceBankCursor.upsert({
+    where: { allianceId },
+    update: { lastSeenId },
+    create: { allianceId, lastSeenId },
+  });
 }
 
-export function applyPeekFilter(rows: BankrecRow[], filter: PeekFilter): BankrecRow[] {
-  if (filter === "all") return rows;
-  if (filter === "tax") return rows.filter(isTaxRow);
-  return rows.filter(r => !isTaxRow(r));
+// --- GraphQL helpers ---
+
+type RawRow = {
+  id: string;
+  date: string;
+  note?: string | null;
+  sender_type: number;
+  sender_id: string;
+  receiver_type: number;
+  receiver_id: string;
+};
+
+type AlliancePayload = {
+  id: string;
+  name: string;
+  bankrecs?: RawRow[];
+  taxrecs?: RawRow[];
+};
+
+async function gql<T>(apiKey: string, query: string, variables: Record<string, any>): Promise<T> {
+  const url = "https://api.politicsandwar.com/graphql?api_key=" + encodeURIComponent(apiKey);
+  const r = await (globalThis as any).fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || j.errors) {
+    throw new Error("PnW GraphQL errors: " + JSON.stringify(j.errors || { status: r.status }));
+  }
+  return j.data as T;
+}
+
+// Fetch latest alliance bankrecs (limit only; paging not supported on alliance field)
+async function fetchAllianceBankrecs(allianceId: number, limit = 25, apiKey: string): Promise<RawRow[]> {
+  const q = `query($aid:[Int!],$limit:Int){
+    alliances(id:$aid){
+      data{ id name bankrecs(limit:$limit){
+        id date note sender_type sender_id receiver_type receiver_id
+      }}
+    }
+  }`;
+  type Resp = { alliances: { data: AlliancePayload[] } };
+  const data = await gql<Resp>(apiKey, q, { aid: [allianceId], limit });
+  const a = data?.alliances?.data?.[0];
+  return a?.bankrecs ?? [];
+}
+
+// Fetch latest alliance taxrecs (limit only)
+async function fetchAllianceTaxrecs(allianceId: number, limit = 25, apiKey: string): Promise<RawRow[]> {
+  const q = `query($aid:[Int!],$limit:Int){
+    alliances(id:$aid){
+      data{ id name taxrecs(limit:$limit){
+        id date note sender_type sender_id receiver_type receiver_id
+      }}
+    }
+  }`;
+  type Resp = { alliances: { data: AlliancePayload[] } };
+  const data = await gql<Resp>(apiKey, q, { aid: [allianceId], limit });
+  const a = data?.alliances?.data?.[0];
+  return a?.taxrecs ?? [];
+}
+
+// Back-compat signature: either options object or positional args.
+// Old commands call queryAllianceBankrecs(allianceId, limit?, filter?)
+type QueryOpts = {
+  allianceId: number;
+  limit?: number;
+  filter?: BankrecFilter | "all" | "tax";
+};
+
+export async function queryAllianceBankrecs(
+  allianceIdOrOpts: number | QueryOpts,
+  maybeLimit?: number,
+  maybeFilter?: BankrecFilter | "all" | "tax"
+): Promise<RawRow[]> {
+  let allianceId: number;
+  let limit = 25;
+  let filter: BankrecFilter | "all" | "tax" = BankrecFilter.ALL;
+
+  if (typeof allianceIdOrOpts === "number") {
+    allianceId = allianceIdOrOpts;
+    if (typeof maybeLimit === "number") limit = maybeLimit;
+    if (maybeFilter) filter = maybeFilter;
+  } else {
+    allianceId = allianceIdOrOpts.allianceId;
+    if (allianceIdOrOpts.limit) limit = allianceIdOrOpts.limit;
+    if (allianceIdOrOpts.filter) filter = allianceIdOrOpts.filter;
+  }
+
+  if (!Number.isFinite(allianceId)) {
+    throw new Error("Invalid alliance_id: " + allianceId);
+  }
+
+  const apiKey = await getAllianceApiKey(allianceId);
+  if (filter === BankrecFilter.TAX || filter === "tax") {
+    return await fetchAllianceTaxrecs(allianceId, limit, apiKey);
+  } else {
+    return await fetchAllianceBankrecs(allianceId, limit, apiKey);
+  }
 }
