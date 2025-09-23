@@ -151,7 +151,7 @@ export async function queryAllianceBankrecs(
   }
 
   const apiKey = await getAllianceApiKey(allianceId);
-  if (filter === BankrecFilter.TAX || filter === "tax") {
+  if (filter === BankrecFilter.TAX) {
     return await fetchAllianceTaxrecs(allianceId, limit, apiKey);
   } else {
     return await fetchAllianceBankrecs(allianceId, limit, apiKey);
