@@ -9,11 +9,7 @@ import * as pnw_apply from './pnw_apply';
 import * as pnw_cursor from './pnw_cursor';
 import * as pnw_logs from './pnw_logs';
 import * as pnw_summary_channel from './pnw_summary_channel';
-import * as pnw_tax_ids from "./pnw_tax_ids"; 
 import * as pnw_bankpeek from './pnw_bankpeek'; 
-import * as pnw_tax_history from './pnw_tax_history';
-import * as pnw_tax_debug from './pnw_tax_debug';
-import * as pnw_tax_sync from './pnw_tax_sync';
 import * as pnw_tax_apply from "./pnw_tax_apply";
 
 // NEW: /who command
@@ -35,14 +31,10 @@ export const commandModules: CommandModule[] = [
   pnw_cursor,
   pnw_logs,
   pnw_summary_channel,
-  pnw_tax_ids, 
   pnw_bankpeek,
-  pnw_tax_history,
-  pnw_tax_debug,
   pnw_tax_apply,
   // NEW:
   who,
-  pnw_tax_sync, 
 ].filter((m) => m?.data && m?.execute);
 
 export const extraCommandsJSON = commandModules
