@@ -2,17 +2,9 @@
 import * as treasury from './treasury';
 import * as treasury_add from './treasury_add';
 import * as treasury_bulk from './treasury_bulk';
-import * as pnw_preview from './pnw_preview';
 import * as pnw_set from './pnw_set';
-import * as pnw_preview_stored from './pnw_preview_stored';
-import * as pnw_apply from './pnw_apply';
-import * as pnw_cursor from './pnw_cursor';
-import * as pnw_logs from './pnw_logs';
-import * as pnw_summary_channel from './pnw_summary_channel';
 import * as pnw_bankpeek from './pnw_bankpeek'; 
 import * as pnw_tax_apply from "./pnw_tax_apply";
-
-// NEW: /who command
 import * as who from './who';
 
 export type CommandModule = {
@@ -24,16 +16,9 @@ export const commandModules: CommandModule[] = [
   treasury,
   treasury_add,
   treasury_bulk,
-  pnw_preview,
   pnw_set,
-  pnw_preview_stored,
-  pnw_apply,
-  pnw_cursor,
-  pnw_logs,
-  pnw_summary_channel,
   pnw_bankpeek,
   pnw_tax_apply,
-  // NEW:
   who,
 ].filter((m) => m?.data && m?.execute);
 
