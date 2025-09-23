@@ -6,14 +6,15 @@ import {
   time,
   TimestampStyles,
 } from "discord.js";
-import {
-  queryAllianceBankrecs,
-  BankrecFilter,
-} from "../lib/pnw_bank_ingest";
+import { queryAllianceBankrecs, BankrecFilter } from "../lib/pnw_bank_ingest";
 
 function parseFilter(raw?: string | null): BankrecFilter {
   const v = (raw || "").toLowerCase();
   return v === "tax" ? BankrecFilter.TAX : BankrecFilter.ALL;
+}
+
+function clampLimit(n: number) {
+  return Math.min(50, Math.max(1, n));
 }
 
 function fmtWhen(iso: string) {
@@ -42,13 +43,15 @@ export const data = new SlashCommandBuilder()
 
 export async function execute(interaction: ChatInputCommandInteraction) {
   const allianceId = interaction.options.getInteger("alliance_id", true);
-  const limit = interaction.options.getInteger("limit", false) ?? 10;
+  const limitRaw = interaction.options.getInteger("limit", false) ?? 10;
+  const limit = clampLimit(limitRaw);
   const filter = parseFilter(interaction.options.getString("filter", false));
 
   await interaction.deferReply();
 
   try {
-    const rows = await queryAllianceBankrecs(allianceId, Math.min(50, Math.max(1, limit)), filter);
+    // NOTE: our lib accepts (allianceId, limit, filter)
+    const rows = await queryAllianceBankrecs(allianceId, limit, filter);
 
     const title =
       filter === BankrecFilter.TAX
@@ -56,16 +59,18 @@ export async function execute(interaction: ChatInputCommandInteraction) {
         : `Alliance ${allianceId} • bankrecs • limit=${limit}`;
 
     if (!rows || rows.length === 0) {
-      await interaction.editReply({ embeds: [new EmbedBuilder().setTitle(title).setDescription("_No records found._")] });
+      await interaction.editReply({
+        embeds: [new EmbedBuilder().setTitle(title).setDescription("_No records found._")],
+      });
       return;
     }
 
-    // Make a tidy, structured list
     const lines = rows.map((x) => {
       const when = fmtWhen(x.date);
       const s = `S:${x.sender_type}/${x.sender_id}`;
       const r = `R:${x.receiver_type}/${x.receiver_id}`;
-      const note = x.note?.replaceAll(/<[^>]+>/g, "") ?? ""; // strip any HTML like &bull;
+      // Strip HTML tags if any; entities like &bull; will just display literally (fine).
+      const note = (x.note || "").replace(/<[^>]+>/g, "").trim();
       return `**${x.id}** • ${when}\n\`${s} → ${r}\`\n_${note || "—"}_`;
     });
 
