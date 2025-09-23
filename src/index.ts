@@ -796,9 +796,13 @@ cron.schedule('*/2 * * * *', async () => {
       const apiKey = k ? open(k.encryptedApiKey as any, k.nonceApi as any) : (process.env.PNW_DEFAULT_API_KEY || '');
       if (!apiKey) continue;
 
-      const alliancesData = await fetchBankrecs({ apiKey }, [a.id]);
-      const al = (alliancesData || [])[0];
-      if (!al || !al.bankrecs) continue;
+      // ---- TEMP: disable legacy bank monitor until we port it to the new GQL shape ----
+if (false) {
+  const alliancesData = await fetchBankrecs({ apiKey }, [a.id]);
+  if (!al || !al.bankrecs) return;
+  const rows = (al.bankrecs as any[]).filter(/* … */);
+}
+// ---- END TEMP ----
 
       let last = a.lastBankrecId || 0;
       const rows = (al.bankrecs as any[]).filter(r => toInt(r.id) > last).sort((x: any, y: any) => toInt(x.id) - toInt(y.id));
