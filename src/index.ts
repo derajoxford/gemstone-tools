@@ -13,7 +13,7 @@ import { PrismaClient, WithdrawStatus } from '@prisma/client';
 import { seal, open } from './lib/crypto.js';
 import { RES_EMOJI, ORDER } from './lib/emojis.js';
 import { fetchBankrecs } from './lib/pnw.js';
-import { commands, executeMap, extraCommandsJSON, findCommandByName } from './commands/registry';
+import { extraCommandsJSON, findCommandByName } from './commands/registry';
 import { startAutoApply } from "./jobs/pnw_auto_apply";
 
 const log = pino({ level: process.env.LOG_LEVEL || 'info' });
