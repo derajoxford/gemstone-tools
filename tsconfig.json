@@ -9,7 +9,11 @@
     "resolveJsonModule": true,
     "skipLibCheck": true
   },
-  "include": [
-    "src"
+  "include": ["src"],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "src/_disabled/**",
+    "src/jobs/**"
   ]
 }
