@@ -1,0 +1,91 @@
+import {
+  SlashCommandBuilder,
+  ChatInputCommandInteraction,
+  PermissionFlagsBits,
+} from "discord.js";
+import { PrismaClient } from "@prisma/client";
+import { addToTreasury } from "../utils/treasury.js";
+import { RESOURCE_KEYS } from "../lib/pnw.js";
+
+const prisma = new PrismaClient();
+
+export const data = new SlashCommandBuilder()
+  .setName("treasury_add")
+  .setDescription("Admin: add (or subtract) amounts to the alliance treasury (JSON payload).")
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+  .setDMPermission(false)
+  // REQUIRED FIRST
+  .addStringOption((opt) =>
+    opt
+      .setName("payload")
+      .setDescription('JSON like {"money":1000000,"steel":500} (negative values allowed)')
+      .setRequired(true)
+  )
+  // OPTIONALS AFTER
+  .addStringOption((opt) =>
+    opt
+      .setName("note")
+      .setDescription("Optional note to include in the reply")
+      .setRequired(false)
+  )
+  .addIntegerOption((opt) =>
+    opt
+      .setName("alliance_id")
+      .setDescription("Alliance ID (defaults to this server's linked alliance or 14258)")
+      .setRequired(false)
+  );
+
+export async function execute(interaction: ChatInputCommandInteraction) {
+  await interaction.deferReply({ ephemeral: true });
+
+  const allianceId =
+    interaction.options.getInteger("alliance_id") ??
+    14258;
+
+  const payloadStr = interaction.options.getString("payload", true);
+  const note = interaction.options.getString("note") ?? undefined;
+
+  let obj: Record<string, number>;
+  try {
+    obj = JSON.parse(payloadStr);
+  } catch (e) {
+    await interaction.editReply("❌ Invalid JSON in `payload`.");
+    return;
+  }
+
+  // Build a delta with only known resource keys
+  const delta: Record<string, number> = {};
+  for (const k of RESOURCE_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(obj, k)) {
+      const v = Number((obj as any)[k]);
+      if (!Number.isFinite(v)) {
+        await interaction.editReply(`❌ Value for \`${k}\` is not a number.`);
+        return;
+      }
+      delta[k] = v;
+    }
+  }
+
+  if (Object.keys(delta).length === 0) {
+    await interaction.editReply(
+      "❌ `payload` must include at least one valid resource key: " +
+        "`" + RESOURCE_KEYS.join("`, `") + "`"
+    );
+    return;
+  }
+
+  await addToTreasury(prisma, allianceId, delta as any, note);
+
+  const nonZero = Object.entries(delta)
+    .filter(([, v]) => v !== 0)
+    .map(([k, v]) => `${k}: ${v}`)
+    .join(", ");
+
+  await interaction.editReply(
+    `✅ Treasury updated for alliance ${allianceId}. ` +
+      (nonZero ? `Delta → ${nonZero}` : "(all zero)") +
+      (note ? `\nNote: ${note}` : "")
+  );
+}
+
+export default { data, execute };
