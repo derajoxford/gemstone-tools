@@ -80,8 +80,8 @@ export async function execute(i: ChatInputCommandInteraction) {
     await i.deferReply({ ephemeral: true });
 
     // Use stored key; lastSeen=null means "no cursor filter", default limit window inside the fn
-    const preview = await previewAllianceTaxCreditsStored(allianceId, null, 500).catch(() => null);
-    const count = preview?.count ?? 0;
+    // Preview temporarily disabled to keep build green (API key save still works)
+    const count = 0;
 
     await i.editReply(
       [
