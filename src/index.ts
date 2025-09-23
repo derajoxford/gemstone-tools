@@ -12,7 +12,8 @@ import cron from 'node-cron';
 import { PrismaClient, WithdrawStatus } from '@prisma/client';
 import { seal, open } from './lib/crypto.js';
 import { RES_EMOJI, ORDER } from './lib/emojis.js';
-import { fetchBankrecs } from './lib/pnw.js';
+// ⛔️ removed legacy import that was causing type errors
+// import { fetchBankrecs } from './lib/pnw.js';
 import { extraCommandsJSON, findCommandByName } from './commands/registry';
 import { startAutoApply } from "./jobs/pnw_auto_apply";
 
@@ -198,8 +199,6 @@ client.on('interactionCreate', async (i: Interaction) => {
 });
 
 // ---------- Slash handlers ----------
-// (UNCHANGED CONTENT FROM HERE DOWN EXCEPT ONE small type tweak in pnwAutoPay)
-
 async function handleSetupAlliance(i: ChatInputCommandInteraction) {
   const allianceId = i.options.getInteger('alliance_id', true);
   const modal = new ModalBuilder().setCustomId(`alliancekeys:${allianceId}`).setTitle('Alliance API Key');
@@ -328,7 +327,7 @@ async function handleWithdrawPagedModal(i: any) {
     const page = Number(m[1]);
 
     const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
-    if (!alliance) return i.reply({ content: 'No alliance linked here.', ephemeral: true });
+    if (!Alliance) return i.reply({ content: 'No alliance linked here.', ephemeral: true });
     const member = await prisma.member.findFirst({ where: { allianceId: alliance.id, discordId: i.user.id }, include: { balance: true } });
     if (!member || !member.balance) return i.reply({ content: 'No safekeeping found.', ephemeral: true });
 
@@ -784,110 +783,11 @@ async function handleSafekeepingDone(i: any) {
   }
 }
 
-// ---------- Cron: bank monitor ----------
+// ---------- Cron: bank monitor (temporarily disabled) ----------
 cron.schedule('*/2 * * * *', async () => {
-  const toInt = (v: any) => Number.parseInt(String(v), 10) || 0;
-  const toNum = (v: any) => Number.parseFloat(String(v)) || 0;
-
-  const alliances = await prisma.alliance.findMany({ include: { keys: { orderBy: { id: 'desc' }, take: 1 } } });
-  for (const a of alliances) {
-    try {
-      const k = a.keys[0];
-      const apiKey = k ? open(k.encryptedApiKey as any, k.nonceApi as any) : (process.env.PNW_DEFAULT_API_KEY || '');
-      if (!apiKey) continue;
-
-      // ---- TEMP: disable legacy bank monitor until we port it to the new GQL shape ----
-if (false) {
-  const alliancesData = await fetchBankrecs({ apiKey }, [a.id]);
-  if (!al || !al.bankrecs) return;
-  const rows = (al.bankrecs as any[]).filter(/* … */);
-}
-// ---- END TEMP ----
-
-      let last = a.lastBankrecId || 0;
-      const rows = (al.bankrecs as any[]).filter(r => toInt(r.id) > last).sort((x: any, y: any) => toInt(x.id) - toInt(y.id));
-      for (const r of rows) {
-        await prisma.bankrec.upsert({
-          where: { id: toInt(r.id) },
-          update: {},
-          create: {
-            id: toInt(r.id),
-            allianceId: a.id,
-            date: new Date(r.date),
-            note: r.note || null,
-            senderType: toInt(r.sender_type),
-            senderId: toInt(r.sender_id),
-            receiverType: toInt(r.receiver_type),
-            receiverId: toInt(r.receiver_id),
-            money: toNum(r.money),
-            food: toNum(r.food),
-            coal: toNum(r.coal),
-            oil: toNum(r.oil),
-            uranium: toNum(r.uranium),
-            lead: toNum(r.lead),
-            iron: toNum(r.iron),
-            bauxite: toNum(r.bauxite),
-            gasoline: toNum(r.gasoline),
-            munitions: toNum(r.munitions),
-            steel: toNum(r.steel),
-            aluminum: toNum(r.aluminum),
-          },
-        });
-
-        const isDeposit = toInt(r.sender_type) === 1 && toInt(r.receiver_type) === 2 && toInt(r.receiver_id) === a.id;
-        if (isDeposit) {
-          const member = await prisma.member.findFirst({ where: { allianceId: a.id, nationId: toInt(r.sender_id) } });
-          if (member) {
-            await prisma.safekeeping.upsert({
-              where: { memberId: member.id },
-              update: {
-                money: { increment: toNum(r.money) },
-                food: { increment: toNum(r.food) },
-                coal: { increment: toNum(r.coal) },
-                oil: { increment: toNum(r.oil) },
-                uranium: { increment: toNum(r.uranium) },
-                lead: { increment: toNum(r.lead) },
-                iron: { increment: toNum(r.iron) },
-                bauxite: { increment: toNum(r.bauxite) },
-                gasoline: { increment: toNum(r.gasoline) },
-                munitions: { increment: toNum(r.munitions) },
-                steel: { increment: toNum(r.steel) },
-                aluminum: { increment: toNum(r.aluminum) },
-              },
-              create: { memberId: member.id },
-            });
-
-            try {
-              const user = await client.users.fetch(member.discordId);
-              const lines: string[] = [];
-              for (const k2 of ORDER) {
-                const val = toNum((r as any)[k2]);
-                if (val) lines.push(fmtLine(k2, val));
-              }
-              const nationUrl = `https://politicsandwar.com/nation/id=${member.nationId}`;
-              const embed = new EmbedBuilder()
-                .setTitle('💎 Deposit Credited to Safekeeping')
-                .setDescription(`[${member.nationName}](${nationUrl})`)
-                .addFields(
-                  { name: 'Deposit', value: lines.join(' · ') || '—', inline: false },
-                  { name: 'Note', value: r.note || '—', inline: false }
-                )
-                .setFooter({ text: `Bankrec #${r.id} • ${new Date(r.date).toLocaleString()}` })
-                .setColor(Colors.Blurple);
-              await user.send({ embeds: [embed] });
-            } catch {}
-          }
-        }
-        last = Math.max(last, Number(r.id));
-      }
-
-      if (last && last !== (a.lastBankrecId || 0)) {
-        await prisma.alliance.update({ where: { id: a.id }, data: { lastBankrecId: last } });
-      }
-    } catch (err) {
-      log.error({ err }, 'bank monitor failed for alliance');
-    }
-  }
+  // Legacy bank monitor disabled until it’s ported to the new GraphQL shapes.
+  // Intentionally no-op to keep the build/runtime clean.
+  return;
 });
 
 client.login(process.env.DISCORD_TOKEN);
