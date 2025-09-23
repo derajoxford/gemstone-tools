@@ -12,8 +12,6 @@ import cron from 'node-cron';
 import { PrismaClient, WithdrawStatus } from '@prisma/client';
 import { seal, open } from './lib/crypto.js';
 import { RES_EMOJI, ORDER } from './lib/emojis.js';
-// ⛔️ removed legacy import that was causing type errors
-// import { fetchBankrecs } from './lib/pnw.js';
 import { extraCommandsJSON, findCommandByName } from './commands/registry';
 import { startAutoApply } from "./jobs/pnw_auto_apply";
 
@@ -115,7 +113,8 @@ const commands = (() => {
 
 async function register() {
   const appId = process.env.DISCORD_CLIENT_ID!;
-  const guildId = process.env.TEST_GUILD_ID;
+  // Use DISCORD_GUILD_ID for targeted guild registration
+  const guildId = process.env.DISCORD_GUILD_ID;
   try {
     if (guildId) {
       log.info({ appId, guildId, commands: (commands as any[]).map((x: any) => x.name) }, 'REGISTER guild');
@@ -133,7 +132,7 @@ client.once('ready', async () => {
   log.info({ tag: client.user?.tag }, 'Gemstone Tools online ✨');
   await register();
 
-  // ✅ Start the hourly auto-apply job (reads PNW_ALLIANCES env or falls back to alliances in DB)
+  // ✅ Start the hourly auto-apply job (safe stub if disabled)
   startAutoApply(client);
 });
 
@@ -199,6 +198,7 @@ client.on('interactionCreate', async (i: Interaction) => {
 });
 
 // ---------- Slash handlers ----------
+
 async function handleSetupAlliance(i: ChatInputCommandInteraction) {
   const allianceId = i.options.getInteger('alliance_id', true);
   const modal = new ModalBuilder().setCustomId(`alliancekeys:${allianceId}`).setTitle('Alliance API Key');
@@ -327,7 +327,7 @@ async function handleWithdrawPagedModal(i: any) {
     const page = Number(m[1]);
 
     const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
-    if (!Alliance) return i.reply({ content: 'No alliance linked here.', ephemeral: true });
+    if (!alliance) return i.reply({ content: 'No alliance linked here.', ephemeral: true });
     const member = await prisma.member.findFirst({ where: { allianceId: alliance.id, discordId: i.user.id }, include: { balance: true } });
     if (!member || !member.balance) return i.reply({ content: 'No safekeeping found.', ephemeral: true });
 
@@ -631,163 +631,9 @@ async function pnwAutoPay(opts: {
   return res.ok && !(data as any).errors && (data as any)?.data?.bankWithdraw;
 }
 
-// ---------- Admin: /safekeeping_edit (paged, absolute set) ----------
-const SK_PAGE_SIZE = 5;
-function skPageCountAll() { return Math.ceil(ORDER.length / SK_PAGE_SIZE); }
-function skSliceAll(page: number) { const s = page * SK_PAGE_SIZE; return ORDER.slice(s, s + SK_PAGE_SIZE); }
-
-async function handleSafekeepingStart(i: ChatInputCommandInteraction) {
-  await i.deferReply({ ephemeral: true });
-
-  const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
-  if (!alliance) return i.editReply({ content: 'No alliance linked yet. Run /setup_alliance first.' });
-
-  if (!i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
-    return i.editReply({ content: 'You lack permission to edit safekeeping.' });
-  }
-
-  const target = i.options.getUser('user', true);
-  const member = await prisma.member.findFirst({ where: { allianceId: alliance.id, discordId: target.id }, include: { balance: true } });
-  if (!member) return i.editReply({ content: 'That user is not linked in this alliance.' });
-
-  if (!member.balance) {
-    await prisma.safekeeping.create({ data: { memberId: member.id } });
-  }
-
-  skSessions.set(i.user.id, { targetMemberId: member.id, data: {}, createdAt: Date.now() });
-
-  const embed = new EmbedBuilder()
-    .setTitle('🧰 Safekeeping Editor')
-    .setDescription(`Editing <@${target.id}>'s safekeeping. Use **Start** to open page 1.`)
-    .setColor(Colors.Blurple);
-
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(`sk:open:${member.id}:0`).setLabel('Start').setEmoji('✨').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('sk:done').setLabel('Done').setStyle(ButtonStyle.Success).setDisabled(true)
-  );
-
-  await i.editReply({ embeds: [embed], components: [row] });
-}
-
-async function handleSafekeepingOpenPaged(i: any) {
-  const parts = i.customId.split(':'); // sk:open:<memberId>:<page>
-  const memberId = Number(parts[2] || 0);
-  const page = Math.max(0, Number(parts[3] || 0) || 0);
-  const total = skPageCountAll();
-
-  const sess = skSessions.get(i.user.id);
-  if (!sess || sess.targetMemberId !== memberId) {
-    return i.reply({ content: 'Session expired. Run /safekeeping_edit again.', ephemeral: true });
-  }
-
-  return skOpenModalPaged(i as ButtonInteraction, memberId, page, total);
-}
-
-async function skOpenModalPaged(i: ButtonInteraction, memberId: number, page: number, total: number) {
-  const member = await prisma.member.findUnique({ where: { id: memberId }, include: { balance: true } });
-  if (!member) return i.reply({ content: 'Member not found.', ephemeral: true });
-  const bal: any = member.balance as any || {};
-
-  const keys = skSliceAll(page);
-  const modal = new ModalBuilder().setCustomId(`sk:modal:${memberId}:${page}`).setTitle(`🧰 Edit (${page + 1}/${total})`);
-
-  for (const k of keys) {
-    const curr = Number(bal[k] || 0);
-    const input = new TextInputBuilder()
-      .setCustomId(k)
-      .setLabel(`${RES_EMOJI[k] ?? ''} ${k} (current: ${curr.toLocaleString()})`)
-      .setStyle(TextInputStyle.Short)
-      .setRequired(false)
-      .setPlaceholder(String(curr));
-    modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
-  }
-  await i.showModal(modal);
-}
-
-async function handleSafekeepingModalSubmit(i: any) {
-  const m = String(i.customId).match(/^sk:modal:(\d+):(\d+)$/);
-  if (!m) return;
-  const memberId = Number(m[1]);
-  const page = Number(m[2]);
-  const total = skPageCountAll();
-
-  const sess = skSessions.get(i.user.id);
-  if (!sess || sess.targetMemberId !== memberId) {
-    return i.reply({ content: 'Session expired. Run /safekeeping_edit again.', ephemeral: true });
-  }
-
-  const keys = skSliceAll(page);
-  for (const k of keys) {
-    const raw = (i.fields.getTextInputValue(k) || '').trim();
-    if (raw === '') { delete sess.data[k]; continue; }
-    const num = parseNum(raw);
-    if (!Number.isFinite(num) || num < 0) {
-      return i.reply({ content: `Invalid number for ${k}.`, ephemeral: true });
-    }
-    sess.data[k] = num;
-  }
-  skSessions.set(i.user.id, sess);
-
-  const btns: ButtonBuilder[] = [];
-  if (page > 0) btns.push(new ButtonBuilder().setCustomId(`sk:open:${memberId}:${page - 1}`).setStyle(ButtonStyle.Secondary).setLabel(`◀ Prev (${page}/${total})`));
-  btns.push(new ButtonBuilder().setCustomId(`sk:open:${memberId}:${page}`).setStyle(ButtonStyle.Primary).setLabel(`Open Page ${page + 1}/${total}`));
-  if (page < total - 1) btns.push(new ButtonBuilder().setCustomId(`sk:open:${memberId}:${page + 1}`).setStyle(ButtonStyle.Secondary).setLabel(`Next (${page + 2}/${total}) ▶`));
-  btns.push(new ButtonBuilder().setCustomId('sk:done').setStyle(ButtonStyle.Success).setLabel('Done ✅'));
-
-  const summary = Object.entries(sess.data)
-    .map(([k, v]) => `${k}:${Number(v).toLocaleString()}`)
-    .join(' · ') || '— none yet —';
-
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(...btns);
-  await i.reply({ content: `Saved (absolute values to set):\n${summary}`, components: [row], ephemeral: true });
-}
-
-async function handleSafekeepingDone(i: any) {
-  const sess = skSessions.get(i.user.id);
-  if (!sess) return i.reply({ content: 'Session expired. Run /safekeeping_edit again.', ephemeral: true });
-
-  const target = await prisma.member.findUnique({ where: { id: sess.targetMemberId }, include: { balance: true } });
-  if (!target) return i.reply({ content: 'Target member not found.', ephemeral: true });
-
-  const data: any = {};
-  for (const [k, v] of Object.entries(sess.data)) {
-    if (!ORDER.includes(k as any)) continue;
-    data[k] = { set: Number(v) };
-  }
-  if (!Object.keys(data).length) {
-    skSessions.delete(i.user.id);
-    return i.reply({ content: 'Nothing to update — no values entered.', ephemeral: true });
-  }
-
-  try {
-    await prisma.safekeeping.update({
-      where: { memberId: target.id },
-      data,
-    });
-    skSessions.delete(i.user.id);
-
-    const setLine = Object.entries(sess.data)
-      .map(([k, v]) => `${RES_EMOJI[k as any] ?? ''}${k}: ${Number(v).toLocaleString()}`)
-      .join(' · ');
-
-    const embed = new EmbedBuilder()
-      .setTitle('✅ Safekeeping Updated')
-      .setDescription(`Edited for <@${target.discordId}>`)
-      .addFields({ name: 'Set To', value: setLine || '—' })
-      .setColor(Colors.Green);
-
-    await i.reply({ embeds: [embed], ephemeral: true });
-  } catch (e) {
-    console.error('[sk:done] update error', e);
-    await i.reply({ content: 'Failed to update safekeeping.', ephemeral: true });
-  }
-}
-
-// ---------- Cron: bank monitor (temporarily disabled) ----------
+// ---------- Cron: bank monitor (DISABLED PLACEHOLDER) ----------
 cron.schedule('*/2 * * * *', async () => {
-  // Legacy bank monitor disabled until it’s ported to the new GraphQL shapes.
-  // Intentionally no-op to keep the build/runtime clean.
-  return;
+  // intentionally no-op
 });
 
 client.login(process.env.DISCORD_TOKEN);
