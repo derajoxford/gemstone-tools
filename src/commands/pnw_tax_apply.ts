@@ -13,11 +13,62 @@ import {
 import {
   ensureAllianceTreasury,
   applyDeltaToTreasury,
-  deltaFromBankrec,
   KEYS,
 } from "../utils/treasury";
 
-type ResKey = (typeof KEYS)[number];
+/**
+ * Some PnW bankrec shapes differ. This extracts numeric amounts robustly.
+ * It checks common field names, plus a few alternates seen in the wild.
+ */
+function extractAmounts(row: any): Record<string, number> {
+  const out: Record<string, number> = {};
+  const candidates: Record<string, string[]> = {
+    money:     ["money", "cash", "money_amount"],
+    food:      ["food"],
+    coal:      ["coal"],
+    oil:       ["oil"],
+    uranium:   ["uranium"],
+    lead:      ["lead"],
+    iron:      ["iron"],
+    bauxite:   ["bauxite"],
+    gasoline:  ["gasoline", "gas"],
+    munitions: ["munitions", "ammo"],
+    steel:     ["steel"],
+    aluminum:  ["aluminum", "aluminium"],
+  };
+
+  for (const k of KEYS) {
+    let v = 0;
+    for (const name of candidates[k] || []) {
+      const raw = (row as any)[name];
+      if (raw !== undefined && raw !== null) {
+        const n = Number(raw);
+        if (Number.isFinite(n)) { v = n; break; }
+      }
+    }
+    out[k] = Number.isFinite(v) ? v : 0;
+  }
+
+  // Some APIs return a nested object like row.resources or row.delta
+  const nested = (row?.resources ?? row?.delta ?? row?.amounts ?? {}) as Record<string, unknown>;
+  for (const k of KEYS) {
+    const n = Number(nested[k as keyof typeof nested]);
+    if (Number.isFinite(n) && n !== 0) out[k] = n;
+  }
+
+  return out;
+}
+
+function isNationToAlliance(row: any, allianceId: number): boolean {
+  const st = Number(row?.sender_type ?? 0);   // 3 = nation
+  const rt = Number(row?.receiver_type ?? 0); // 2 = alliance
+  const rid = Number(row?.receiver_id ?? 0);
+  return st === 3 && rt === 2 && rid === allianceId;
+}
+
+function anyNonZero(d: Record<string, number>) {
+  return KEYS.some(k => Number(d[k] || 0) !== 0);
+}
 
 function detectModel(p: any): "treasury" | "allianceTreasury" | "alliance_treasury" {
   if (p?.treasury) return "treasury";
@@ -26,22 +77,9 @@ function detectModel(p: any): "treasury" | "allianceTreasury" | "alliance_treasu
   throw new Error("Prisma model treasury not found");
 }
 
-function hasAnyAmounts(row: any): boolean {
-  // rely on the standard PnW bankrec numeric fields via deltaFromBankrec
-  const d = deltaFromBankrec(row);
-  return KEYS.some(k => Number((d as any)[k] ?? 0) !== 0);
-}
-
-function isNationToAlliance(row: any, allianceId: number): boolean {
-  const st = Number(row?.sender_type ?? 0);
-  const rt = Number(row?.receiver_type ?? 0);
-  const rid = Number(row?.receiver_id ?? 0);
-  return st === 3 && rt === 2 && rid === allianceId;
-}
-
 export const data = new SlashCommandBuilder()
   .setName("pnw_tax_apply")
-  .setDescription("Apply nation→alliance deposits (incl. Automated Tax) to the alliance treasury")
+  .setDescription("Scan recent nation→alliance deposits (incl. Automated Tax) and credit the alliance treasury")
   .addIntegerOption((o) =>
     o.setName("alliance_id").setDescription("PnW alliance ID").setRequired(true)
   )
@@ -64,44 +102,58 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     const model = detectModel(prisma as any);
     await ensureAllianceTreasury(prisma as any, model, allianceId);
 
-    // Pull from the ALL feed so amounts are present
-    const rows = await queryAllianceBankrecs(allianceId, limit, BankrecFilter.ALL);
+    // Pull BOTH feeds, concat, and de-dupe by id (some installs only return one side)
+    const [rowsAll, rowsTax] = await Promise.all([
+      queryAllianceBankrecs(allianceId, limit, BankrecFilter.ALL).catch(() => [] as any[]),
+      queryAllianceBankrecs(allianceId, limit, BankrecFilter.TAX).catch(() => [] as any[]),
+    ]);
 
-    // Filter to nation -> alliance deposits with any non-zero amounts
-    const taxish = (rows || []).filter(r => isNationToAlliance(r, allianceId) && hasAnyAmounts(r));
+    const byId = new Map<string | number, any>();
+    for (const r of [...(rowsAll || []), ...(rowsTax || [])]) {
+      if (!r) continue;
+      const id = (r as any).id ?? `${(r as any).date}-${(r as any).sender_id}-${(r as any).receiver_id}`;
+      if (!byId.has(id)) byId.set(id, r);
+    }
+    const merged = Array.from(byId.values());
 
-    if (!taxish.length) {
-      await interaction.editReply(`No tax-like bank records with amounts found for alliance ${allianceId}.`);
+    // Filter to nation -> alliance rows, then extract amounts
+    const depositRows = merged.filter(r => isNationToAlliance(r, allianceId));
+    if (!depositRows.length) {
+      await interaction.editReply(`No nation→alliance deposits found for alliance ${allianceId}.`);
       return;
     }
 
-    const totals = Object.fromEntries(KEYS.map((k) => [k, 0])) as Record<ResKey, number>;
+    // Apply only rows that actually move resources (non-zero amounts)
+    const totals: Record<string, number> = Object.fromEntries(KEYS.map(k => [k, 0])) as any;
     let applied = 0;
 
-    for (const r of taxish) {
-      const d = deltaFromBankrec(r);
-      // accumulate totals
-      for (const k of KEYS) {
-        const v = Number((d as any)[k] ?? 0);
-        if (v) totals[k] += v;
-      }
+    for (const r of depositRows) {
+      const d = extractAmounts(r);
+      if (!anyNonZero(d)) continue;
+
+      for (const k of KEYS) totals[k] += Number(d[k] || 0);
       await applyDeltaToTreasury(prisma as any, model, allianceId, d);
       applied++;
     }
 
+    if (applied === 0) {
+      await interaction.editReply(`No tax-like bank records with amounts found for alliance ${allianceId}.`);
+      return;
+    }
+
     const prettyTotals =
-      KEYS.filter((k) => Number(totals[k]) !== 0)
-        .map((k) => `**${k}**: ${Number(totals[k]).toLocaleString()}`)
-        .join(" · ") || "—";
+      KEYS.filter(k => Number(totals[k] || 0) !== 0)
+          .map(k => `**${k}**: ${Number(totals[k]).toLocaleString()}`)
+          .join(" · ") || "—";
 
     const embed = new EmbedBuilder()
       .setTitle("✅ Deposits credited to treasury")
       .setDescription(
         [
           `Alliance **${allianceId}**`,
-          `Scanned (ALL feed): **${limit}** rows`,
-          `Matched rows: **${taxish.length}**`,
-          `Applied: **${applied}**`,
+          `Scanned rows: **${merged.length}** (ALL+TAX)`,
+          `Candidate nation→alliance: **${depositRows.length}**`,
+          `Applied (non-zero): **${applied}**`,
           ``,
           `**Totals credited**`,
           `${prettyTotals}`,
