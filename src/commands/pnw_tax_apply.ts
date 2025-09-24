@@ -5,161 +5,143 @@ import {
   EmbedBuilder,
   Colors,
 } from "discord.js";
-
+import prisma from "../utils/db";
 import {
   queryAllianceBankrecs,
   BankrecFilter,
-  type BankrecRow,
 } from "../lib/pnw_bank_ingest";
+import { creditTreasury } from "../utils/treasury";
+import { fetchBankrecs } from "../lib/pnw";
 
-import { creditTreasuryTotals } from "../utils/treasury";
-import { fetchBankrecs } from "../lib/pnw"; // legacy helper that returns amounts
-
+// --- constants / helpers ---
 const RES_KEYS = [
   "money","food","coal","oil","uranium","lead","iron",
   "bauxite","gasoline","munitions","steel","aluminum",
 ] as const;
 type ResKey = typeof RES_KEYS[number];
+type ResTotals = Partial<Record<ResKey, number>>;
 
-function n(x: any): number {
-  const v = Number(x);
-  return Number.isFinite(v) ? v : 0;
+type AnyRow = Record<string, any>;
+
+function num(v: any): number {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
 }
-function hasAnyAmounts(r: Partial<Record<ResKey, any>> | null | undefined) {
-  if (!r) return false;
-  for (const k of RES_KEYS) {
-    if (n((r as any)[k]) > 0) return true;
-  }
-  return false;
+function getAmount(row: AnyRow, k: ResKey): number {
+  // support both snake_case and camelCase just in case
+  return num(row[k] ?? row[toCamel(k)] ?? 0);
 }
-function isTaxNote(note: string | null | undefined): boolean {
-  const s = (note || "").toLowerCase();
-  return s.includes("automated tax");
+function toCamel(k: string) {
+  return k.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+}
+function hasAnyResources(row: AnyRow): boolean {
+  return RES_KEYS.some(k => getAmount(row, k) !== 0);
+}
+function looksLikeTax(row: AnyRow, allianceId: number): boolean {
+  const sType = Number(row.sender_type ?? row.senderType ?? 0);
+  const rType = Number(row.receiver_type ?? row.receiverType ?? 0);
+  const rId   = Number(row.receiver_id ?? row.receiverId ?? 0);
+  const note  = String(row.note ?? "").toLowerCase();
+  // PnW tax is typically nation(3) -> alliance(2), receiver matches alliance
+  // Also accept note containing 'tax'
+  return rType === 2 && rId === allianceId && (sType === 3 || note.includes("tax"));
 }
 
-// Summation helper into a plain object
-function addInto(sum: Record<ResKey, number>, row: Partial<Record<ResKey, any>>) {
-  for (const k of RES_KEYS) sum[k] += n((row as any)[k]);
-}
-
+// --- slash command metadata ---
 export const data = new SlashCommandBuilder()
   .setName("pnw_tax_apply")
-  .setDescription("Credit alliance treasury from recent Automated Tax bank records")
+  .setDescription("Credit recent tax rows into the alliance treasury")
   .addIntegerOption(o =>
     o.setName("alliance_id").setDescription("PnW alliance ID").setRequired(true)
   )
   .addIntegerOption(o =>
     o
       .setName("limit")
-      .setDescription("How many rows to scan (1–5000)")
+      .setDescription("Max rows to scan (default 200)")
       .setMinValue(1)
-      .setMaxValue(5000)
+      .setMaxValue(2000)
   );
 
+// --- main execution ---
 export async function execute(interaction: ChatInputCommandInteraction) {
   const allianceId = interaction.options.getInteger("alliance_id", true);
-  const limit = interaction.options.getInteger("limit", false) ?? 200;
+  const limitOpt = interaction.options.getInteger("limit");
+  // default to 200, allow up to 2000. (GQL may still page; we’ll request the max it allows)
+  const limit = Math.max(1, Math.min(limitOpt ?? 200, 2000));
 
   await interaction.deferReply({ ephemeral: true });
 
   try {
-    // 1) Try GraphQL (TAX filter) first
-    let rows: BankrecRow[] = await queryAllianceBankrecs(
-      allianceId,
-      Math.min(5000, Math.max(1, limit)),
-      BankrecFilter.TAX
-    ).catch(() => []);
+    // 1) Try GQL ingest first (fastest, consistent with /pnw_bankpeek)
+    let rows: AnyRow[] = await queryAllianceBankrecs(allianceId, limit, BankrecFilter.TAX);
 
-    // If GQL TAX returns nothing or no amounts, try GQL ALL + tax-note filter
-    if (!rows.length || rows.every(r => !hasAnyAmounts(r))) {
-      const all = await queryAllianceBankrecs(
-        allianceId,
-        Math.min(5000, Math.max(1, limit)),
-        BankrecFilter.ALL
-      ).catch(() => []);
-      const taxLike = all.filter(r => isTaxNote(r.note));
-      if (taxLike.length && taxLike.some(hasAnyAmounts)) {
-        rows = taxLike;
-      }
-    }
-
-    // If still nothing with amounts, fall back to legacy fetchBankrecs (which returns amounts)
-    if (!rows.length || rows.every(r => !hasAnyAmounts(r))) {
-      const apiKey = process.env.PNW_DEFAULT_API_KEY || process.env.PNW_API_KEY || "";
+    // If rows exist but have no amounts, fallback to legacy top-level fetch (HTML scrape/API)
+    const gqlHasAmounts = rows.some(r => hasAnyResources(r));
+    if (!gqlHasAmounts) {
+      // fetchBankrecs signature: fetchBankrecs({ apiKey }, [allianceId]) or similar is used elsewhere
+      // We only need amounts; legacy fetch returns full amounts on each row.
+      const apiKey = process.env.PNW_DEFAULT_API_KEY || "";
       if (!apiKey) {
-        await interaction.editReply("❌ Error: No PNW API key configured on the server.");
-        return;
+        // Keep going with GQL rows if no default key; better than nothing
+      } else {
+        const legacy = await fetchBankrecs({ apiKey }, [allianceId]).catch(() => null);
+        // shape (based on existing usage in index.ts): array with items per alliance, each having bankrecs[]
+        // Normalize to a flat array if available
+        const legacyRows = Array.isArray(legacy)
+          ? (legacy.find((x: any) => Number(x?.id ?? x?.alliance_id) === allianceId)?.bankrecs ?? [])
+          : [];
+        if (Array.isArray(legacyRows) && legacyRows.length) {
+          rows = legacyRows.slice(0, limit);
+        }
       }
-      // fetchBankrecs({ apiKey }, [allianceId]) → returns an array for each alliance id
-      const alliancesData: any[] = await fetchBankrecs({ apiKey }, [allianceId]).catch(() => []);
-      const al = Array.isArray(alliancesData) ? alliancesData.find((a: any) => a?.id == allianceId) : null;
-
-      const legacyRows: any[] = (al?.bankrecs || []).slice(0, Math.min(5000, Math.max(1, limit)));
-      // Normalize legacy rows into BankrecRow-ish objects
-      rows = legacyRows
-        .filter((r: any) => isTaxNote(r?.note))
-        .map((r: any) => ({
-          id: n(r.id),
-          date: r.date,
-          note: r.note ?? null,
-          sender_type: n(r.sender_type),
-          sender_id: n(r.sender_id),
-          receiver_type: n(r.receiver_type),
-          receiver_id: n(r.receiver_id),
-          money: n(r.money),
-          food: n(r.food),
-          coal: n(r.coal),
-          oil: n(r.oil),
-          uranium: n(r.uranium),
-          lead: n(r.lead),
-          iron: n(r.iron),
-          bauxite: n(r.bauxite),
-          gasoline: n(r.gasoline),
-          munitions: n(r.munitions),
-          steel: n(r.steel),
-          aluminum: n(r.aluminum),
-        })) as BankrecRow[];
     }
 
-    // Final guard: if we truly have no amounts, quit cleanly
-    if (!rows.length || rows.every(r => !hasAnyAmounts(r))) {
+    // Filter to tax-like rows for this alliance
+    const taxRows = rows.filter(r => looksLikeTax(r, allianceId));
+
+    // If still nothing with amounts, bail early
+    const anyAmounts = taxRows.some(r => hasAnyResources(r));
+    if (!taxRows.length || !anyAmounts) {
       await interaction.editReply(`No tax-like bank records with amounts found for alliance ${allianceId}.`);
       return;
     }
 
-    // 2) Sum amounts across selected rows
-    const totals: Record<ResKey, number> = {
-      money: 0, food: 0, coal: 0, oil: 0, uranium: 0, lead: 0, iron: 0,
-      bauxite: 0, gasoline: 0, munitions: 0, steel: 0, aluminum: 0,
-    };
+    // 2) Deduplicate by bankrec id (in case of mixed sources)
+    const seen = new Set<number | string>();
+    const uniq = taxRows.filter(r => {
+      const id = r.id ?? r.bankrec_id ?? `${r.sender_id}:${r.receiver_id}:${r.date ?? r.time ?? ""}`;
+      if (seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    });
 
-    let counted = 0;
-    for (const r of rows) {
-      if (!isTaxNote(r.note)) continue;
-      addInto(totals, r);
-      counted++;
+    // 3) Sum resource columns
+    const totals: ResTotals = {};
+    for (const k of RES_KEYS) totals[k] = 0;
+    for (const r of uniq) {
+      for (const k of RES_KEYS) {
+        const v = getAmount(r, k);
+        if (v) totals[k]! = (totals[k] || 0) + v;
+      }
     }
-    if (!counted || !hasAnyAmounts(totals)) {
-      await interaction.editReply(`No tax-like bank records with amounts found for alliance ${allianceId}.`);
-      return;
-    }
 
-    // 3) Credit treasury
-    await creditTreasuryTotals(allianceId, totals);
+    // 4) Credit the alliance treasury (upserts a treasury row & increments balances JSON)
+    await creditTreasury(prisma, allianceId, totals, "tax");
 
-    // 4) Report success
-    const nonZero = RES_KEYS
-      .filter(k => n(totals[k]) > 0)
-      .map(k => `**${k}**: ${n(totals[k]).toLocaleString()}`)
-      .join(" · ");
+    // 5) Reply with a summary
+    const lines = RES_KEYS
+      .map(k => ({ k, v: Number(totals[k] || 0) }))
+      .filter(x => x.v !== 0)
+      .map(x => `**${x.k}**: ${x.v.toLocaleString()}`);
 
     const embed = new EmbedBuilder()
-      .setTitle("✅ Tax rows applied to Treasury")
+      .setTitle(`✅ Applied ${uniq.length} tax rows`)
+      .setDescription(lines.length ? lines.join(" · ") : "—")
       .setColor(Colors.Green)
-      .setDescription(`Alliance **${allianceId}**\nRows counted: **${counted}**`)
-      .addFields({ name: "Totals credited", value: nonZero || "—" });
+      .setFooter({ text: `Alliance ${allianceId}` });
 
     await interaction.editReply({ embeds: [embed] });
+
   } catch (err: any) {
     await interaction.editReply(`❌ Error: ${err?.message ?? String(err)}`);
   }
