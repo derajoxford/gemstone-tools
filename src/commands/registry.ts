@@ -1,18 +1,28 @@
 // src/commands/registry.ts
-import type { RESTPostAPIChatInputApplicationCommandsJSONBody } from 'discord.js';
+import type { RESTPostAPIChatInputApplicationCommandsJSONBody } from "discord.js";
 
-// ✅ Keep ONLY commands that currently compile.
-//    Right now we only ship /pnw_bankpeek from this registry.
-import * as pnw_bankpeek from './pnw_bankpeek';
+// Extra slash commands implemented as modules (each exports `data` + `execute`)
+import * as pnw_bankpeek from "./pnw_bankpeek";
 import * as pnw_tax_apply from "./pnw_tax_apply";
 
-export const extraCommandsJSON: RESTPostAPIChatInputApplicationCommandsJSONBody[] = [
-  pnw_bankpeek.data.toJSON(),
-  pnw_tax_apply,
-];
+export type CommandModule = {
+  data?: { name?: string; toJSON?: () => any };
+  execute?: (i: any) => Promise<any>;
+};
 
-// Called by index.ts to dispatch to the command module
+// Only include modules that actually expose both `data` and `execute`
+export const commandModules: CommandModule[] = [
+  pnw_bankpeek,
+  pnw_tax_apply,
+].filter((m) => m?.data && m?.execute);
+
+// JSON payloads for registration (consumed by src/index.ts)
+export const extraCommandsJSON: RESTPostAPIChatInputApplicationCommandsJSONBody[] =
+  commandModules
+    .map((m) => m.data?.toJSON?.())
+    .filter(Boolean) as RESTPostAPIChatInputApplicationCommandsJSONBody[];
+
+// Lookup helper used by src/index.ts to dispatch to module.execute
 export function findCommandByName(name: string) {
-  if (name === pnw_bankpeek.data.name) return pnw_bankpeek;
-  return undefined;
+  return commandModules.find((m) => m.data?.name === name);
 }
