@@ -10,7 +10,7 @@ import {
   queryAllianceBankrecs,
   BankrecFilter,
 } from "../lib/pnw_bank_ingest";
-import { creditTreasury } from "../utils/treasury";
+import creditTreasury from "../utils/treasury";
 import { fetchBankrecs } from "../lib/pnw";
 
 // --- constants / helpers ---
@@ -75,22 +75,17 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     // 1) Try GQL ingest first (fastest, consistent with /pnw_bankpeek)
     let rows: AnyRow[] = await queryAllianceBankrecs(allianceId, limit, BankrecFilter.TAX);
 
-    // If rows exist but have no amounts, fallback to legacy top-level fetch (HTML scrape/API)
+    // If rows exist but have no amounts, fallback to legacy top-level fetch (HTML/API)
     const gqlHasAmounts = rows.some(r => hasAnyResources(r));
     if (!gqlHasAmounts) {
-      // fetchBankrecs signature: fetchBankrecs({ apiKey }, [allianceId]) or similar is used elsewhere
-      // We only need amounts; legacy fetch returns full amounts on each row.
       const apiKey = process.env.PNW_DEFAULT_API_KEY || "";
-      if (!apiKey) {
-        // Keep going with GQL rows if no default key; better than nothing
-      } else {
-        const legacy = await fetchBankrecs({ apiKey }, [allianceId]).catch(() => null);
-        // shape (based on existing usage in index.ts): array with items per alliance, each having bankrecs[]
-        // Normalize to a flat array if available
-        const legacyRows = Array.isArray(legacy)
+      if (apiKey) {
+        // Type cast to avoid TS signature mismatch; we only need the data shape
+        const legacy: any = await (fetchBankrecs as any)({ apiKey }, [allianceId]).catch(() => null);
+        const legacyRows: any[] = Array.isArray(legacy)
           ? (legacy.find((x: any) => Number(x?.id ?? x?.alliance_id) === allianceId)?.bankrecs ?? [])
           : [];
-        if (Array.isArray(legacyRows) && legacyRows.length) {
+        if (legacyRows.length) {
           rows = legacyRows.slice(0, limit);
         }
       }
@@ -125,7 +120,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       }
     }
 
-    // 4) Credit the alliance treasury (upserts a treasury row & increments balances JSON)
+    // 4) Credit the alliance treasury (upserts a treasury row & increments JSON balances)
     await creditTreasury(prisma, allianceId, totals, "tax");
 
     // 5) Reply with a summary
