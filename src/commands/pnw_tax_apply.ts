@@ -5,92 +5,83 @@ import {
   EmbedBuilder,
   Colors,
 } from "discord.js";
+import { prisma } from "../utils/db";
 import {
   queryAllianceBankrecs,
   BankrecFilter,
 } from "../lib/pnw_bank_ingest";
-import { addToTreasury } from "../utils/treasury";
-
-type BankrecRow = {
-  id: number | string;
-  date: string;
-  note?: string | null;
-  sender_type: number | string;
-  sender_id: number | string;
-  receiver_type: number | string;
-  receiver_id: number | string;
-  money?: number;
-  food?: number;
-  coal?: number;
-  oil?: number;
-  uranium?: number;
-  lead?: number;
-  iron?: number;
-  bauxite?: number;
-  gasoline?: number;
-  munitions?: number;
-  steel?: number;
-  aluminum?: number;
-};
-
-const RES_KEYS = [
-  "money","food","coal","oil","uranium","lead","iron","bauxite",
-  "gasoline","munitions","steel","aluminum",
-] as const;
-
-function toNum(v: any): number { const n = Number(v); return Number.isFinite(n) ? n : 0; }
+import {
+  ensureAllianceTreasury,
+  applyDeltaToTreasury,
+  deltaFromBankrec,
+  KEYS,
+} from "../utils/treasury";
 
 export const data = new SlashCommandBuilder()
   .setName("pnw_tax_apply")
-  .setDescription("Apply recent tax records to the alliance Treasury (totals resources)")
+  .setDescription("Apply recent taxrecs to the alliance treasury")
   .addIntegerOption(o =>
     o.setName("alliance_id").setDescription("PnW alliance ID").setRequired(true)
   )
   .addIntegerOption(o =>
-    o.setName("limit").setDescription("How many rows to pull (1-200)").setMinValue(1).setMaxValue(200)
+    o
+      .setName("limit")
+      .setDescription("How many tax rows to apply (1–2000)")
+      .setMinValue(1)
+      .setMaxValue(2000)
   );
 
 export async function execute(interaction: ChatInputCommandInteraction) {
   const allianceId = interaction.options.getInteger("alliance_id", true);
-  const limit = Math.min(200, Math.max(1, interaction.options.getInteger("limit") ?? 50));
+  const limit = interaction.options.getInteger("limit", false) ?? 100;
 
   await interaction.deferReply({ ephemeral: true });
 
   try {
-    // Pull latest taxrecs
-    const rows = await queryAllianceBankrecs(allianceId, limit, BankrecFilter.TAX);
-    const list = (rows ?? []) as BankrecRow[];
+    // Ensure a treasury row exists (works for scalar- or JSON-based schema)
+    await ensureAllianceTreasury(prisma, "treasury", allianceId);
 
-    if (!list.length) {
+    // NOTE: PnW API typically caps a single page (≈200). We’ll add pagination next step.
+    const rows = await queryAllianceBankrecs(
+      allianceId,
+      Math.min(2000, Math.max(1, limit)),
+      BankrecFilter.TAX
+    );
+
+    if (!rows?.length) {
       await interaction.editReply(`No tax records found for alliance ${allianceId}.`);
       return;
     }
 
-    // Sum all resources from these rows
-    const delta: Record<(typeof RES_KEYS)[number], number> = {
-      money:0,food:0,coal:0,oil:0,uranium:0,lead:0,iron:0,bauxite:0,
-      gasoline:0,munitions:0,steel:0,aluminum:0,
-    };
-    for (const r of list) {
-      for (const k of RES_KEYS) delta[k] += toNum((r as any)[k]);
+    let applied = 0;
+    const totals: Record<string, number> = {};
+    for (const k of KEYS) totals[k] = 0;
+
+    for (const r of rows) {
+      // Convert the bankrec into a delta shape
+      const d = deltaFromBankrec(r);
+
+      // Sum for reporting
+      for (const k of KEYS) {
+        if (d[k as any]) totals[k] += Number(d[k as any] || 0);
+      }
+
+      // Credit to treasury
+      await applyDeltaToTreasury(prisma, "treasury", allianceId, d);
+      applied++;
     }
 
-    // Credit Treasury once with the totals
-    await addToTreasury(allianceId, delta);
+    const lines = KEYS
+      .filter(k => totals[k] && Number(totals[k]) !== 0)
+      .map(k => `**${k}**: ${Number(totals[k]).toLocaleString()}`)
+      .join(" · ") || "—";
 
-    // Build a compact summary
-    const shown = RES_KEYS
-      .filter(k => delta[k] && Math.abs(delta[k]) > 0)
-      .map(k => `**${k}**: ${Math.round(delta[k]).toLocaleString()}`)
-      .join(" · ") || "— all zero —";
-
-    const emb = new EmbedBuilder()
-      .setTitle(`✅ Tax applied to Treasury`)
-      .setDescription(`Alliance **${allianceId}** — applied **${list.length}** tax rows.`)
-      .addFields({ name: "Totals credited", value: shown })
+    const embed = new EmbedBuilder()
+      .setTitle(`✅ Applied ${applied} tax rows`)
+      .setDescription(`Alliance **${allianceId}**\nTotals credited:\n${lines}`)
       .setColor(Colors.Green);
 
-    await interaction.editReply({ embeds: [emb] });
+    await interaction.editReply({ embeds: [embed] });
   } catch (err: any) {
     await interaction.editReply(`❌ Error: ${err?.message ?? String(err)}`);
   }
