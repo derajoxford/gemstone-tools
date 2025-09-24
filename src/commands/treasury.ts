@@ -28,20 +28,23 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
   try {
     const model = detectModel(prisma as any);
-    const row =
-      model === "treasury"
-        ? await (prisma as any).treasury.findUnique({ where: { allianceId } })
-        : model === "allianceTreasury"
-        ? await (prisma as any).allianceTreasury.findUnique({ where: { allianceId } })
-        : await (prisma as any).alliance_treasury.findUnique({ where: { allianceId } });
+    let row: any = null;
+
+    if (model === "treasury") {
+      row = await (prisma as any).treasury.findUnique({ where: { allianceId } }).catch(() => null);
+    } else if (model === "allianceTreasury") {
+      row = await (prisma as any).allianceTreasury.findUnique({ where: { allianceId } }).catch(() => null);
+    } else {
+      row = await (prisma as any).alliance_treasury.findUnique({ where: { allianceId } }).catch(() => null);
+    }
 
     const balances: Record<string, number> =
       (row?.balances as any) || Object.fromEntries(KEYS.map(k => [k, 0]));
 
-    const lines = KEYS
-      .filter(k => Number(balances[k] || 0) !== 0)
-      .map(k => `**${k}**: ${Number(balances[k] || 0).toLocaleString()}`)
-      .join(" · ") || "—";
+    const lines =
+      KEYS.filter(k => Number(balances[k] || 0) !== 0)
+          .map(k => `**${k}**: ${Number(balances[k] || 0).toLocaleString()}`)
+          .join(" · ") || "—";
 
     const embed = new EmbedBuilder()
       .setTitle(`💰 Treasury — Alliance ${allianceId}`)
