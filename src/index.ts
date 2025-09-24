@@ -180,7 +180,7 @@ client.on('interactionCreate', async (i: Interaction) => {
       if (i.customId.startsWith('sk:modal:')) return handleSafekeepingModalSubmit(i as any);
 
     } else if (i.isButton()) {
-      if (i.customId.startsWith('wd:open:')) return handleWithdrawOpenPaged(i as any);
+      if (i.customId.startsWith('wd:open:')) return handleWithdrawOpenButtonPaged(i as any);
       if (i.customId === 'wd:done') return handleWithdrawDone(i as any);
 
       if (i.customId.startsWith('sk:open:')) return handleSafekeepingOpenPaged(i as any);
