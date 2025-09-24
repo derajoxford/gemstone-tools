@@ -1,66 +1,175 @@
 // src/utils/treasury.ts
-import { PrismaClient } from "@prisma/client";
-const prisma = new PrismaClient();
+import type { PrismaClient } from "@prisma/client";
 
-const KEYS = [
-  "money","food","coal","oil","uranium","lead","iron","bauxite",
-  "gasoline","munitions","steel","aluminum",
+// canonical resource keys we track
+export const KEYS = [
+  "money",
+  "food",
+  "coal",
+  "oil",
+  "uranium",
+  "lead",
+  "iron",
+  "bauxite",
+  "gasoline",
+  "munitions",
+  "steel",
+  "aluminum",
 ] as const;
 
-export type TreasuryDelta = Partial<Record<(typeof KEYS)[number], number>>;
+export type ResourceKey = (typeof KEYS)[number];
+export type Delta = Partial<Record<ResourceKey, number>>;
 
-/**
- * Sum a set of PnW bank/tax rows into a single delta by resource keys.
- * Rows are expected to have numeric fields named like: money, food, coal, ...
- */
-export function sumRowsToDelta(rows: any[]): TreasuryDelta {
-  const out: Record<string, number> = {};
-  for (const k of KEYS) out[k] = 0;
-  for (const r of rows || []) {
-    for (const k of KEYS) {
-      const v = Number((r as any)[k] ?? 0);
-      if (Number.isFinite(v) && v) out[k] += v;
-    }
-  }
-  // strip zeros
-  const clean: TreasuryDelta = {};
-  for (const k of KEYS) if (out[k]) clean[k] = out[k];
-  return clean;
+// -- internals ---------------------------------------------------------------
+
+function zeroBalances(): Record<ResourceKey, number> {
+  const z: any = {};
+  for (const k of KEYS) z[k] = 0;
+  return z;
 }
 
 /**
- * Add a delta to the alliance treasury. This is schema-agnostic:
- * it will try prisma.treasury, prisma.allianceTreasury, or prisma.AllianceTreasury.
- * The model must have a unique `allianceId` and numeric resource columns matching KEYS.
+ * Try an upsert assuming *scalar* columns exist (money, food, ...).
+ * If that fails with "Unknown argument", the caller can fall back to JSON mode.
  */
-export async function addToTreasury(allianceId: number, delta: TreasuryDelta) {
-  if (!allianceId) throw new Error("allianceId required");
-  const model =
-    (prisma as any).treasury ??
-    (prisma as any).allianceTreasury ??
-    (prisma as any).AllianceTreasury;
-
-  if (!model) {
-    throw new Error(
-      "Prisma model for treasury not found. Expected one of: treasury, allianceTreasury, AllianceTreasury",
-    );
+async function upsertScalarOrThrow(
+  prisma: PrismaClient,
+  modelName: string,
+  allianceId: number
+) {
+  const model = (prisma as any)[modelName];
+  if (!model || typeof model.upsert !== "function") {
+    throw new Error(`Prisma model ${modelName} not found`);
   }
-
-  // Build increment payload for update
-  const inc: Record<string, any> = {};
-  for (const k of KEYS) {
-    const v = Number((delta as any)[k] ?? 0);
-    if (v) inc[k] = { increment: v };
-  }
-
-  // Build create payload for first-time upsert
-  const create: Record<string, any> = { allianceId };
-  for (const k of KEYS) create[k] = Number((delta as any)[k] ?? 0) || 0;
-
-  // Some schemas name the unique field differently; we assume `allianceId` is unique.
-  await model.upsert({
+  const create: any = { allianceId };
+  for (const k of KEYS) create[k] = 0;
+  return model.upsert({
     where: { allianceId },
-    update: inc,
+    update: {},
     create,
   });
+}
+
+/**
+ * Upsert using a JSON {balances} column.
+ */
+async function upsertJson(
+  prisma: PrismaClient,
+  modelName: string,
+  allianceId: number
+) {
+  const model = (prisma as any)[modelName];
+  if (!model || typeof model.upsert !== "function") {
+    throw new Error(`Prisma model ${modelName} not found`);
+  }
+  return model.upsert({
+    where: { allianceId },
+    update: {},
+    create: {
+      allianceId,
+      balances: zeroBalances(),
+    },
+  });
+}
+
+async function getByAllianceId(
+  prisma: PrismaClient,
+  modelName: string,
+  allianceId: number
+) {
+  const model = (prisma as any)[modelName];
+  return model.findUnique?.({ where: { allianceId } });
+}
+
+// -- public helpers ----------------------------------------------------------
+
+/**
+ * Ensure a treasury row exists for the alliance. Works with either schema:
+ * - scalar columns (money, food, …)
+ * - JSON column { balances }
+ */
+export async function ensureAllianceTreasury(
+  prisma: PrismaClient,
+  modelName: string,
+  allianceId: number
+) {
+  // Try scalar first; if that fails due to shape, fall back to JSON.
+  try {
+    return await upsertScalarOrThrow(prisma, modelName, allianceId);
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    const looksLikeShapeErr =
+      msg.includes("Unknown argument") ||
+      msg.includes("Argument") ||
+      msg.includes("Invalid") ||
+      msg.includes("unknown field");
+    if (!looksLikeShapeErr) throw e;
+    return upsertJson(prisma, modelName, allianceId);
+  }
+}
+
+/**
+ * Apply a delta (add amounts) to the treasury row.
+ * If scalar columns exist, uses { increment }.
+ * If only JSON {balances} exists, merges and writes back.
+ */
+export async function applyDeltaToTreasury(
+  prisma: PrismaClient,
+  modelName: string,
+  allianceId: number,
+  delta: Delta
+) {
+  const model = (prisma as any)[modelName];
+  if (!model) throw new Error(`Prisma model ${modelName} not found`);
+
+  // Make sure the row exists
+  await ensureAllianceTreasury(prisma, modelName, allianceId);
+
+  // Attempt scalar increment path
+  try {
+    const data: any = {};
+    for (const k of KEYS) {
+      const v = Number((delta as any)[k] ?? 0) || 0;
+      if (v) data[k] = { increment: v };
+    }
+    if (Object.keys(data).length === 0) return;
+    await model.update({ where: { allianceId }, data });
+    return;
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    const looksLikeShapeErr =
+      msg.includes("Unknown argument") ||
+      msg.includes("Argument") ||
+      msg.includes("Invalid") ||
+      msg.includes("unknown field");
+    if (!looksLikeShapeErr) throw e;
+  }
+
+  // JSON fallback: read, merge, write
+  const row = await getByAllianceId(prisma, modelName, allianceId);
+  const currentBalances: Record<string, number> = {
+    ...(row?.balances ?? zeroBalances()),
+  };
+
+  for (const k of KEYS) {
+    const add = Number((delta as any)[k] ?? 0) || 0;
+    if (add) currentBalances[k] = Number(currentBalances[k] ?? 0) + add;
+  }
+
+  await model.update({
+    where: { allianceId },
+    data: { balances: currentBalances },
+  });
+}
+
+/**
+ * Turn a raw bank/tax row (from PnW) into a {Delta}
+ */
+export function deltaFromBankrec(row: any): Delta {
+  const d: any = {};
+  for (const k of KEYS) {
+    const v = Number(row?.[k] ?? 0) || 0;
+    if (v) d[k] = v;
+  }
+  return d;
 }
