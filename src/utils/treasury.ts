@@ -1,23 +1,74 @@
 // src/utils/treasury.ts
-import { ResourceDelta, RESOURCE_KEYS } from "../integrations/pnw/tax.js";
+import { PrismaClient } from "@prisma/client";
+const prisma = new PrismaClient();
 
-type Bag = Partial<Record<string, number>>;
+/**
+ * Increment the alliance treasury by the provided resource deltas.
+ * Any missing keys are treated as zero.
+ */
+export type ResourceKey =
+  | "money" | "food" | "coal" | "oil" | "uranium" | "lead" | "iron" | "bauxite"
+  | "gasoline" | "munitions" | "steel" | "aluminum";
 
-export function coerceDelta(obj: any): ResourceDelta {
-  const out: Partial<Record<string, number>> = {};
-  for (const k of RESOURCE_KEYS) {
-    const v = Number(obj?.[k]);
-    if (Number.isFinite(v) && v !== 0) out[k] = v;
+export type ResourceDelta = Partial<Record<ResourceKey, number>>;
+
+const KEYS: ResourceKey[] = [
+  "money","food","coal","oil","uranium","lead","iron","bauxite",
+  "gasoline","munitions","steel","aluminum",
+];
+
+/**
+ * Ensures a treasury row exists and increments it atomically.
+ * Assumes a Prisma model `treasury` with a unique constraint on { allianceId } and
+ * numeric columns for each resource key above.
+ */
+export async function addToTreasury(allianceId: number, delta: ResourceDelta) {
+  // normalize: coerce all keys to numbers (0 if missing/NaN)
+  const inc: Record<string, any> = {};
+  for (const k of KEYS) {
+    const v = Number(delta[k] ?? 0);
+    if (v) inc[k] = { increment: v };
   }
-  return out as ResourceDelta;
+
+  // if everything is zero, nothing to do
+  if (Object.keys(inc).length === 0) return;
+
+  // upsert the row and apply increments
+  await prisma.treasury.upsert({
+    where: { allianceId },
+    update: inc,
+    create: {
+      allianceId,
+      // initialize with zeros + deltas
+      money: Number(delta.money ?? 0),
+      food: Number(delta.food ?? 0),
+      coal: Number(delta.coal ?? 0),
+      oil: Number(delta.oil ?? 0),
+      uranium: Number(delta.uranium ?? 0),
+      lead: Number(delta.lead ?? 0),
+      iron: Number(delta.iron ?? 0),
+      bauxite: Number(delta.bauxite ?? 0),
+      gasoline: Number(delta.gasoline ?? 0),
+      munitions: Number(delta.munitions ?? 0),
+      steel: Number(delta.steel ?? 0),
+      aluminum: Number(delta.aluminum ?? 0),
+    },
+  });
 }
 
-export function applyDelta(bag: Bag, delta: ResourceDelta): Bag {
-  for (const k of RESOURCE_KEYS) {
-    const d = Number((delta as any)[k] ?? 0);
-    if (!Number.isFinite(d) || d === 0) continue;
-    const curr = Number(bag[k] ?? 0);
-    bag[k] = curr + d;
+/**
+ * Convenience: sum an array of bank/tax rows into a ResourceDelta.
+ * Expects row fields to match the KEYS above.
+ */
+export function sumRowsToDelta(rows: Array<Record<string, any>>): ResourceDelta {
+  const out: Record<string, number> = {};
+  for (const k of KEYS) out[k] = 0;
+
+  for (const r of rows) {
+    for (const k of KEYS) {
+      const v = Number(r?.[k] ?? 0);
+      if (Number.isFinite(v) && v) out[k]! += v;
+    }
   }
-  return bag;
+  return out as ResourceDelta;
 }
