@@ -19,43 +19,29 @@ import {
 
 type ResKey = (typeof KEYS)[number];
 
-function detectTreasuryModelName(p: any): "treasury" | "allianceTreasury" | "alliance_treasury" {
+function detectModel(p: any): "treasury" | "allianceTreasury" | "alliance_treasury" {
   if (p?.treasury) return "treasury";
   if (p?.allianceTreasury) return "allianceTreasury";
   if (p?.alliance_treasury) return "alliance_treasury";
   throw new Error("Prisma model treasury not found");
 }
 
-function stripHtml(s: string): string {
-  return s
-    .replace(/<[^>]+>/g, "")       // tags
-    .replace(/&nbsp;/g, " ")
-    .replace(/&bull;/g, "•")
-    .replace(/&amp;/g, "&")
-    .trim();
-}
-
-/** Heuristic: is this a TAX marker line? (works for ALL or TAX feeds) */
-function isTaxish(row: any): boolean {
-  const note = stripHtml(String(row?.note ?? "")).toLowerCase();
-  const st = String(row?.sender_type ?? "");
-  const rt = String(row?.receiver_type ?? "");
-  const senderNation = st === "3" || Number(st) === 3;   // 3 = nation
-  const recvAlliance = rt === "2" || Number(rt) === 2;   // 2 = alliance
-  // PnW commonly writes "Automated Tax 100%/100%" or similar
-  const mentionsTax = note.includes("automated tax") || note.includes("tax");
-  return mentionsTax && senderNation && recvAlliance;
-}
-
-/** Any non-zero amounts after deriving the delta from the bankrec row */
-function rowHasAnyAmounts(row: any): boolean {
+function hasAnyAmounts(row: any): boolean {
+  // rely on the standard PnW bankrec numeric fields via deltaFromBankrec
   const d = deltaFromBankrec(row);
-  return KEYS.some((k) => Number((d as any)[k] ?? 0) !== 0);
+  return KEYS.some(k => Number((d as any)[k] ?? 0) !== 0);
+}
+
+function isNationToAlliance(row: any, allianceId: number): boolean {
+  const st = Number(row?.sender_type ?? 0);
+  const rt = Number(row?.receiver_type ?? 0);
+  const rid = Number(row?.receiver_id ?? 0);
+  return st === 3 && rt === 2 && rid === allianceId;
 }
 
 export const data = new SlashCommandBuilder()
   .setName("pnw_tax_apply")
-  .setDescription("Apply alliance tax deposits to the treasury (credits nation→alliance tax lines)")
+  .setDescription("Apply nation→alliance deposits (incl. Automated Tax) to the alliance treasury")
   .addIntegerOption((o) =>
     o.setName("alliance_id").setDescription("PnW alliance ID").setRequired(true)
   )
@@ -75,40 +61,31 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   await interaction.deferReply({ ephemeral: true });
 
   try {
-    const modelName = detectTreasuryModelName(prisma as any);
-    await ensureAllianceTreasury(prisma as any, modelName, allianceId);
+    const model = detectModel(prisma as any);
+    await ensureAllianceTreasury(prisma as any, model, allianceId);
 
-    // Strategy:
-    // 1) Pull ALL recent bankrecs (not TAX feed) so we can see the credited amounts.
-    // 2) Filter to “tax-like” nation→alliance rows mentioning Automated Tax.
-    // 3) Apply deltas to the alliance treasury.
-    const allRows = await queryAllianceBankrecs(
-      allianceId,
-      limit,
-      BankrecFilter.ALL
-    );
+    // Pull from the ALL feed so amounts are present
+    const rows = await queryAllianceBankrecs(allianceId, limit, BankrecFilter.ALL);
 
-    const candidates = (allRows || []).filter(isTaxish);
-    const rowsWithAmounts = candidates.filter(rowHasAnyAmounts);
+    // Filter to nation -> alliance deposits with any non-zero amounts
+    const taxish = (rows || []).filter(r => isNationToAlliance(r, allianceId) && hasAnyAmounts(r));
 
-    if (!rowsWithAmounts.length) {
-      await interaction.editReply(
-        `No tax-like bank records with amounts found for alliance ${allianceId}.`
-      );
+    if (!taxish.length) {
+      await interaction.editReply(`No tax-like bank records with amounts found for alliance ${allianceId}.`);
       return;
     }
 
-    // Aggregate totals + apply one-by-one (idempotent upserts in treasury helper)
     const totals = Object.fromEntries(KEYS.map((k) => [k, 0])) as Record<ResKey, number>;
     let applied = 0;
 
-    for (const r of rowsWithAmounts) {
+    for (const r of taxish) {
       const d = deltaFromBankrec(r);
+      // accumulate totals
       for (const k of KEYS) {
         const v = Number((d as any)[k] ?? 0);
         if (v) totals[k] += v;
       }
-      await applyDeltaToTreasury(prisma as any, modelName, allianceId, d);
+      await applyDeltaToTreasury(prisma as any, model, allianceId, d);
       applied++;
     }
 
@@ -118,13 +95,12 @@ export async function execute(interaction: ChatInputCommandInteraction) {
         .join(" · ") || "—";
 
     const embed = new EmbedBuilder()
-      .setTitle("✅ Tax deposits credited to treasury")
+      .setTitle("✅ Deposits credited to treasury")
       .setDescription(
         [
           `Alliance **${allianceId}**`,
-          `Scanned: **${limit}** rows (ALL feed)`,
-          `Tax-like rows: **${candidates.length}**`,
-          `Rows with amounts: **${rowsWithAmounts.length}**`,
+          `Scanned (ALL feed): **${limit}** rows`,
+          `Matched rows: **${taxish.length}**`,
           `Applied: **${applied}**`,
           ``,
           `**Totals credited**`,
