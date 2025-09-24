@@ -1,22 +1,16 @@
 // src/commands/registry.ts
-import type { RESTPostAPIChatInputApplicationCommandsJSONBody } from "discord.js";
+import type { RESTPostAPIChatInputApplicationCommandsJSONBody } from 'discord.js';
 
-// ✅ Only include commands we’ve explicitly migrated into registry
-import * as pnw_bankpeek from "./pnw_bankpeek";
+// ✅ Keep ONLY commands that currently compile.
+//    Right now we only ship /pnw_bankpeek from this registry.
+import * as pnw_bankpeek from './pnw_bankpeek';
 
-export const commandModules = [
-  pnw_bankpeek,
-].filter((m) => m?.data && m?.execute);
+export const extraCommandsJSON: RESTPostAPIChatInputApplicationCommandsJSONBody[] = [
+  pnw_bankpeek.data.toJSON(),
+];
 
-export const commands: RESTPostAPIChatInputApplicationCommandsJSONBody[] =
-  commandModules.map((m) => m.data!.toJSON());
-
-export const executeMap = new Map<string, any>(
-  commandModules.map((m) => [m.data!.name!, m])
-);
-
-// ---- TEMP STUBS (to keep build green for legacy paths) ----
-export const extraCommandsJSON: any[] = [];
-export function findCommandByName(_name: string) {
-  return undefined as any;
+// Called by index.ts to dispatch to the command module
+export function findCommandByName(name: string) {
+  if (name === pnw_bankpeek.data.name) return pnw_bankpeek;
+  return undefined;
 }
