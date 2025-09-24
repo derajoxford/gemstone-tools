@@ -5,7 +5,7 @@ import {
   EmbedBuilder,
   Colors,
 } from "discord.js";
-import prisma from "../utils/db"; // ✅ default export
+import prisma from "../utils/db"; // default export
 import {
   queryAllianceBankrecs,
   BankrecFilter,
@@ -18,6 +18,14 @@ import {
 } from "../utils/treasury";
 
 type ResKey = (typeof KEYS)[number];
+
+// Detect the treasury model name that exists on this Prisma client
+function detectTreasuryModelName(p: any): "treasury" | "allianceTreasury" | "alliance_treasury" {
+  if (p?.treasury) return "treasury";
+  if (p?.allianceTreasury) return "allianceTreasury";
+  if (p?.alliance_treasury) return "alliance_treasury";
+  throw new Error("Prisma model treasury not found");
+}
 
 export const data = new SlashCommandBuilder()
   .setName("pnw_tax_apply")
@@ -40,10 +48,13 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   await interaction.deferReply({ ephemeral: true });
 
   try {
-    // Ensure a treasury row exists (works for scalar- or JSON-based schema)
-    await ensureAllianceTreasury(prisma, "treasury", allianceId);
+    // Figure out the model name in THIS schema
+    const modelName = detectTreasuryModelName(prisma as any);
 
-    // NOTE: current fetch is single-shot; pagination comes next if needed
+    // Ensure a treasury row exists (works for scalar- or JSON-based schema)
+    await ensureAllianceTreasury(prisma as any, modelName, allianceId);
+
+    // Pull tax records (server already bumped to allow >50; we cap at 2000 here)
     const rows = await queryAllianceBankrecs(
       allianceId,
       Math.min(2000, Math.max(1, limit)),
@@ -68,7 +79,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       }
 
       // Credit to treasury
-      await applyDeltaToTreasury(prisma, "treasury", allianceId, d);
+      await applyDeltaToTreasury(prisma as any, modelName, allianceId, d);
       applied++;
     }
 
