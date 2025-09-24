@@ -26,37 +26,51 @@ function detectTreasuryModelName(p: any): "treasury" | "allianceTreasury" | "all
   throw new Error("Prisma model treasury not found");
 }
 
-/** Any non-zero amount after delta extraction? */
-function rowHasAnyResources(row: any): boolean {
-  const d = deltaFromBankrec(row);
-  return KEYS.some(k => Number((d as any)[k] ?? 0) !== 0);
+function stripHtml(s: string): string {
+  return s
+    .replace(/<[^>]+>/g, "")       // tags
+    .replace(/&nbsp;/g, " ")
+    .replace(/&bull;/g, "•")
+    .replace(/&amp;/g, "&")
+    .trim();
 }
 
-/** Heuristic: is this a tax row? */
+/** Heuristic: is this a TAX marker line? (works for ALL or TAX feeds) */
 function isTaxish(row: any): boolean {
-  const note = String(row?.note || "").toLowerCase();
-  const senderNation = Number(row?.sender_type) === 3; // nation
-  const recvAlliance = Number(row?.receiver_type) === 2; // alliance
-  return note.includes("tax") && senderNation && recvAlliance;
+  const note = stripHtml(String(row?.note ?? "")).toLowerCase();
+  const st = String(row?.sender_type ?? "");
+  const rt = String(row?.receiver_type ?? "");
+  const senderNation = st === "3" || Number(st) === 3;   // 3 = nation
+  const recvAlliance = rt === "2" || Number(rt) === 2;   // 2 = alliance
+  // PnW commonly writes "Automated Tax 100%/100%" or similar
+  const mentionsTax = note.includes("automated tax") || note.includes("tax");
+  return mentionsTax && senderNation && recvAlliance;
+}
+
+/** Any non-zero amounts after deriving the delta from the bankrec row */
+function rowHasAnyAmounts(row: any): boolean {
+  const d = deltaFromBankrec(row);
+  return KEYS.some((k) => Number((d as any)[k] ?? 0) !== 0);
 }
 
 export const data = new SlashCommandBuilder()
   .setName("pnw_tax_apply")
-  .setDescription("Apply recent tax rows to the alliance treasury (credits deposits)")
-  .addIntegerOption(o =>
+  .setDescription("Apply alliance tax deposits to the treasury (credits nation→alliance tax lines)")
+  .addIntegerOption((o) =>
     o.setName("alliance_id").setDescription("PnW alliance ID").setRequired(true)
   )
-  .addIntegerOption(o =>
+  .addIntegerOption((o) =>
     o
       .setName("limit")
-      .setDescription("How many rows to consider (1–2000)")
+      .setDescription("How many recent rows to scan (1–5000)")
       .setMinValue(1)
-      .setMaxValue(2000)
+      .setMaxValue(5000)
   );
 
 export async function execute(interaction: ChatInputCommandInteraction) {
   const allianceId = interaction.options.getInteger("alliance_id", true);
-  const limit = interaction.options.getInteger("limit", false) ?? 200;
+  const rawLimit = interaction.options.getInteger("limit", false) ?? 2000;
+  const limit = Math.max(1, Math.min(5000, rawLimit));
 
   await interaction.deferReply({ ephemeral: true });
 
@@ -64,67 +78,59 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     const modelName = detectTreasuryModelName(prisma as any);
     await ensureAllianceTreasury(prisma as any, modelName, allianceId);
 
-    // 1) TAX feed first
-    let rows = await queryAllianceBankrecs(
+    // Strategy:
+    // 1) Pull ALL recent bankrecs (not TAX feed) so we can see the credited amounts.
+    // 2) Filter to “tax-like” nation→alliance rows mentioning Automated Tax.
+    // 3) Apply deltas to the alliance treasury.
+    const allRows = await queryAllianceBankrecs(
       allianceId,
-      Math.min(2000, Math.max(1, limit)),
-      BankrecFilter.TAX
+      limit,
+      BankrecFilter.ALL
     );
 
-    // 2) If TAX feed has no resource data, fallback to ALL and filter tax-ish
-    if (!rows?.length || rows.every(r => !rowHasAnyResources(r))) {
-      const fallback = await queryAllianceBankrecs(
-        allianceId,
-        Math.min(2000, Math.max(1, limit)),
-        BankrecFilter.ALL
-      );
-      rows = (fallback || []).filter(isTaxish);
-    }
+    const candidates = (allRows || []).filter(isTaxish);
+    const rowsWithAmounts = candidates.filter(rowHasAnyAmounts);
 
-    if (!rows?.length) {
-      await interaction.editReply(`No tax-like bank records found for alliance ${allianceId}.`);
+    if (!rowsWithAmounts.length) {
+      await interaction.editReply(
+        `No tax-like bank records with amounts found for alliance ${allianceId}.`
+      );
       return;
     }
 
-    // Aggregate + apply
-    let considered = rows.length;
-    let withAmounts = 0;
+    // Aggregate totals + apply one-by-one (idempotent upserts in treasury helper)
+    const totals = Object.fromEntries(KEYS.map((k) => [k, 0])) as Record<ResKey, number>;
     let applied = 0;
-    const totals = Object.fromEntries(KEYS.map(k => [k, 0])) as Record<ResKey, number>;
 
-    for (const r of rows) {
+    for (const r of rowsWithAmounts) {
       const d = deltaFromBankrec(r);
-      const any = KEYS.some(k => Number((d as any)[k] ?? 0) !== 0);
-      if (!any) continue;
-      withAmounts++;
-
       for (const k of KEYS) {
         const v = Number((d as any)[k] ?? 0);
         if (v) totals[k] += v;
       }
-
       await applyDeltaToTreasury(prisma as any, modelName, allianceId, d);
       applied++;
     }
 
-    const lines =
-      KEYS.filter(k => Number(totals[k]) !== 0)
-        .map(k => `**${k}**: ${Number(totals[k]).toLocaleString()}`)
+    const prettyTotals =
+      KEYS.filter((k) => Number(totals[k]) !== 0)
+        .map((k) => `**${k}**: ${Number(totals[k]).toLocaleString()}`)
         .join(" · ") || "—";
 
-    const desc = [
-      `Alliance **${allianceId}**`,
-      `Rows considered: **${considered}**`,
-      `Rows with resources: **${withAmounts}**`,
-      `Rows credited: **${applied}**`,
-      ``,
-      `Totals credited:`,
-      `${lines}`,
-    ].join("\n");
-
     const embed = new EmbedBuilder()
-      .setTitle(`✅ Tax credit applied`)
-      .setDescription(desc)
+      .setTitle("✅ Tax deposits credited to treasury")
+      .setDescription(
+        [
+          `Alliance **${allianceId}**`,
+          `Scanned: **${limit}** rows (ALL feed)`,
+          `Tax-like rows: **${candidates.length}**`,
+          `Rows with amounts: **${rowsWithAmounts.length}**`,
+          `Applied: **${applied}**`,
+          ``,
+          `**Totals credited**`,
+          `${prettyTotals}`,
+        ].join("\n")
+      )
       .setColor(Colors.Green);
 
     await interaction.editReply({ embeds: [embed] });
