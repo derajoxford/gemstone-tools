@@ -5,7 +5,7 @@ import {
   EmbedBuilder,
   Colors,
 } from "discord.js";
-import { prisma } from "../utils/db";
+import prisma from "../utils/db"; // ✅ default export
 import {
   queryAllianceBankrecs,
   BankrecFilter,
@@ -16,6 +16,8 @@ import {
   deltaFromBankrec,
   KEYS,
 } from "../utils/treasury";
+
+type ResKey = (typeof KEYS)[number];
 
 export const data = new SlashCommandBuilder()
   .setName("pnw_tax_apply")
@@ -41,7 +43,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     // Ensure a treasury row exists (works for scalar- or JSON-based schema)
     await ensureAllianceTreasury(prisma, "treasury", allianceId);
 
-    // NOTE: PnW API typically caps a single page (≈200). We’ll add pagination next step.
+    // NOTE: current fetch is single-shot; pagination comes next if needed
     const rows = await queryAllianceBankrecs(
       allianceId,
       Math.min(2000, Math.max(1, limit)),
@@ -54,16 +56,15 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     }
 
     let applied = 0;
-    const totals: Record<string, number> = {};
-    for (const k of KEYS) totals[k] = 0;
+    const totals = Object.fromEntries(KEYS.map(k => [k, 0])) as Record<ResKey, number>;
 
     for (const r of rows) {
-      // Convert the bankrec into a delta shape
-      const d = deltaFromBankrec(r);
+      const d = deltaFromBankrec(r); // Partial<Record<ResKey, number>>
 
       // Sum for reporting
       for (const k of KEYS) {
-        if (d[k as any]) totals[k] += Number(d[k as any] || 0);
+        const val = (d as any)[k];
+        if (val) totals[k] += Number(val) || 0;
       }
 
       // Credit to treasury
@@ -71,10 +72,10 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       applied++;
     }
 
-    const lines = KEYS
-      .filter(k => totals[k] && Number(totals[k]) !== 0)
-      .map(k => `**${k}**: ${Number(totals[k]).toLocaleString()}`)
-      .join(" · ") || "—";
+    const lines =
+      KEYS.filter(k => totals[k] && Number(totals[k]) !== 0)
+        .map(k => `**${k}**: ${Number(totals[k]).toLocaleString()}`)
+        .join(" · ") || "—";
 
     const embed = new EmbedBuilder()
       .setTitle(`✅ Applied ${applied} tax rows`)
