@@ -6,112 +6,93 @@ import {
   Colors,
 } from "discord.js";
 import prisma from "../utils/db";
-import { queryAllianceBankrecs, BankrecFilter } from "../lib/pnw_bank_ingest";
-import { fetchBankrecs } from "../lib/pnw";
+import {
+  queryAllianceBankrecs,
+  BankrecFilter,
+} from "../lib/pnw_bank_ingest";
 import { creditTreasury } from "../utils/treasury";
+import { fetchBankrecs } from "../lib/pnw";
 
+// -------------------- constants / helpers --------------------
 const RES_KEYS = [
-  "money", "food", "coal", "oil", "uranium", "lead", "iron",
-  "bauxite", "gasoline", "munitions", "steel", "aluminum",
+  "money","food","coal","oil","uranium","lead","iron",
+  "bauxite","gasoline","munitions","steel","aluminum",
 ] as const;
 type ResKey = typeof RES_KEYS[number];
+type ResTotals = Partial<Record<ResKey, number>>;
 type AnyRow = Record<string, any>;
-type Totals = Partial<Record<ResKey, number>>;
 
-function toCamel(k: string) { return k.replace(/_([a-z])/g, (_, c) => c.toUpperCase()); }
-function num(v: any): number { const n = Number(v); return Number.isFinite(n) ? n : 0; }
-function getAmount(row: AnyRow, k: ResKey): number { return num(row[k] ?? row[toCamel(k)] ?? 0); }
-function hasAnyResources(r: AnyRow): boolean { return RES_KEYS.some(k => getAmount(r, k) !== 0); }
-function looksLikeTax(r: AnyRow, allianceId: number): boolean {
-  const sType = Number(r.sender_type ?? r.senderType ?? 0);
-  const rType = Number(r.receiver_type ?? r.receiverType ?? 0);
-  const rId   = Number(r.receiver_id ?? r.receiverId ?? 0);
-  const note  = String(r.note ?? "").toLowerCase();
+const TAG = "[tax_apply]";
+
+// Convert snake_case to camelCase
+function toCamel(k: string) {
+  return k.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+}
+
+// Parse numbers robustly, including "$2,611,448.89" style strings
+function num(v: any): number {
+  if (v === null || v === undefined) return 0;
+  if (typeof v === "number") return Number.isFinite(v) ? v : 0;
+  if (typeof v === "string") {
+    const cleaned = v.replace(/[^0-9.+-]/g, ""); // strip $, commas, spaces, units
+    if (!cleaned) return 0;
+    const n = Number(cleaned);
+    return Number.isFinite(n) ? n : 0;
+  }
+  const n = Number(v as any);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function getAmount(row: AnyRow, k: ResKey): number {
+  return num(row[k] ?? row[toCamel(k)] ?? 0);
+}
+
+function hasAnyResources(row: AnyRow): boolean {
+  return RES_KEYS.some(k => getAmount(row, k) !== 0);
+}
+
+// Try to detect a PnW “tax” row (nation -> alliance, or note mentions tax)
+function looksLikeTax(row: AnyRow, allianceId: number): boolean {
+  const sType = Number(row.sender_type ?? row.senderType ?? 0);
+  const rType = Number(row.receiver_type ?? row.receiverType ?? 0);
+  const rId   = Number(row.receiver_id ?? row.receiverId ?? 0);
+  const note  = String(row.note ?? "").toLowerCase();
+  // nation(3) -> alliance(2) and receiver matches alliance, or note contains "tax"
   return rType === 2 && rId === allianceId && (sType === 3 || note.includes("tax"));
 }
 
-// ---- interaction safety helpers ----
+function normalizeRow(raw: AnyRow): AnyRow {
+  // Map a minimal set of stable fields and leave resource columns in place (snake/camel tolerated)
+  const out: AnyRow = { ...raw };
+  // Standardize some id fields if available
+  if (out.bankrec_id && !out.id) out.id = out.bankrec_id;
+  // Stabilize date/time fields if present
+  if (!out.date && out.time) out.date = out.time;
+  return out;
+}
+
+// ---- safe reply helpers (avoid crashing client on “Unknown interaction” or double ack) ----
 async function safeDefer(i: ChatInputCommandInteraction, ephemeral = true) {
   try {
-    if (!i.deferred && !i.replied) {
-      await i.deferReply({ ephemeral });
-    }
-  } catch (e: any) {
-    if (e?.code === 10062 || e?.code === 40060) return false; // already acked / unknown
-    throw e;
-  }
-  return true;
-}
-async function safeEdit(i: ChatInputCommandInteraction, payload: any) {
-  try {
-    if (i.deferred) return await i.editReply(payload);
-    if (!i.replied)  return await i.reply({ ...payload, ephemeral: true });
-    return await i.followUp({ ...payload, ephemeral: true });
-  } catch (e: any) {
-    if (e?.code === 10062 || e?.code === 40060) {
-      try { return await i.followUp({ ...payload, ephemeral: true }); } catch {}
-      return;
-    }
-    throw e;
-  }
-}
-
-/**
- * Normalize any plausible legacy response shape to an array of bankrec rows.
- */
-function normalizeLegacyResult(res: any, allianceId: number): AnyRow[] {
-  if (!res) return [];
-
-  // Case A: direct array of bankrec rows
-  if (Array.isArray(res)) {
-    // If elements look like bankrec rows (have sender/receiver), take them
-    if (res.length && (res[0]?.sender_type !== undefined || res[0]?.senderType !== undefined)) {
-      return res;
-    }
-    // If elements are packs: [{ id, bankrecs:[...] }, ...]
-    const pack = res.find((x: any) => Number(x?.id ?? x?.alliance_id) === allianceId);
-    if (pack?.bankrecs && Array.isArray(pack.bankrecs)) return pack.bankrecs;
-    return [];
-  }
-
-  // Case B: object with .bankrecs
-  if (Array.isArray(res.bankrecs)) return res.bankrecs;
-
-  // Case C: object with .rows
-  if (Array.isArray(res.rows)) return res.rows;
-
-  return [];
-}
-
-/**
- * Try legacy fetchBankrecs with several known/observed signatures.
- * Returns an array of raw bankrec rows (with possible amounts) or [].
- */
-async function tryLegacyFetch(allianceId: number, limit: number, apiKey: string): Promise<AnyRow[]> {
-  const attempts: Array<[string, () => Promise<any>]> = [
-    ["fn(optsObj,arrayIds)",   () => (fetchBankrecs as any)({ apiKey }, [allianceId])],
-    ["fn(limit,arrayIds)",      () => (fetchBankrecs as any)(limit, [allianceId])],
-    ["fn(arrayIds,optsObj)",    () => (fetchBankrecs as any)([allianceId], { apiKey, limit })],
-    ["fn(opts union)",          () => (fetchBankrecs as any)({ apiKey, limit, allianceIds: [allianceId] })],
-    ["fn(allianceIdOnly?)",     () => (fetchBankrecs as any)(allianceId)],
-  ];
-
-  for (let idx = 0; idx < attempts.length; idx++) {
-    const [label, call] = attempts[idx];
+    // Discord.js v14 deprecates { ephemeral } at deferReply; flags=64 is the equivalent
+    // We’ll still try ephemeral: true first, then fallback to flags if needed.
     try {
-      const res = await call();
-      const rows = normalizeLegacyResult(res, allianceId).slice(0, limit);
-      const withAmounts = rows.filter(hasAnyResources).length;
-      console.log(`[tax_apply][legacy attempt ${idx + 1} ${label}] rows=${rows.length} withAmounts=${withAmounts}`);
-      if (rows.length) return rows;
-    } catch (e) {
-      console.log(`[tax_apply][legacy attempt ${idx + 1} ${label}] error`, e);
+      await i.deferReply({ ephemeral });
+    } catch {
+      await i.deferReply({ flags: 64 as any }).catch(() => {});
     }
-  }
-  return [];
+  } catch { /* ignore */ }
 }
 
-// ---------------- slash metadata ----------------
+async function safeEdit(i: ChatInputCommandInteraction, data: any) {
+  try {
+    await i.editReply(data);
+  } catch {
+    try { await i.followUp({ ...data, ephemeral: true }); } catch { /* ignore */ }
+  }
+}
+
+// -------------------- slash command metadata --------------------
 export const data = new SlashCommandBuilder()
   .setName("pnw_tax_apply")
   .setDescription("Credit recent tax rows into the alliance treasury")
@@ -119,63 +100,100 @@ export const data = new SlashCommandBuilder()
     o.setName("alliance_id").setDescription("PnW alliance ID").setRequired(true)
   )
   .addIntegerOption(o =>
-    o.setName("limit")
-     .setDescription("Max rows to scan (default 200, up to 2000)")
-     .setMinValue(1)
-     .setMaxValue(2000)
+    o
+      .setName("limit")
+      .setDescription("Max rows to scan (default 200)")
+      .setMinValue(1)
+      .setMaxValue(2000)
   );
 
-// ---------------- main ----------------
+// -------------------- main execution --------------------
 export async function execute(interaction: ChatInputCommandInteraction) {
   const allianceId = interaction.options.getInteger("alliance_id", true);
   const limitOpt = interaction.options.getInteger("limit");
   const limit = Math.max(1, Math.min(limitOpt ?? 200, 2000));
 
+  console.log(`${TAG} GQL fetch TAX rows for alliance=${allianceId} limit=${limit}`);
   await safeDefer(interaction, true);
 
   try {
-    // 1) GQL first
-    console.log(`[tax_apply] GQL fetch TAX rows for alliance=${allianceId} limit=${limit}`);
-    let rows: AnyRow[] = await queryAllianceBankrecs(allianceId, limit, BankrecFilter.TAX)
-      .catch((e: any) => { console.error("[tax_apply] GQL error:", e); return []; });
+    // 1) Primary source: GraphQL
+    let rows: AnyRow[] = await queryAllianceBankrecs(allianceId, limit, BankrecFilter.TAX);
+    rows = Array.isArray(rows) ? rows.map(normalizeRow) : [];
+    console.log(`${TAG} GQL returned ${rows.length} rows`);
 
-    console.log(`[tax_apply] GQL returned ${rows.length} rows`);
-    const gqlHasAmounts = rows.some(hasAnyResources);
+    const gqlHasAmounts = rows.some(r => hasAnyResources(r));
+    const needLegacy = !gqlHasAmounts;
 
-    // 2) Fallback to legacy when GQL rows lack amounts
-    if (!gqlHasAmounts) {
+    console.log(`${TAG} GQL had no amounts; fallback=${needLegacy}`);
+    if (needLegacy) {
       const apiKey = process.env.PNW_DEFAULT_API_KEY || "";
-      console.log(`[tax_apply] GQL had no amounts; fallback=${!!apiKey}`);
       if (apiKey) {
-        const legacyRows = await tryLegacyFetch(allianceId, limit, apiKey);
-        if (legacyRows.length) rows = legacyRows;
-        console.log(`[tax_apply] legacy chosen rows: ${rows.length}`);
+        // Try multiple signatures because the legacy helper has varied in the codebase.
+        let legacyRows: AnyRow[] = [];
+        const attempts: Array<{ label: string; call: () => Promise<any> }> = [
+          {
+            label: "fn(optsObj,arrayIds)",
+            call: () => (fetchBankrecs as any)({ apiKey }, [allianceId]),
+          },
+          {
+            label: "fn(limit,arrayIds)",
+            call: () => (fetchBankrecs as any)(limit, [allianceId]),
+          },
+          {
+            label: "fn(arrayIds,optsObj)",
+            call: () => (fetchBankrecs as any)([allianceId], { apiKey }),
+          },
+        ];
+
+        for (const a of attempts) {
+          try {
+            const legacy: any = await a.call().catch(() => null);
+            // Expect an array of alliances; pick the one matching our allianceId then take .bankrecs
+            const arr = Array.isArray(legacy) ? legacy : [];
+            const chosen = arr.find((x: any) => Number(x?.id ?? x?.alliance_id) === allianceId);
+            const br = (chosen?.bankrecs ?? []) as any[];
+            legacyRows = Array.isArray(br) ? br.map(normalizeRow) : [];
+            const withAmts = legacyRows.filter(hasAnyResources).length;
+            console.log(`${TAG}[legacy attempt ${attempts.indexOf(a)+1} ${a.label}] rows=${legacyRows.length} withAmounts=${withAmts}`);
+            if (legacyRows.length > 0) break;
+          } catch (e) {
+            console.log(`${TAG} legacy attempt failed:`, e);
+          }
+        }
+
+        if (legacyRows.length > 0) {
+          // Use only up to `limit`
+          rows = legacyRows.slice(0, limit);
+          console.log(`${TAG} legacy chosen rows: ${rows.length}`);
+        } else {
+          console.log(`${TAG} legacy returned 0 rows`);
+        }
       }
     }
 
-    // 3) Filter to tax-like rows for this alliance
+    // 2) Filter to tax-like rows for this alliance
     const taxRows = rows.filter(r => looksLikeTax(r, allianceId));
-    console.log(`[tax_apply] tax-like rows: ${taxRows.length}`);
+    console.log(`${TAG} tax-like rows: ${taxRows.length}`);
 
-    // If still nothing with amounts, bail
-    const anyAmounts = taxRows.some(hasAnyResources);
+    // 3) Require that at least some rows have amounts > 0
+    const anyAmounts = taxRows.some(r => hasAnyResources(r));
     if (!taxRows.length || !anyAmounts) {
       await safeEdit(interaction, { content: `No tax-like bank records with amounts found for alliance ${allianceId}.` });
       return;
     }
 
-    // 4) Deduplicate
-    const seen = new Set<string|number>();
+    // 4) Deduplicate by bankrec id (in case of mixed sources)
+    const seen = new Set<number | string>();
     const uniq = taxRows.filter(r => {
       const id = r.id ?? r.bankrec_id ?? `${r.sender_id}:${r.receiver_id}:${r.date ?? r.time ?? ""}`;
       if (seen.has(id)) return false;
       seen.add(id);
       return true;
     });
-    console.log(`[tax_apply] unique rows after dedupe: ${uniq.length}`);
 
-    // 5) Sum amounts
-    const totals: Totals = {};
+    // 5) Sum resource columns
+    const totals: ResTotals = {};
     for (const k of RES_KEYS) totals[k] = 0;
     for (const r of uniq) {
       for (const k of RES_KEYS) {
@@ -183,25 +201,29 @@ export async function execute(interaction: ChatInputCommandInteraction) {
         if (v) totals[k]! = (totals[k] || 0) + v;
       }
     }
-    const nonZero = RES_KEYS.filter(k => (totals[k] || 0) !== 0);
-    console.log(`[tax_apply] non-zero keys: ${nonZero.join(", ") || "(none)"}`);
 
-    // 6) Credit treasury
-    await creditTreasury(prisma, allianceId, totals as Record<ResKey, number>, "tax");
-    console.log(`[tax_apply] credited treasury for alliance=${allianceId}`);
+    const nonZeroKeys = RES_KEYS.filter(k => (totals[k] || 0) !== 0);
+    console.log(`${TAG} non-zero keys: ${nonZeroKeys.join(", ") || "(none)"}`);
 
-    // 7) Reply
-    const lines = nonZero.map(k => `**${k}**: ${Number(totals[k]).toLocaleString()}`);
+    // 6) Credit the alliance treasury
+    await creditTreasury(prisma, allianceId, totals, "tax");
+    console.log(`${TAG} credited treasury for alliance=${allianceId}`);
+
+    // 7) Reply with a summary
+    const lines = RES_KEYS
+      .map(k => ({ k, v: Number(totals[k] || 0) }))
+      .filter(x => x.v !== 0)
+      .map(x => `**${x.k}**: ${x.v.toLocaleString()}`);
+
     const embed = new EmbedBuilder()
       .setTitle(`✅ Applied ${uniq.length} tax rows`)
       .setDescription(lines.length ? lines.join(" · ") : "—")
-      .setFooter({ text: `Alliance ${allianceId}` })
-      .setColor(Colors.Green);
+      .setColor(Colors.Green)
+      .setFooter({ text: `Alliance ${allianceId}` });
 
     await safeEdit(interaction, { embeds: [embed] });
 
   } catch (err: any) {
-    console.error("[tax_apply] unexpected error:", err);
     await safeEdit(interaction, { content: `❌ Error: ${err?.message ?? String(err)}` });
   }
 }
