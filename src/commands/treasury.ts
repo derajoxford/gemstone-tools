@@ -6,14 +6,7 @@ import {
   Colors,
 } from "discord.js";
 import prisma from "../utils/db";
-import { KEYS } from "../utils/treasury";
-
-function detectModel(p: any): "treasury" | "allianceTreasury" | "alliance_treasury" {
-  if (p?.treasury) return "treasury";
-  if (p?.allianceTreasury) return "allianceTreasury";
-  if (p?.alliance_treasury) return "alliance_treasury";
-  throw new Error("Prisma model treasury not found");
-}
+import { getTreasury, RES_KEYS, type ResKey } from "../utils/treasury";
 
 export const data = new SlashCommandBuilder()
   .setName("treasury")
@@ -22,37 +15,29 @@ export const data = new SlashCommandBuilder()
     o.setName("alliance_id").setDescription("PnW alliance ID").setRequired(true)
   );
 
-export async function execute(interaction: ChatInputCommandInteraction) {
-  const allianceId = interaction.options.getInteger("alliance_id", true);
-  await interaction.deferReply({ ephemeral: true });
-
+export async function execute(i: ChatInputCommandInteraction) {
   try {
-    const model = detectModel(prisma as any);
-    let row: any = null;
+    const allianceId = i.options.getInteger("alliance_id", true);
+    await i.deferReply({ ephemeral: true });
 
-    if (model === "treasury") {
-      row = await (prisma as any).treasury.findUnique({ where: { allianceId } }).catch(() => null);
-    } else if (model === "allianceTreasury") {
-      row = await (prisma as any).allianceTreasury.findUnique({ where: { allianceId } }).catch(() => null);
-    } else {
-      row = await (prisma as any).alliance_treasury.findUnique({ where: { allianceId } }).catch(() => null);
-    }
+    const balances = await getTreasury(prisma, allianceId);
 
-    const balances: Record<string, number> =
-      (row?.balances as any) || Object.fromEntries(KEYS.map(k => [k, 0]));
-
-    const lines =
-      KEYS.filter(k => Number(balances[k] || 0) !== 0)
-          .map(k => `**${k}**: ${Number(balances[k] || 0).toLocaleString()}`)
-          .join(" · ") || "—";
+    const lines = RES_KEYS
+      .filter((k: ResKey) => Number(balances[k] || 0) !== 0)
+      .map((k: ResKey) => `**${k}**: ${Number(balances[k] || 0).toLocaleString()}`);
 
     const embed = new EmbedBuilder()
-      .setTitle(`💰 Treasury — Alliance ${allianceId}`)
-      .setDescription(lines)
+      .setTitle(`🏦 Alliance Treasury — ${allianceId}`)
+      .setDescription(lines.length ? lines.join("\n") : "_Empty_")
       .setColor(Colors.Blurple);
 
-    await interaction.editReply({ embeds: [embed] });
+    await i.editReply({ embeds: [embed] });
   } catch (err: any) {
-    await interaction.editReply(`❌ Error: ${err?.message ?? String(err)}`);
+    try {
+      await (i.deferred || i.replied
+        ? i.editReply(`❌ Error: ${err?.message ?? String(err)}`)
+        : i.reply({ content: `❌ Error: ${err?.message ?? String(err)}`, ephemeral: true })
+      );
+    } catch {}
   }
 }
