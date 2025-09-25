@@ -5,8 +5,12 @@ export const RES_KEYS = [
   "money","food","coal","oil","uranium","lead","iron",
   "bauxite","gasoline","munitions","steel","aluminum",
 ] as const;
+
 export type ResKey = typeof RES_KEYS[number];
 export type ResTotals = Partial<Record<ResKey, number>>;
+
+// Back-compat for older code that imported KEYS
+export const KEYS = RES_KEYS;
 
 function toNumber(v: any): number {
   const n = Number(v);
@@ -20,16 +24,27 @@ function normalizeBalances(bal: any): Record<ResKey, number> {
 }
 
 /**
- * Upserts a Treasury row for the alliance and adds (credits) resource deltas
- * into the JSON `balances` field. Returns the updated balances.
- *
- * Schema expectation:
- *   model Treasury {
- *     allianceId  Int   @unique
- *     balances    Json
- *     createdAt   DateTime @default(now())
- *     updatedAt   DateTime @updatedAt
- *   }
+ * Read treasury balances (JSON) for an alliance. Creates the row if missing.
+ * Expects Prisma model: allianceTreasury { allianceId Int @unique, balances Json, ... }
+ */
+export async function getTreasury(
+  prisma: PrismaClient,
+  allianceId: number
+): Promise<Record<ResKey, number>> {
+  // Ensure row exists
+  await prisma.allianceTreasury.upsert({
+    where: { allianceId },
+    update: {},
+    create: { allianceId, balances: {} },
+  });
+
+  const row = await prisma.allianceTreasury.findUnique({ where: { allianceId } });
+  return normalizeBalances(row?.balances ?? {});
+}
+
+/**
+ * Credit (add) resource amounts into the treasury JSON balances.
+ * Returns the updated balances.
  */
 export async function creditTreasury(
   prisma: PrismaClient,
@@ -37,28 +52,25 @@ export async function creditTreasury(
   delta: ResTotals,
   _reason?: string
 ): Promise<Record<ResKey, number>> {
-  // Ensure a row exists first (create empty if missing)
-  await prisma.treasury.upsert({
+  // Ensure row exists first
+  await prisma.allianceTreasury.upsert({
     where: { allianceId },
     update: {},
     create: { allianceId, balances: {} },
   });
 
-  // Read current balances
-  const currentRow = await prisma.treasury.findUnique({ where: { allianceId } });
-  const current = normalizeBalances(currentRow?.balances ?? {});
+  const row = await prisma.allianceTreasury.findUnique({ where: { allianceId } });
+  const balances = normalizeBalances(row?.balances ?? {});
 
-  // Apply delta
   for (const k of RES_KEYS) {
     const add = toNumber((delta as any)[k] ?? 0);
-    if (add) current[k] = toNumber(current[k]) + add;
+    if (add) balances[k] = toNumber(balances[k]) + add;
   }
 
-  // Write back
-  await prisma.treasury.update({
+  await prisma.allianceTreasury.update({
     where: { allianceId },
-    data: { balances: current },
+    data: { balances },
   });
 
-  return current;
+  return balances;
 }
