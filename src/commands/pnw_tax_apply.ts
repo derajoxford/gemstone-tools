@@ -14,6 +14,36 @@ import { fetchBankrecs } from "../lib/pnw";
 import { creditTreasury } from "../utils/treasury";
 import { open } from "../lib/crypto.js";
 
+// ---- interaction safety helpers ----
+async function safeDefer(i: ChatInputCommandInteraction, ephemeral = true) {
+  try {
+    if (!i.deferred && !i.replied) {
+      await i.deferReply({ ephemeral }); // flags:64 under the hood
+    }
+  } catch (e: any) {
+    // Ignore "Unknown interaction" (10062) or "already acknowledged" (40060)
+    if (e?.code === 10062 || e?.code === 40060) return false;
+    throw e;
+  }
+  return true;
+}
+
+async function safeEdit(i: ChatInputCommandInteraction, payload: any) {
+  try {
+    if (i.deferred) return await i.editReply(payload);
+    if (!i.replied) return await i.reply({ ...payload, ephemeral: true });
+    return await i.followUp({ ...payload, ephemeral: true });
+  } catch (e: any) {
+    if (e?.code === 10062 || e?.code === 40060) {
+      // Try a last followUp as a fallback
+      try { return await i.followUp({ ...payload, ephemeral: true }); } catch {}
+      return;
+    }
+    throw e;
+  }
+}
+
+
 type AnyRow = Record<string, any>;
 
 const RES_KEYS = [
