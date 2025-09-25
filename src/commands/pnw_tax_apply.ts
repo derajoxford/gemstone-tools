@@ -10,7 +10,6 @@ import { queryAllianceBankrecs, BankrecFilter } from "../lib/pnw_bank_ingest";
 import { fetchBankrecs } from "../lib/pnw";
 import { creditTreasury } from "../utils/treasury";
 
-// ---------------- constants / helpers ----------------
 const RES_KEYS = [
   "money", "food", "coal", "oil", "uranium", "lead", "iron",
   "bauxite", "gasoline", "munitions", "steel", "aluminum",
@@ -28,7 +27,6 @@ function looksLikeTax(r: AnyRow, allianceId: number): boolean {
   const rType = Number(r.receiver_type ?? r.receiverType ?? 0);
   const rId   = Number(r.receiver_id ?? r.receiverId ?? 0);
   const note  = String(r.note ?? "").toLowerCase();
-  // Nation (3) -> Alliance (2), receiver is this alliance; note often contains "tax"
   return rType === 2 && rId === allianceId && (sType === 3 || note.includes("tax"));
 }
 
@@ -39,7 +37,7 @@ async function safeDefer(i: ChatInputCommandInteraction, ephemeral = true) {
       await i.deferReply({ ephemeral });
     }
   } catch (e: any) {
-    if (e?.code === 10062 || e?.code === 40060) return false; // Unknown/already acked
+    if (e?.code === 10062 || e?.code === 40060) return false; // already acked / unknown
     throw e;
   }
   return true;
@@ -56,6 +54,61 @@ async function safeEdit(i: ChatInputCommandInteraction, payload: any) {
     }
     throw e;
   }
+}
+
+/**
+ * Normalize any plausible legacy response shape to an array of bankrec rows.
+ */
+function normalizeLegacyResult(res: any, allianceId: number): AnyRow[] {
+  if (!res) return [];
+
+  // Case A: direct array of bankrec rows
+  if (Array.isArray(res)) {
+    // If elements look like bankrec rows (have sender/receiver), take them
+    if (res.length && (res[0]?.sender_type !== undefined || res[0]?.senderType !== undefined)) {
+      return res;
+    }
+    // If elements are packs: [{ id, bankrecs:[...] }, ...]
+    const pack = res.find((x: any) => Number(x?.id ?? x?.alliance_id) === allianceId);
+    if (pack?.bankrecs && Array.isArray(pack.bankrecs)) return pack.bankrecs;
+    return [];
+  }
+
+  // Case B: object with .bankrecs
+  if (Array.isArray(res.bankrecs)) return res.bankrecs;
+
+  // Case C: object with .rows
+  if (Array.isArray(res.rows)) return res.rows;
+
+  return [];
+}
+
+/**
+ * Try legacy fetchBankrecs with several known/observed signatures.
+ * Returns an array of raw bankrec rows (with possible amounts) or [].
+ */
+async function tryLegacyFetch(allianceId: number, limit: number, apiKey: string): Promise<AnyRow[]> {
+  const attempts: Array<[string, () => Promise<any>]> = [
+    ["fn(optsObj,arrayIds)",   () => (fetchBankrecs as any)({ apiKey }, [allianceId])],
+    ["fn(limit,arrayIds)",      () => (fetchBankrecs as any)(limit, [allianceId])],
+    ["fn(arrayIds,optsObj)",    () => (fetchBankrecs as any)([allianceId], { apiKey, limit })],
+    ["fn(opts union)",          () => (fetchBankrecs as any)({ apiKey, limit, allianceIds: [allianceId] })],
+    ["fn(allianceIdOnly?)",     () => (fetchBankrecs as any)(allianceId)],
+  ];
+
+  for (let idx = 0; idx < attempts.length; idx++) {
+    const [label, call] = attempts[idx];
+    try {
+      const res = await call();
+      const rows = normalizeLegacyResult(res, allianceId).slice(0, limit);
+      const withAmounts = rows.filter(hasAnyResources).length;
+      console.log(`[tax_apply][legacy attempt ${idx + 1} ${label}] rows=${rows.length} withAmounts=${withAmounts}`);
+      if (rows.length) return rows;
+    } catch (e) {
+      console.log(`[tax_apply][legacy attempt ${idx + 1} ${label}] error`, e);
+    }
+  }
+  return [];
 }
 
 // ---------------- slash metadata ----------------
@@ -76,7 +129,7 @@ export const data = new SlashCommandBuilder()
 export async function execute(interaction: ChatInputCommandInteraction) {
   const allianceId = interaction.options.getInteger("alliance_id", true);
   const limitOpt = interaction.options.getInteger("limit");
-  const limit = Math.max(1, Math.min(limitOpt ?? 200, 2000)); // sane cap; GQL may return fewer
+  const limit = Math.max(1, Math.min(limitOpt ?? 200, 2000));
 
   await safeDefer(interaction, true);
 
@@ -94,17 +147,9 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       const apiKey = process.env.PNW_DEFAULT_API_KEY || "";
       console.log(`[tax_apply] GQL had no amounts; fallback=${!!apiKey}`);
       if (apiKey) {
-        try {
-          // fetchBankrecs({ apiKey }, [id]) -> [{ id, bankrecs: [...] }, ...]
-          const legacy: any = await (fetchBankrecs as any)({ apiKey }, [allianceId]);
-          const legacyRows: any[] = Array.isArray(legacy)
-            ? (legacy.find((x: any) => Number(x?.id ?? x?.alliance_id) === allianceId)?.bankrecs ?? [])
-            : [];
-          console.log(`[tax_apply] legacy returned ${legacyRows.length} rows`);
-          if (legacyRows.length) rows = legacyRows.slice(0, limit);
-        } catch (e) {
-          console.error("[tax_apply] legacy fetch error:", e);
-        }
+        const legacyRows = await tryLegacyFetch(allianceId, limit, apiKey);
+        if (legacyRows.length) rows = legacyRows;
+        console.log(`[tax_apply] legacy chosen rows: ${rows.length}`);
       }
     }
 
