@@ -10,7 +10,7 @@ import {
   queryAllianceBankrecs,
   BankrecFilter,
 } from "../lib/pnw_bank_ingest";
-import creditTreasury from "../utils/treasury";
+import { creditTreasury } from "../utils/treasury";
 import { fetchBankrecs } from "../lib/pnw";
 
 // --- constants / helpers ---
@@ -28,7 +28,7 @@ function num(v: any): number {
   return Number.isFinite(n) ? n : 0;
 }
 function getAmount(row: AnyRow, k: ResKey): number {
-  // support both snake_case and camelCase just in case
+  // support both snake_case and camelCase
   return num(row[k] ?? row[toCamel(k)] ?? 0);
 }
 function toCamel(k: string) {
@@ -66,7 +66,7 @@ export const data = new SlashCommandBuilder()
 export async function execute(interaction: ChatInputCommandInteraction) {
   const allianceId = interaction.options.getInteger("alliance_id", true);
   const limitOpt = interaction.options.getInteger("limit");
-  // default to 200, allow up to 2000. (GQL may still page; we’ll request the max it allows)
+  // default to 200, allow up to 2000 (GQL may still page; we request max it allows)
   const limit = Math.max(1, Math.min(limitOpt ?? 200, 2000));
 
   await interaction.deferReply({ ephemeral: true });
