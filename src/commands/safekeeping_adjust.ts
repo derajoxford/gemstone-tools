@@ -137,17 +137,20 @@ export async function execute(i: ChatInputCommandInteraction) {
     const prettyChange = `${delta >= 0 ? "➕" : "➖"} ${fmtAmount(Math.abs(delta))} ${meta.emoji}`;
     const prettyBalance = `${fmtAmount(newValue)} ${meta.emoji}`;
 
+    // Build fields safely (no undefined entries)
+    const fields: { name: string; value: string; inline?: boolean }[] = [
+      { name: "Change", value: prettyChange, inline: true },
+      { name: "New Balance", value: prettyBalance, inline: true },
+      { name: "By", value: `<@${i.user.id}>`, inline: true },
+    ];
+    if (reason) fields.push({ name: "Reason", value: reason, inline: false });
+
     const embed = new EmbedBuilder()
       .setColor(color)
       .setAuthor({ name: "Safekeeping Adjusted", iconURL: guildIcon })
       .setTitle(resourceLabel(resource))
       .setDescription(`For <@${member.discordId}>`)
-      .addFields(
-        { name: "Change", value: prettyChange, inline: true },
-        { name: "New Balance", value: prettyBalance, inline: true },
-        { name: "By", value: `<@${i.user.id}>`, inline: true },
-        reason ? { name: "Reason", value: reason, inline: false } : (undefined as any)
-      )
+      .addFields(fields)
       .setTimestamp();
 
     await i.editReply({ embeds: [embed] });
@@ -158,16 +161,18 @@ export async function execute(i: ChatInputCommandInteraction) {
       if (chId) {
         const ch = guild.channels.cache.get(chId) as TextChannel | undefined;
         if (ch?.isTextBased()) {
+          const logFields: { name: string; value: string; inline?: boolean }[] = [
+            { name: "Change", value: prettyChange, inline: true },
+            { name: "New Balance", value: prettyBalance, inline: true },
+          ];
+          if (reason) logFields.push({ name: "Reason", value: reason, inline: false });
+
           const log = new EmbedBuilder()
             .setColor(color)
             .setAuthor({ name: "Manual Safekeeping Adjustment", iconURL: guildIcon })
             .setTitle(resourceLabel(resource))
             .setDescription(`<@${i.user.id}> ${delta >= 0 ? "added" : "subtracted"} **${fmtAmount(Math.abs(delta))} ${meta.emoji}** for <@${member.discordId}>`)
-            .addFields(
-              { name: "Change", value: prettyChange, inline: true },
-              { name: "New Balance", value: prettyBalance, inline: true },
-              reason ? { name: "Reason", value: reason, inline: false } : (undefined as any)
-            )
+            .addFields(logFields)
             .setTimestamp();
           await ch.send({ embeds: [log] }).catch(() => {});
         }
