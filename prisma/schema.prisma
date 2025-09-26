@@ -184,6 +184,7 @@ model AllianceTaxCursor {
   @@id([allianceId])
   @@map("alliance_tax_cursors")
 }
+
 // --- Safekeeping transaction audit trail ---
 enum SafeTxnType {
   MANUAL_ADJUST
@@ -207,4 +208,3 @@ model SafeTxn {
 
   @@index([memberId, createdAt])
 }
-
