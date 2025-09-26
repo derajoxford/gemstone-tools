@@ -5,6 +5,7 @@ import type { RESTPostAPIChatInputApplicationCommandsJSONBody } from "discord.js
 import * as pnw_bankpeek from "./pnw_bankpeek";
 import * as pnw_tax_apply from "./pnw_tax_apply";
 import * as treasury from "./treasury";
+import * as safekeeping_adjust from "./safekeeping_adjust"; // NEW
 
 export type CommandModule = {
   data?: { name?: string; toJSON?: () => any };
@@ -16,6 +17,7 @@ export const commandModules: CommandModule[] = [
   pnw_bankpeek,
   pnw_tax_apply,
   treasury,
+  safekeeping_adjust,
 ].filter((m) => m?.data && m?.execute);
 
 // JSON payloads for registration (consumed by src/index.ts)
