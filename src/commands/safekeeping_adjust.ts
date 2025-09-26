@@ -15,12 +15,12 @@ function hasBankerRoleOrAdmin(member: GuildMember | null): boolean {
   return member.roles.cache.some((r) => r.name.toLowerCase() === "banker");
 }
 
-async function resolveAllianceAndMember(opts: { discordUserId?: string | null; nationId?: number | null; }) {
-  const { discordUserId, nationId } = opts;
+async function resolveAllianceAndMember(opts: { discordId?: string | null; nationId?: number | null; }) {
+  const { discordId, nationId } = opts;
   const memberRecord = await prisma.member.findFirst({
     where: {
       OR: [
-        discordUserId ? { discordUserId } : undefined,
+        discordId ? { discordId } : undefined,
         nationId ? { nationId } : undefined,
       ].filter(Boolean) as any,
     },
@@ -72,7 +72,7 @@ export const data = new SlashCommandBuilder()
   .setDescription("Bankers: add or subtract resources in a member's safekeeping.")
   .addSubcommand(sub =>
     sub.setName("add").setDescription("Add resources")
-      // REQUIRED FIRST (Discord requirement)
+      // REQUIRED FIRST
       .addStringOption(o =>
         o.setName("resource").setDescription("Resource").setRequired(true)
          .addChoices(...RESOURCE_KEYS.map(k => ({ name: k, value: k })))
@@ -87,7 +87,7 @@ export const data = new SlashCommandBuilder()
   )
   .addSubcommand(sub =>
     sub.setName("subtract").setDescription("Subtract resources")
-      // REQUIRED FIRST (Discord requirement)
+      // REQUIRED FIRST
       .addStringOption(o =>
         o.setName("resource").setDescription("Resource").setRequired(true)
          .addChoices(...RESOURCE_KEYS.map(k => ({ name: k, value: k })))
@@ -125,7 +125,7 @@ export async function execute(i: ChatInputCommandInteraction) {
   const delta = sub === "subtract" ? -Math.abs(raw) : Math.abs(raw);
 
   const { allianceId, member } = await resolveAllianceAndMember({
-    discordUserId: targetUser?.id ?? null,
+    discordId: targetUser?.id ?? null,
     nationId: nationId ?? null,
   });
   if (!member || !allianceId) {
@@ -145,7 +145,7 @@ export async function execute(i: ChatInputCommandInteraction) {
 
   const embed = new EmbedBuilder()
     .setTitle("Safekeeping Adjusted")
-    .setDescription(`${delta >= 0 ? "Added" : "Subtracted"} **${Math.abs(delta)} ${resource}** for <@${member.discordUserId}>`)
+    .setDescription(`${delta >= 0 ? "Added" : "Subtracted"} **${Math.abs(delta)} ${resource}** for <@${member.discordId}>`)
     .addFields(
       { name: "Alliance ID", value: String(allianceId), inline: true },
       { name: "Member ID", value: String(member.id), inline: true },
@@ -165,7 +165,7 @@ export async function execute(i: ChatInputCommandInteraction) {
       if (ch?.isTextBased()) {
         const log = new EmbedBuilder()
           .setTitle("Manual Safekeeping Adjustment")
-          .setDescription(`<@${i.user.id}> ${delta >= 0 ? "added" : "subtracted"} **${Math.abs(delta)} ${resource}** for <@${member.discordUserId}>`)
+          .setDescription(`<@${i.user.id}> ${delta >= 0 ? "added" : "subtracted"} **${Math.abs(delta)} ${resource}** for <@${member.discordId}>`)
           .addFields(
             { name: "Alliance ID", value: String(allianceId), inline: true },
             { name: "Member ID", value: String(member.id), inline: true },
