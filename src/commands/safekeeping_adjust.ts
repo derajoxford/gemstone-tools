@@ -1,4 +1,11 @@
-import { SlashCommandBuilder, ChatInputCommandInteraction, PermissionFlagsBits, EmbedBuilder, GuildMember, TextChannel } from "discord.js";
+import {
+  SlashCommandBuilder,
+  ChatInputCommandInteraction,
+  PermissionFlagsBits,
+  EmbedBuilder,
+  GuildMember,
+  TextChannel,
+} from "discord.js";
 import { PrismaClient } from "@prisma/client";
 import { getGuildSetting } from "../utils/settings.js";
 
@@ -15,168 +22,198 @@ function hasBankerRoleOrAdmin(member: GuildMember | null): boolean {
   return member.roles.cache.some((r) => r.name.toLowerCase() === "banker");
 }
 
-async function resolveAllianceAndMember(opts: { discordId?: string | null; nationId?: number | null; }) {
-  const { discordId, nationId } = opts;
-  const memberRecord = await prisma.member.findFirst({
-    where: {
-      OR: [
-        discordId ? { discordId } : undefined,
-        nationId ? { nationId } : undefined,
-      ].filter(Boolean) as any,
-    },
-    orderBy: { id: "desc" },
-  });
-  if (!memberRecord) return { allianceId: null as number | null, member: null as any };
-  return { allianceId: memberRecord.allianceId as number, member: memberRecord };
+// Safer resolvers (avoid empty OR and invalid fields)
+async function findMemberByDiscordId(discordId: string | null) {
+  if (!discordId) return null;
+  return prisma.member.findFirst({ where: { discordId }, orderBy: { id: "desc" } });
 }
-
-async function applyManualAdjust(opts: {
-  allianceId: number;
-  memberId: number;
-  resource: ResourceKey;
-  delta: number;
-  actorDiscordId: string;
-  reason?: string | null;
-}) {
-  const { allianceId, memberId, resource, delta, actorDiscordId, reason } = opts;
-
-  const [safe] = await prisma.$transaction(async (tx) => {
-    const safe = await tx.safekeeping.upsert({
-      where: { memberId_allianceId: { memberId, allianceId } },
-      update: { [resource]: { increment: delta } as any },
-      create: {
-        allianceId, memberId,
-        money: 0, food: 0, coal: 0, oil: 0, uranium: 0, lead: 0, iron: 0, bauxite: 0,
-        gasoline: 0, munitions: 0, steel: 0, aluminum: 0,
-        [resource]: delta,
-      } as any,
-    });
-
-    await tx.safeTxn.create({
-      data: {
-        allianceId, memberId, resource, amount: delta,
-        type: "MANUAL_ADJUST",
-        actorDiscordId,
-        reason: reason ?? null,
-      } as any,
-    });
-
-    return [safe];
-  });
-
-  return safe;
+async function findMemberByNationId(nationId: number | null) {
+  if (nationId == null) return null;
+  return prisma.member.findFirst({ where: { nationId }, orderBy: { id: "desc" } });
 }
 
 export const data = new SlashCommandBuilder()
   .setName("safekeeping_adjust")
   .setDescription("Bankers: add or subtract resources in a member's safekeeping.")
-  .addSubcommand(sub =>
-    sub.setName("add").setDescription("Add resources")
-      // REQUIRED FIRST
-      .addStringOption(o =>
-        o.setName("resource").setDescription("Resource").setRequired(true)
-         .addChoices(...RESOURCE_KEYS.map(k => ({ name: k, value: k })))
+  .addSubcommand((sub) =>
+    sub
+      .setName("add")
+      .setDescription("Add resources")
+      // REQUIRED FIRST (Discord requirement)
+      .addStringOption((o) =>
+        o
+          .setName("resource")
+          .setDescription("Resource")
+          .setRequired(true)
+          .addChoices(...RESOURCE_KEYS.map((k) => ({ name: k, value: k })))
       )
-      .addNumberOption(o =>
+      .addNumberOption((o) =>
         o.setName("amount").setDescription("Amount (positive)").setRequired(true)
       )
       // OPTIONAL AFTER
-      .addUserOption(o => o.setName("member").setDescription("Discord user").setRequired(false))
-      .addIntegerOption(o => o.setName("nation_id").setDescription("Target by nation ID").setRequired(false))
-      .addStringOption(o => o.setName("reason").setDescription("Audit note").setRequired(false))
+      .addUserOption((o) =>
+        o.setName("member").setDescription("Discord user").setRequired(false)
+      )
+      .addIntegerOption((o) =>
+        o.setName("nation_id").setDescription("Target by nation ID").setRequired(false)
+      )
+      .addStringOption((o) =>
+        o.setName("reason").setDescription("Audit note").setRequired(false)
+      )
   )
-  .addSubcommand(sub =>
-    sub.setName("subtract").setDescription("Subtract resources")
+  .addSubcommand((sub) =>
+    sub
+      .setName("subtract")
+      .setDescription("Subtract resources")
       // REQUIRED FIRST
-      .addStringOption(o =>
-        o.setName("resource").setDescription("Resource").setRequired(true)
-         .addChoices(...RESOURCE_KEYS.map(k => ({ name: k, value: k })))
+      .addStringOption((o) =>
+        o
+          .setName("resource")
+          .setDescription("Resource")
+          .setRequired(true)
+          .addChoices(...RESOURCE_KEYS.map((k) => ({ name: k, value: k })))
       )
-      .addNumberOption(o =>
+      .addNumberOption((o) =>
         o.setName("amount").setDescription("Amount (positive)").setRequired(true)
       )
       // OPTIONAL AFTER
-      .addUserOption(o => o.setName("member").setDescription("Discord user").setRequired(false))
-      .addIntegerOption(o => o.setName("nation_id").setDescription("Target by nation ID").setRequired(false))
-      .addStringOption(o => o.setName("reason").setDescription("Audit note").setRequired(false))
+      .addUserOption((o) =>
+        o.setName("member").setDescription("Discord user").setRequired(false)
+      )
+      .addIntegerOption((o) =>
+        o.setName("nation_id").setDescription("Target by nation ID").setRequired(false)
+      )
+      .addStringOption((o) =>
+        o.setName("reason").setDescription("Audit note").setRequired(false)
+      )
   )
   .setDMPermission(false);
 
 export async function execute(i: ChatInputCommandInteraction) {
-  await i.deferReply({ ephemeral: true });
+  try {
+    await i.deferReply({ ephemeral: true });
 
-  const guild = i.guild;
-  const invoker = guild ? await guild.members.fetch(i.user.id).catch(() => null) : null;
-  if (!hasBankerRoleOrAdmin(invoker)) {
-    return i.editReply("You must have the **Banker** role (or be an Admin) to use this command.");
-  }
+    const guild = i.guild;
+    const invoker = guild ? await guild.members.fetch(i.user.id).catch(() => null) : null;
+    if (!hasBankerRoleOrAdmin(invoker)) {
+      return i.editReply("You must have the **Banker** role (or be an Admin) to use this command.");
+    }
 
-  const sub = i.options.getSubcommand(true);
-  const resource = i.options.getString("resource", true) as ResourceKey;
-  const raw = i.options.getNumber("amount", true);
-  const targetUser = i.options.getUser("member");
-  const nationId = i.options.getInteger("nation_id");
-  const reason = i.options.getString("reason") ?? null;
+    const sub = i.options.getSubcommand(true);
+    const resource = i.options.getString("resource", true) as ResourceKey;
+    const raw = i.options.getNumber("amount", true);
+    const targetUser = i.options.getUser("member");
+    const nationId = i.options.getInteger("nation_id");
+    const reason = i.options.getString("reason") ?? null;
 
-  if (!((RESOURCE_KEYS as readonly string[]).includes(resource))) {
-    return i.editReply(`Resource must be one of: ${RESOURCE_KEYS.join(", ")}`);
-  }
-  if (raw <= 0) return i.editReply("Amount must be a positive number.");
-  const delta = sub === "subtract" ? -Math.abs(raw) : Math.abs(raw);
+    if (!((RESOURCE_KEYS as readonly string[]).includes(resource))) {
+      return i.editReply(`Resource must be one of: ${RESOURCE_KEYS.join(", ")}`);
+    }
+    if (raw <= 0) return i.editReply("Amount must be a positive number.");
+    const delta = sub === "subtract" ? -Math.abs(raw) : Math.abs(raw);
 
-  const { allianceId, member } = await resolveAllianceAndMember({
-    discordId: targetUser?.id ?? null,
-    nationId: nationId ?? null,
-  });
-  if (!member || !allianceId) {
-    return i.editReply("Could not resolve the target member/alliance. Make sure the user is linked in the DB.");
-  }
+    // Resolve target member:
+    // prefer explicit targetUser, then nation_id, else default to invoker
+    let member =
+      (await findMemberByDiscordId(targetUser?.id ?? null)) ??
+      (await findMemberByNationId(nationId ?? null)) ??
+      (await findMemberByDiscordId(i.user.id));
 
-  const safe = await applyManualAdjust({
-    allianceId,
-    memberId: member.id,
-    resource,
-    delta,
-    actorDiscordId: i.user.id,
-    reason,
-  });
+    if (!member) {
+      return i.editReply(
+        "Could not resolve the target member/alliance. Make sure the user is linked in the bot database (or specify `member` or `nation_id`)."
+      );
+    }
+    const allianceId = member.allianceId as number;
 
-  const newValue = (safe as any)[resource] as number;
+    // Apply update; keep audit best-effort so missing models won't crash
+    const safe = await prisma.$transaction(async (tx) => {
+      const updated = await tx.safekeeping.upsert({
+        where: { memberId_allianceId: { memberId: member!.id, allianceId } },
+        update: { [resource]: { increment: delta } as any },
+        create: {
+          allianceId,
+          memberId: member!.id,
+          money: 0, food: 0, coal: 0, oil: 0, uranium: 0, lead: 0, iron: 0, bauxite: 0,
+          gasoline: 0, munitions: 0, steel: 0, aluminum: 0,
+          [resource]: delta,
+        } as any,
+      });
 
-  const embed = new EmbedBuilder()
-    .setTitle("Safekeeping Adjusted")
-    .setDescription(`${delta >= 0 ? "Added" : "Subtracted"} **${Math.abs(delta)} ${resource}** for <@${member.discordId}>`)
-    .addFields(
-      { name: "Alliance ID", value: String(allianceId), inline: true },
-      { name: "Member ID", value: String(member.id), inline: true },
-      { name: "Delta", value: String(delta), inline: true },
-      { name: "New Balance", value: String(newValue), inline: true },
-      reason ? { name: "Reason", value: reason, inline: false } : (undefined as any)
-    )
-    .setTimestamp();
+      // Audit row if the model exists
+      const anyTx = tx as any;
+      if (anyTx.safeTxn?.create) {
+        await anyTx.safeTxn
+          .create({
+            data: {
+              allianceId,
+              memberId: member!.id,
+              resource,
+              amount: delta,
+              type: "MANUAL_ADJUST",
+              actorDiscordId: i.user.id,
+              reason: reason ?? null,
+            },
+          })
+          .catch(() => {});
+      }
 
-  await i.editReply({ embeds: [embed] });
+      return updated;
+    });
 
-  // Optional: post to manual log channel if configured
-  if (guild) {
-    const chId = await getGuildSetting(guild.id, "manual_adjust_log_channel_id");
-    if (chId) {
-      const ch = guild.channels.cache.get(chId) as TextChannel | undefined;
-      if (ch?.isTextBased()) {
-        const log = new EmbedBuilder()
-          .setTitle("Manual Safekeeping Adjustment")
-          .setDescription(`<@${i.user.id}> ${delta >= 0 ? "added" : "subtracted"} **${Math.abs(delta)} ${resource}** for <@${member.discordId}>`)
-          .addFields(
-            { name: "Alliance ID", value: String(allianceId), inline: true },
-            { name: "Member ID", value: String(member.id), inline: true },
-            { name: "Delta", value: String(delta), inline: true },
-            { name: "New Balance", value: String(newValue), inline: true },
-            reason ? { name: "Reason", value: reason, inline: false } : (undefined as any)
-          )
-          .setTimestamp();
-        await ch.send({ embeds: [log] }).catch(() => {});
+    const newValue = (safe as any)[resource] as number;
+
+    const embed = new EmbedBuilder()
+      .setTitle("Safekeeping Adjusted")
+      .setDescription(
+        `${delta >= 0 ? "Added" : "Subtracted"} **${Math.abs(delta)} ${resource}** for <@${member.discordId}>`
+      )
+      .addFields(
+        { name: "Alliance ID", value: String(allianceId), inline: true },
+        { name: "Member ID", value: String(member.id), inline: true },
+        { name: "Delta", value: String(delta), inline: true },
+        { name: "New Balance", value: String(newValue), inline: true },
+        reason ? ({ name: "Reason", value: reason, inline: false } as any) : undefined!
+      )
+      .setTimestamp();
+
+    await i.editReply({ embeds: [embed] });
+
+    // Optional: post to manual log channel if configured (in-memory cache)
+    if (guild) {
+      const chId = await getGuildSetting(guild.id, "manual_adjust_log_channel_id");
+      if (chId) {
+        const ch = guild.channels.cache.get(chId) as TextChannel | undefined;
+        if (ch?.isTextBased()) {
+          const log = new EmbedBuilder()
+            .setTitle("Manual Safekeeping Adjustment")
+            .setDescription(
+              `<@${i.user.id}> ${delta >= 0 ? "added" : "subtracted"} **${Math.abs(delta)} ${resource}** for <@${member.discordId}>`
+            )
+            .addFields(
+              { name: "Alliance ID", value: String(allianceId), inline: true },
+              { name: "Member ID", value: String(member.id), inline: true },
+              { name: "Delta", value: String(delta), inline: true },
+              { name: "New Balance", value: String(newValue), inline: true },
+              reason ? ({ name: "Reason", value: reason, inline: false } as any) : undefined!
+            )
+            .setTimestamp();
+          await ch.send({ embeds: [log] }).catch(() => {});
+        }
       }
     }
+  } catch (err) {
+    // Never crash the bot on interaction errors
+    const msg =
+      err instanceof Error ? `${err.name}: ${err.message}` : "Unknown error";
+    try {
+      if (i.deferred || i.replied) {
+        await i.editReply(`❌ Error: ${msg}`);
+      } else {
+        await i.reply({ content: `❌ Error: ${msg}`, ephemeral: true });
+      }
+    } catch {}
+    console.error("safekeeping_adjust error:", err);
   }
 }
 
