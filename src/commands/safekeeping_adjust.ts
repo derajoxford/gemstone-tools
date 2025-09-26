@@ -12,7 +12,18 @@ import { getGuildSetting } from "../utils/settings.js";
 const prisma = new PrismaClient();
 
 const RESOURCE_KEYS = [
-  "money","food","coal","oil","uranium","lead","iron","bauxite","gasoline","munitions","steel","aluminum",
+  "money",
+  "food",
+  "coal",
+  "oil",
+  "uranium",
+  "lead",
+  "iron",
+  "bauxite",
+  "gasoline",
+  "munitions",
+  "steel",
+  "aluminum",
 ] as const;
 type ResourceKey = (typeof RESOURCE_KEYS)[number];
 
@@ -25,11 +36,17 @@ function hasBankerRoleOrAdmin(member: GuildMember | null): boolean {
 // Safer resolvers (avoid empty OR and invalid fields)
 async function findMemberByDiscordId(discordId: string | null) {
   if (!discordId) return null;
-  return prisma.member.findFirst({ where: { discordId }, orderBy: { id: "desc" } });
+  return prisma.member.findFirst({
+    where: { discordId },
+    orderBy: { id: "desc" },
+  });
 }
 async function findMemberByNationId(nationId: number | null) {
   if (nationId == null) return null;
-  return prisma.member.findFirst({ where: { nationId }, orderBy: { id: "desc" } });
+  return prisma.member.findFirst({
+    where: { nationId },
+    orderBy: { id: "desc" },
+  });
 }
 
 export const data = new SlashCommandBuilder()
@@ -41,16 +58,25 @@ export const data = new SlashCommandBuilder()
       .setDescription("Add resources")
       // REQUIRED FIRST (Discord requirement)
       .addStringOption((o) =>
-        o.setName("resource").setDescription("Resource").setRequired(true)
-         .addChoices(...RESOURCE_KEYS.map((k) => ({ name: k, value: k })))
+        o
+          .setName("resource")
+          .setDescription("Resource")
+          .setRequired(true)
+          .addChoices(...RESOURCE_KEYS.map((k) => ({ name: k, value: k })))
       )
       .addNumberOption((o) =>
         o.setName("amount").setDescription("Amount (positive)").setRequired(true)
       )
       // OPTIONAL AFTER
-      .addUserOption((o) => o.setName("member").setDescription("Discord user").setRequired(false))
-      .addIntegerOption((o) => o.setName("nation_id").setDescription("Target by nation ID").setRequired(false))
-      .addStringOption((o) => o.setName("reason").setDescription("Audit note").setRequired(false))
+      .addUserOption((o) =>
+        o.setName("member").setDescription("Discord user").setRequired(false)
+      )
+      .addIntegerOption((o) =>
+        o.setName("nation_id").setDescription("Target by nation ID").setRequired(false)
+      )
+      .addStringOption((o) =>
+        o.setName("reason").setDescription("Audit note").setRequired(false)
+      )
   )
   .addSubcommand((sub) =>
     sub
@@ -58,16 +84,25 @@ export const data = new SlashCommandBuilder()
       .setDescription("Subtract resources")
       // REQUIRED FIRST
       .addStringOption((o) =>
-        o.setName("resource").setDescription("Resource").setRequired(true)
-         .addChoices(...RESOURCE_KEYS.map((k) => ({ name: k, value: k })))
+        o
+          .setName("resource")
+          .setDescription("Resource")
+          .setRequired(true)
+          .addChoices(...RESOURCE_KEYS.map((k) => ({ name: k, value: k })))
       )
       .addNumberOption((o) =>
         o.setName("amount").setDescription("Amount (positive)").setRequired(true)
       )
       // OPTIONAL AFTER
-      .addUserOption((o) => o.setName("member").setDescription("Discord user").setRequired(false))
-      .addIntegerOption((o) => o.setName("nation_id").setDescription("Target by nation ID").setRequired(false))
-      .addStringOption((o) => o.setName("reason").setDescription("Audit note").setRequired(false))
+      .addUserOption((o) =>
+        o.setName("member").setDescription("Discord user").setRequired(false)
+      )
+      .addIntegerOption((o) =>
+        o.setName("nation_id").setDescription("Target by nation ID").setRequired(false)
+      )
+      .addStringOption((o) =>
+        o.setName("reason").setDescription("Audit note").setRequired(false)
+      )
   )
   .setDMPermission(false);
 
@@ -88,7 +123,7 @@ export async function execute(i: ChatInputCommandInteraction) {
     const nationId = i.options.getInteger("nation_id");
     const reason = i.options.getString("reason") ?? null;
 
-    if (!((RESOURCE_KEYS as readonly string[]).includes(resource))) {
+    if (!(RESOURCE_KEYS as readonly string[]).includes(resource)) {
       return i.editReply(`Resource must be one of: ${RESOURCE_KEYS.join(", ")}`);
     }
     if (raw <= 0) return i.editReply("Amount must be a positive number.");
@@ -108,8 +143,10 @@ export async function execute(i: ChatInputCommandInteraction) {
 
     // ---- Safekeeping update without upsert (works regardless of unique constraints) ----
     const updated = await prisma.$transaction(async (tx) => {
-      // Find any existing safekeeping row for this member
-      const existing = await tx.safekeeping.findFirst({ where: { memberId: member.id } });
+      // Unique on memberId, so we can find by memberId directly
+      const existing = await tx.safekeeping.findUnique({
+        where: { memberId: member.id },
+      });
 
       let safeRow;
       if (existing) {
@@ -121,27 +158,38 @@ export async function execute(i: ChatInputCommandInteraction) {
         // create with zeros, then apply delta to target resource
         const base: any = {
           memberId: member.id,
-          money: 0, food: 0, coal: 0, oil: 0, uranium: 0, lead: 0, iron: 0, bauxite: 0,
-          gasoline: 0, munitions: 0, steel: 0, aluminum: 0,
+          money: 0,
+          food: 0,
+          coal: 0,
+          oil: 0,
+          uranium: 0,
+          lead: 0,
+          iron: 0,
+          bauxite: 0,
+          gasoline: 0,
+          munitions: 0,
+          steel: 0,
+          aluminum: 0,
         };
         base[resource] = delta;
         safeRow = await tx.safekeeping.create({ data: base });
       }
 
-      // Best-effort audit if the table exists
+      // Best-effort audit (matches SafeTxn model)
       const anyTx = tx as any;
       if (anyTx.safeTxn?.create) {
-        await anyTx.safeTxn.create({
-          data: {
-            allianceId: member.allianceId ?? null, // ok if column exists; ignored if not
-            memberId: member.id,
-            resource,
-            amount: delta,
-            type: "MANUAL_ADJUST",
-            actorDiscordId: i.user.id,
-            reason: reason ?? null,
-          },
-        }).catch(() => {});
+        await anyTx.safeTxn
+          .create({
+            data: {
+              memberId: member.id,
+              resource,
+              amount: delta,
+              type: "MANUAL_ADJUST",
+              actorDiscordId: i.user.id,
+              reason: reason ?? null,
+            },
+          })
+          .catch(() => {});
       }
 
       return safeRow;
@@ -151,7 +199,9 @@ export async function execute(i: ChatInputCommandInteraction) {
 
     const embed = new EmbedBuilder()
       .setTitle("Safekeeping Adjusted")
-      .setDescription(`${delta >= 0 ? "Added" : "Subtracted"} **${Math.abs(delta)} ${resource}** for <@${member.discordId}>`)
+      .setDescription(
+        `${delta >= 0 ? "Added" : "Subtracted"} **${Math.abs(delta)} ${resource}** for <@${member.discordId}>`
+      )
       .addFields(
         { name: "Member ID", value: String(member.id), inline: true },
         { name: "Delta", value: String(delta), inline: true },
@@ -170,7 +220,9 @@ export async function execute(i: ChatInputCommandInteraction) {
         if (ch?.isTextBased()) {
           const log = new EmbedBuilder()
             .setTitle("Manual Safekeeping Adjustment")
-            .setDescription(`<@${i.user.id}> ${delta >= 0 ? "added" : "subtracted"} **${Math.abs(delta)} ${resource}** for <@${member.discordId}>`)
+            .setDescription(
+              `<@${i.user.id}> ${delta >= 0 ? "added" : "subtracted"} **${Math.abs(delta)} ${resource}** for <@${member.discordId}>`
+            )
             .addFields(
               { name: "Member ID", value: String(member.id), inline: true },
               { name: "Delta", value: String(delta), inline: true },
