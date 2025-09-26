@@ -1,4 +1,3 @@
-// src/commands/manual_adjust_log_channel.ts
 import { SlashCommandBuilder, ChatInputCommandInteraction, PermissionFlagsBits, ChannelType } from "discord.js";
 import { setGuildSetting } from "../utils/settings.js";
 
@@ -17,7 +16,6 @@ export const data = new SlashCommandBuilder()
 export async function execute(i: ChatInputCommandInteraction) {
   await i.deferReply({ ephemeral: true });
   if (!i.guild) return i.editReply("Run this in a server.");
-
   const ch = i.options.getChannel("channel", true);
   await setGuildSetting(i.guild.id, "manual_adjust_log_channel_id", ch.id);
   return i.editReply(`Manual adjustments will now be logged in <#${ch.id}>.`);
