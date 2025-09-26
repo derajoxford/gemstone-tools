@@ -1,13 +1,18 @@
-import { PrismaClient } from "@prisma/client";
-const prisma = new PrismaClient();
+// src/utils/settings.ts
+// Temporary in-memory guild settings cache (no DB dependency).
+// TODO: replace with a real Setting model when available.
 
-/** Get a guild-scoped string setting (value) by key, or null. */
+const manualAdjustLogChannel = new Map<string, string>(); // guildId -> channelId
+
 export async function getGuildSetting(guildId: string, key: string): Promise<string | null> {
-  const s = await prisma.setting.findFirst({ where: { guildId, key }, orderBy: { id: "desc" } });
-  return s?.value ?? null;
+  if (key === "manual_adjust_log_channel_id") {
+    return manualAdjustLogChannel.get(guildId) ?? null;
+  }
+  return null;
 }
 
-/** Upsert a guild-scoped string setting (value) by key. */
 export async function setGuildSetting(guildId: string, key: string, value: string) {
-  await prisma.setting.create({ data: { guildId, key, value } });
+  if (key === "manual_adjust_log_channel_id") {
+    manualAdjustLogChannel.set(guildId, value);
+  }
 }
