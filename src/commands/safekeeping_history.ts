@@ -30,10 +30,10 @@ export async function execute(i: ChatInputCommandInteraction) {
   const targetUser = i.options.getUser("member");
   const nationId = i.options.getInteger("nation_id");
 
-  // Resolve the target Member
-  const me = await prisma.member.findFirst({ where: { discordUserId: i.user.id }, orderBy: { id: "desc" } });
+  // Resolve target Member (NOTE: model uses discordId, not discordUserId)
+  const me = await prisma.member.findFirst({ where: { discordId: i.user.id }, orderBy: { id: "desc" } });
   const target = targetUser
-    ? await prisma.member.findFirst({ where: { discordUserId: targetUser.id }, orderBy: { id: "desc" } })
+    ? await prisma.member.findFirst({ where: { discordId: targetUser.id }, orderBy: { id: "desc" } })
     : nationId
     ? await prisma.member.findFirst({ where: { nationId }, orderBy: { id: "desc" } })
     : me;
@@ -41,7 +41,7 @@ export async function execute(i: ChatInputCommandInteraction) {
   if (!target) return i.editReply("Could not resolve the target member. Link your account or specify a valid member.");
 
   // Permission: viewing someone else requires Banker/Admin
-  const viewingSelf = target.discordUserId === i.user.id;
+  const viewingSelf = target.discordId === i.user.id;
   if (!viewingSelf && !hasBankerOrAdmin(invoker)) {
     return i.editReply("You need the **Banker** role (or be an Admin) to view other members’ history.");
   }
@@ -54,7 +54,6 @@ export async function execute(i: ChatInputCommandInteraction) {
 
   if (txns.length === 0) return i.editReply("No ledger entries found for this member.");
 
-  // Per-page resource totals
   const totals = new Map<string, number>();
   for (const t of txns) totals.set(t.resource, (totals.get(t.resource) ?? 0) + Number(t.amount));
 
