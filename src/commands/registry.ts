@@ -6,6 +6,8 @@ import * as pnw_bankpeek from "./pnw_bankpeek";
 import * as pnw_tax_apply from "./pnw_tax_apply";
 import * as treasury from "./treasury";
 import * as safekeeping_adjust from "./safekeeping_adjust"; // NEW
+import * as manual_adjust_log_channel from "./manual_adjust_log_channel";
+import * as safekeeping_history from "./safekeeping_history";
 
 export type CommandModule = {
   data?: { name?: string; toJSON?: () => any };
@@ -18,6 +20,8 @@ export const commandModules: CommandModule[] = [
   pnw_tax_apply,
   treasury,
   safekeeping_adjust,
+  manual_adjust_log_channel,
+  safekeeping_history,
 ].filter((m) => m?.data && m?.execute);
 
 // JSON payloads for registration (consumed by src/index.ts)
