@@ -184,3 +184,27 @@ model AllianceTaxCursor {
   @@id([allianceId])
   @@map("alliance_tax_cursors")
 }
+// --- Safekeeping transaction audit trail ---
+enum SafeTxnType {
+  MANUAL_ADJUST
+  AUTO_CREDIT
+  WITHDRAWAL
+}
+
+model SafeTxn {
+  id             Int         @id @default(autoincrement())
+  memberId       Int
+  member         Member      @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  resource       String      // e.g. "money", "steel", etc.
+  amount         Decimal     @db.Decimal(20,4)
+
+  type           SafeTxnType
+  actorDiscordId String?     @db.VarChar(32)
+  reason         String?     @db.Text
+
+  createdAt      DateTime    @default(now())
+
+  @@index([memberId, createdAt])
+}
+
