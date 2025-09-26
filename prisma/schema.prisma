@@ -54,6 +54,7 @@ model Member {
 
   balance     Safekeeping?
   alliance    Alliance @relation(fields: [allianceId], references: [id])
+  safeTxns    SafeTxn[]        // <— back-reference for SafeTxn.member
 
   @@unique([allianceId, discordId])
 }
