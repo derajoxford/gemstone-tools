@@ -1,5 +1,6 @@
 import type { Client } from "discord.js";
 import { PrismaClient, SafeTxnType } from "@prisma/client";
+import { fetch } from "undici";
 import {
   RESOURCE_KEYS,
   type ResourceKey,
@@ -11,23 +12,23 @@ import {
 
 const prisma = new PrismaClient();
 
-// Poll every 5 minutes by default; override via env (ms)
-const POLL_MS = Math.max(
+// Poll every 5 minutes (override via PNW_AUTO_APPLY_INTERVAL_MS)
+export const POLL_MS = Math.max(
   60_000,
   Number.isFinite(Number(process.env.PNW_AUTO_APPLY_INTERVAL_MS))
     ? Number(process.env.PNW_AUTO_APPLY_INTERVAL_MS)
     : 300_000
 );
 
-// Rolling window: look back 48 hours (idempotency avoids double-crediting)
-const WINDOW_MS = Math.max(
+// Rolling window: look back 48h (override via PNW_AUTO_APPLY_WINDOW_MS)
+export const WINDOW_MS = Math.max(
   60_000,
   Number.isFinite(Number(process.env.PNW_AUTO_APPLY_WINDOW_MS))
     ? Number(process.env.PNW_AUTO_APPLY_WINDOW_MS)
     : 48 * 60 * 60 * 1000
 );
 
-// PnW enums in cache
+// PnW enums (sender/receiver types)
 const SENDER_NATION = 1;
 const RECEIVER_ALLIANCE = 3;
 
@@ -74,7 +75,7 @@ async function sendCreditDM(
       ],
     });
   } catch {
-    // DMs may be closed; ignore
+    // DM closed or not allowed; ignore
   }
 }
 
@@ -89,7 +90,7 @@ async function creditDepositForRow(p: PrismaClient, client: Client | undefined, 
   });
   if (!member) return false;
 
-  // Gather positive amounts
+  // Build increments
   const increments: Record<string, any> = {};
   const amounts: Amounts = {};
   for (const res of RESOURCE_KEYS) {
@@ -117,7 +118,7 @@ async function creditDepositForRow(p: PrismaClient, client: Client | undefined, 
       await tx.safekeeping.create({ data: base });
     }
 
-    // Idempotent SafeTxn per (row.id, resource)
+    // Idempotent SafeTxn per (bankrecId, resource)
     for (const [res, amt] of Object.entries(amounts) as [ResourceKey, number][]) {
       const bankrecId = String(row.id);
       const marker = `BR:${bankrecId}:${res}`;
@@ -143,16 +144,111 @@ async function creditDepositForRow(p: PrismaClient, client: Client | undefined, 
 
   if (createdAny) {
     const alliance = await p.alliance.findUnique({ where: { id: allianceId } });
-    await sendCreditDM(client, member.discordId, alliance?.name, String(row.id), row.created_at ?? row.date, amounts, row.note);
+    await sendCreditDM(
+      client,
+      member.discordId,
+      alliance?.name,
+      String(row.id),
+      row.created_at ?? row.date,
+      amounts,
+      row.note
+    );
   }
 
   return createdAny;
 }
 
+/** Live PnW API fallback (GraphQL). */
+async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) {
+  try {
+    const keyrec = await prisma.allianceApiKey.findUnique({ where: { allianceId } });
+    const apiKey = keyrec?.apiKey?.trim();
+    if (!apiKey) return [];
+
+    const url = process.env.PNW_GRAPHQL_URL || "https://api.politicsandwar.com/graphql";
+
+    // Keep the query simple and filter in code; fewer assumptions about API args
+    const query = `
+      query {
+        bankrecs(alliance_id: ${allianceId}, limit: 200) {
+          id
+          date
+          note
+          sender_type
+          sender_id
+          receiver_type
+          receiver_id
+          money
+          food
+          coal
+          oil
+          uranium
+          lead
+          iron
+          bauxite
+          gasoline
+          munitions
+          steel
+          aluminum
+        }
+      }
+    `;
+
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        // PnW GraphQL commonly accepts either header or query param; header first:
+        "X-API-Key": apiKey,
+      },
+      body: JSON.stringify({ query }),
+    });
+
+    if (!resp.ok) {
+      console.warn(`[auto-credit] PnW API HTTP ${resp.status} for alliance ${allianceId}`);
+      return [];
+    }
+    const json: any = await resp.json();
+
+    // Try a few common shapes: { data: { bankrecs: [...] } } or { bankrecs: [...] }
+    const raw = json?.data?.bankrecs ?? json?.bankrecs ?? [];
+    const list: any[] = Array.isArray(raw) ? raw : (raw?.data ?? []);
+    const cutoff = since.getTime();
+
+    const mapped = list
+      .map((r) => {
+        const d = new Date(r.date as string);
+        return {
+          ...r,
+          id: String(r.id),
+          created_at: d,
+          alliance_id_derived: allianceId,
+        };
+      })
+      .filter(
+        (r) =>
+          r.sender_type == SENDER_NATION &&
+          r.receiver_type == RECEIVER_ALLIANCE &&
+          r.created_at instanceof Date &&
+          !Number.isNaN(r.created_at.getTime()) &&
+          r.created_at.getTime() > cutoff
+      )
+      .sort((a, b) => (a.created_at as Date).getTime() - (b.created_at as Date).getTime());
+
+    console.log(
+      `[auto-credit] PnW API fallback fetched ${mapped.length} rows for alliance ${allianceId}`
+    );
+    return mapped;
+  } catch (e) {
+    console.warn("[auto-credit] PnW API fallback error:", e);
+    return [];
+  }
+}
+
 async function fetchRecentRows(p: PrismaClient, allianceId: number) {
   const since = new Date(Date.now() - WINDOW_MS);
 
-  // Prefer the cache table
+  // 1) Prefer cached table
   const cache = await p.allianceBankrec.findMany({
     where: {
       alliance_id_derived: allianceId,
@@ -165,7 +261,7 @@ async function fetchRecentRows(p: PrismaClient, allianceId: number) {
   });
   if (cache.length > 0) return { rows: cache, source: "alliance_bankrec" as const };
 
-  // Fallback to legacy Bankrec table if present/filled
+  // 2) Legacy Bankrec
   const legacy = await p.bankrec.findMany({
     where: {
       allianceId,
@@ -176,7 +272,11 @@ async function fetchRecentRows(p: PrismaClient, allianceId: number) {
     orderBy: { date: "asc" },
     take: 1000,
   });
-  return { rows: legacy, source: "bankrec" as const };
+  if (legacy.length > 0) return { rows: legacy, source: "bankrec" as const };
+
+  // 3) Live PnW fallback
+  const live = await fetchAllianceDepositsFromPnWAPI(allianceId, since);
+  return { rows: live, source: "pnw_api" as const };
 }
 
 async function tickOnce(p: PrismaClient, client: Client | undefined) {
@@ -186,7 +286,6 @@ async function tickOnce(p: PrismaClient, client: Client | undefined) {
   for (const a of alliances) {
     const { rows, source } = await fetchRecentRows(p, a.id);
     if (rows.length === 0) {
-      // Only warn occasionally to avoid spam
       console.warn(`[auto-credit] no recent deposit rows found for alliance ${a.id} (source=${source})`);
       continue;
     }
@@ -206,11 +305,12 @@ async function tickOnce(p: PrismaClient, client: Client | undefined) {
 
 export async function startAutoApply(client?: Client, external?: PrismaClient) {
   const p = external ?? prisma;
+  console.log(`[auto-credit] mode=rolling-window windowMs=${WINDOW_MS} pollMs=${POLL_MS}`);
 
   // Kick once immediately
   tickOnce(p, client).catch((e) => console.error("[auto-credit] initial tick failed:", e));
 
-  // Then schedule every POLL_MS (safe loop)
+  // Then schedule every POLL_MS
   const loop = async () => {
     const start = Date.now();
     try {
