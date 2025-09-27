@@ -19,17 +19,19 @@ const POLL_MS = Math.max(
     : 300_000
 );
 
+// Rolling window: look back 48 hours (idempotency avoids double-crediting)
+const WINDOW_MS = Math.max(
+  60_000,
+  Number.isFinite(Number(process.env.PNW_AUTO_APPLY_WINDOW_MS))
+    ? Number(process.env.PNW_AUTO_APPLY_WINDOW_MS)
+    : 48 * 60 * 60 * 1000
+);
+
+// PnW enums in cache
 const SENDER_NATION = 1;
 const RECEIVER_ALLIANCE = 3;
 
 type Amounts = Partial<Record<ResourceKey, number>>;
-
-function parseCursorDate(raw: string | null | undefined) {
-  if (!raw || /^\s*$/.test(raw)) return { date: new Date(0), invalid: true };
-  const t = Date.parse(raw);
-  if (Number.isNaN(t)) return { date: new Date(0), invalid: true };
-  return { date: new Date(t), invalid: false };
-}
 
 async function sendCreditDM(
   client: Client | undefined,
@@ -40,7 +42,7 @@ async function sendCreditDM(
   amounts: Amounts,
   note?: string | null
 ) {
-  if (!client) return; // DM optional
+  if (!client) return;
   try {
     const user = await client.users.fetch(memberDiscordId);
     if (!user) return;
@@ -52,6 +54,8 @@ async function sendCreditDM(
         lines.push(`• ${resourceLabel(res)} — **${fmtAmount(amt)}** ${meta.emoji}`);
       }
     }
+    if (lines.length === 0) return;
+
     const desc =
       (note ? `> _${note}_\n\n` : "") +
       lines.join("\n") +
@@ -75,8 +79,8 @@ async function sendCreditDM(
 }
 
 async function creditDepositForRow(p: PrismaClient, client: Client | undefined, row: any) {
-  const allianceId = Number(row.alliance_id_derived);
-  const nationId = Number(row.sender_id);
+  const allianceId = Number(row.alliance_id_derived ?? row.allianceId);
+  const nationId = Number(row.sender_id ?? row.senderId);
   if (!Number.isFinite(allianceId) || !Number.isFinite(nationId)) return false;
 
   const member = await p.member.findFirst({
@@ -85,6 +89,7 @@ async function creditDepositForRow(p: PrismaClient, client: Client | undefined, 
   });
   if (!member) return false;
 
+  // Gather positive amounts
   const increments: Record<string, any> = {};
   const amounts: Amounts = {};
   for (const res of RESOURCE_KEYS) {
@@ -95,6 +100,8 @@ async function creditDepositForRow(p: PrismaClient, client: Client | undefined, 
     }
   }
   if (Object.keys(increments).length === 0) return false;
+
+  let createdAny = false;
 
   await p.$transaction(async (tx) => {
     const existing = await tx.safekeeping.findUnique({ where: { memberId: member.id } });
@@ -110,9 +117,10 @@ async function creditDepositForRow(p: PrismaClient, client: Client | undefined, 
       await tx.safekeeping.create({ data: base });
     }
 
-    // Idempotent SafeTxn per (row, resource)
+    // Idempotent SafeTxn per (row.id, resource)
     for (const [res, amt] of Object.entries(amounts) as [ResourceKey, number][]) {
-      const marker = `BR:${row.id}:${res}`;
+      const bankrecId = String(row.id);
+      const marker = `BR:${bankrecId}:${res}`;
       const dup = await tx.safeTxn.findFirst({
         where: { memberId: member.id, type: SafeTxnType.AUTO_CREDIT, reason: marker },
         select: { id: true },
@@ -128,22 +136,47 @@ async function creditDepositForRow(p: PrismaClient, client: Client | undefined, 
             reason: marker,
           },
         });
+        createdAny = true;
       }
     }
   });
 
-  const alliance = await p.alliance.findUnique({ where: { id: allianceId } });
-  await sendCreditDM(
-    client,
-    member.discordId,
-    alliance?.name,
-    row.id,
-    row.created_at,
-    amounts,
-    row.note
-  );
+  if (createdAny) {
+    const alliance = await p.alliance.findUnique({ where: { id: allianceId } });
+    await sendCreditDM(client, member.discordId, alliance?.name, String(row.id), row.created_at ?? row.date, amounts, row.note);
+  }
 
-  return true;
+  return createdAny;
+}
+
+async function fetchRecentRows(p: PrismaClient, allianceId: number) {
+  const since = new Date(Date.now() - WINDOW_MS);
+
+  // Prefer the cache table
+  const cache = await p.allianceBankrec.findMany({
+    where: {
+      alliance_id_derived: allianceId,
+      created_at: { gt: since },
+      sender_type: SENDER_NATION,
+      receiver_type: RECEIVER_ALLIANCE,
+    },
+    orderBy: { created_at: "asc" },
+    take: 1000,
+  });
+  if (cache.length > 0) return { rows: cache, source: "alliance_bankrec" as const };
+
+  // Fallback to legacy Bankrec table if present/filled
+  const legacy = await p.bankrec.findMany({
+    where: {
+      allianceId,
+      date: { gt: since },
+      senderType: SENDER_NATION,
+      receiverType: RECEIVER_ALLIANCE,
+    },
+    orderBy: { date: "asc" },
+    take: 1000,
+  });
+  return { rows: legacy, source: "bankrec" as const };
 }
 
 async function tickOnce(p: PrismaClient, client: Client | undefined) {
@@ -151,35 +184,10 @@ async function tickOnce(p: PrismaClient, client: Client | undefined) {
   const alliances = await p.alliance.findMany({ select: { id: true } });
 
   for (const a of alliances) {
-    const cursor = await p.allianceBankCursor.upsert({
-      where: { allianceId: a.id },
-      create: { allianceId: a.id, lastSeenId: "1970-01-01T00:00:00.000Z" },
-      update: {},
-      select: { lastSeenId: true },
-    });
-
-    const { date: sinceDate, invalid } = parseCursorDate(cursor.lastSeenId);
-
-    // Fetch rows newer than the watermark
-    const rows = await p.allianceBankrec.findMany({
-      where: {
-        alliance_id_derived: a.id,
-        created_at: { gt: sinceDate },
-        sender_type: SENDER_NATION,
-        receiver_type: RECEIVER_ALLIANCE,
-      },
-      orderBy: { created_at: "asc" },
-      take: 500,
-    });
-
+    const { rows, source } = await fetchRecentRows(p, a.id);
     if (rows.length === 0) {
-      // Self-heal bad cursors so we don't keep logging "Invalid Date"
-      if (invalid) {
-        await p.allianceBankCursor.update({
-          where: { allianceId: a.id },
-          data: { lastSeenId: new Date().toISOString() },
-        });
-      }
+      // Only warn occasionally to avoid spam
+      console.warn(`[auto-credit] no recent deposit rows found for alliance ${a.id} (source=${source})`);
       continue;
     }
 
@@ -191,18 +199,9 @@ async function tickOnce(p: PrismaClient, client: Client | undefined) {
         console.error("[auto-credit] error for row", row.id, e);
       }
     }
-
-    // Advance watermark to newest processed timestamp (valid ISO)
-    const newest = rows[rows.length - 1]!.created_at as Date;
-    await p.allianceBankCursor.update({
-      where: { allianceId: a.id },
-      data: { lastSeenId: new Date(newest).toISOString() },
-    });
   }
 
-  if (processed > 0) {
-    console.log(`[auto-credit] processed ${processed} deposit rows`);
-  }
+  if (processed > 0) console.log(`[auto-credit] processed ${processed} deposit rows`);
 }
 
 export async function startAutoApply(client?: Client, external?: PrismaClient) {
