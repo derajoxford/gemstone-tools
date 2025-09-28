@@ -8,13 +8,12 @@ async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) 
       return [];
     }
 
-    // Build URL with ?api_key=... (works reliably for PnW v3 GraphQL)
+    // Build URL with ?api_key=... (reliable for PnW v3 GraphQL)
     const base = process.env.PNW_GRAPHQL_URL || "https://api.politicsandwar.com/graphql";
     const url = new URL(base);
     url.searchParams.set("api_key", apiKey);
 
     // alliances(id:[AID]) { id bankrecs { ... } }
-    // We request all resource columns so we can increment balances directly.
     const query = `
       {
         alliances(id:[${allianceId}]) {
@@ -56,30 +55,36 @@ async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) 
     }
 
     const json: any = await resp.json();
-    // Expect shape: { data: { alliances: [ { id, bankrecs: [...] } ] } }
-    const alliances = json?.data?.alliances;
-    const list: any[] = Array.isArray(alliances) && alliances[0]?.bankrecs
-      ? alliances[0].bankrecs
-      : [];
+    if (Array.isArray(json?.errors) && json.errors.length > 0) {
+      console.warn("[auto-credit] PnW API GraphQL errors:", json.errors.map((e: any) => e?.message ?? e));
+      return [];
+    }
 
+    // Expect: { data: { alliances: [ { id, bankrecs: [...] } ] } }
+    const recs: any[] = json?.data?.alliances?.[0]?.bankrecs ?? [];
     const cutoff = since.getTime();
-    const mapped = list
+
+    const mapped = recs
       .map((r) => {
-        // PnW returns date as string; parse to Date
         const d = new Date(String(r.date));
+        const created_at = Number.isNaN(d.getTime()) ? new Date(0) : d;
         return {
           ...r,
           id: String(r.id),
-          created_at: d,
+          created_at,
           alliance_id_derived: allianceId,
+          // coerce to numbers so our filters are robust
+          sender_type: Number(r.sender_type),
+          receiver_type: Number(r.receiver_type),
         };
       })
-      .filter((r) =>
-        r.sender_type === 1 &&                      // nation
-        r.receiver_type === 3 &&                    // alliance
-        r.created_at instanceof Date &&
-        !Number.isNaN(r.created_at.getTime()) &&
-        r.created_at.getTime() > cutoff
+      .filter(
+        (r) =>
+          r.sender_type === 1 &&                 // nation
+          r.receiver_type === 3 &&               // alliance
+          r.created_at instanceof Date &&
+          !Number.isNaN(r.created_at.getTime()) &&
+          r.created_at.getTime() > cutoff
       )
       .sort((a, b) => (a.created_at as Date).getTime() - (b.created_at as Date).getTime());
 
