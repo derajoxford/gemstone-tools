@@ -131,7 +131,7 @@ export async function execute(i: ChatInputCommandInteraction) {
 
     const newValue = Number((updated as any)[resource] ?? 0);
     const meta = RESOURCE_META[resource];
-    const color = colorForDelta(delta, meta?.color ?? COLORS.blurple);
+    const color = colorForDelta(delta, (meta?.color ?? COLORS.blurple) as typeof COLORS.blurple);
     const guildIcon = guild?.iconURL?.() ?? undefined;
 
     const prettyChange = `${delta >= 0 ? "➕" : "➖"} ${fmtAmount(Math.abs(delta))} ${meta.emoji}`;
