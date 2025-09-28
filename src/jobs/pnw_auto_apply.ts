@@ -317,30 +317,4 @@ async function tickOnce(p: PrismaClient, client: Client | undefined) {
     }
   }
 
-  if (processed > 0) console.log(`[auto-credit] processed ${processed} deposit rows`);
-}
-
-export async function startAutoApply(client?: Client, external?: PrismaClient) {
-  const p = external ?? prisma;
-  console.log(`[auto-credit] mode=rolling-window windowMs=${WINDOW_MS} pollMs=${POLL_MS}`);
-
-  // Kick once immediately
-  tickOnce(p, client).catch((e) => console.error("[auto-credit] initial tick failed:", e));
-
-  // Then schedule every POLL_MS
-  const loop = async () => {
-    const start = Date.now();
-    try {
-      await tickOnce(p, client);
-    } catch (e) {
-      console.error("[auto-credit] tick failed:", e);
-    } finally {
-      const elapsed = Date.now() - start;
-      const wait = Math.max(10_000, POLL_MS - elapsed);
-      setTimeout(loop, wait);
-    }
-  };
-  setTimeout(loop, POLL_MS);
-}
-
-export default { startAutoApply };
+  if (processed > 0) console.log(`[auto-credit] processed ${p
