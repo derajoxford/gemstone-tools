@@ -1,128 +1,32 @@
-/* src/jobs/pnw_auto_apply.ts */
-
-import { Client as DiscordClient } from 'discord.js';
-import { PrismaClient, Prisma, SafeTxnType } from '@prisma/client';
+// src/jobs/pnw_auto_apply.ts
+import { PrismaClient, Prisma, SafeTxnType } from "@prisma/client";
+import type { Client } from "discord.js";
 
 const prisma = new PrismaClient();
 
-// ---- constants -------------------------------------------------------------
-
-// PnW type codes we care about
+// Constants from your earlier code
 const SENDER_NATION = 1;
 const RECEIVER_ALLIANCE = 3;
+// We also treat receiver_type=2 (bank) as an alliance deposit target
+const RECEIVER_ALLIANCE_BANK = 2;
 
-// rolling window & polling cadence
-const WINDOW_MS = Number(process.env.AUTO_CREDIT_WINDOW_MS ?? 2 * 24 * 60 * 60 * 1000); // 48h
-const POLL_MS = Number(process.env.AUTO_CREDIT_POLL_MS ?? 5 * 60 * 1000); // 5m
+// Window & poll (same defaults as logs showed)
+const WINDOW_MS = Number(process.env.AUTO_CREDIT_WINDOW_MS ?? 1000 * 60 * 60 * 24 * 2); // 48h
+const POLL_MS = Number(process.env.AUTO_CREDIT_POLL_MS ?? 1000 * 60 * 5); // 5m
 
-// ---------------------------------------------------------------------------
-
-type ResourceKey =
-  | 'money'
-  | 'food'
-  | 'coal'
-  | 'oil'
-  | 'uranium'
-  | 'lead'
-  | 'iron'
-  | 'bauxite'
-  | 'gasoline'
-  | 'munitions'
-  | 'steel'
-  | 'aluminum';
-
-type BankrecRow = {
-  id: string | number;
-  date: string;
+type PnwBankrec = {
+  id: string;
+  date: string; // ISO
   note?: string | null;
-  sender_type: number | string;
-  sender_id: string | number;
-  receiver_type: number | string;
-  receiver_id: string | number;
-  money?: number | string | null;
-  food?: number | string | null;
-  coal?: number | string | null;
-  oil?: number | string | null;
-  uranium?: number | string | null;
-  lead?: number | string | null;
-  iron?: number | string | null;
-  bauxite?: number | string | null;
-  gasoline?: number | string | null;
-  munitions?: number | string | null;
-  steel?: number | string | null;
-  aluminum?: number | string | null;
-  alliance_id_derived?: number;
-  created_at?: Date;
+  sender_type: number;
+  sender_id: string;
+  receiver_type: number;
+  receiver_id: string;
+  money?: number | null;
+  // other resources omitted here (we only auto-credit money)
 };
 
-// ---- atomic credit helper (idempotent via SafeTxn.reason UNIQUE) -----------
-
-async function creditDepositAtomic(
-  p: PrismaClient,
-  memberId: number,
-  resource: ResourceKey,
-  amount: Prisma.Decimal | number | string,
-  bankrecId: string
-) {
-  const dAmt = new Prisma.Decimal(amount);
-  const reason = `BR:${bankrecId}:${resource}`;
-
-  return p
-    .$transaction(async (tx) => {
-      // 1) Ledger first (enforces idempotency)
-      await tx.safeTxn.create({
-        data: {
-          memberId,
-          resource,
-          amount: dAmt,
-          type: SafeTxnType.AUTO_CREDIT,
-          reason, // UNIQUE when not null
-        },
-      });
-
-      // 2) Then increment safekeeping (source of truth)
-      const updateData: Record<string, any> = {};
-      updateData[resource] = { increment: dAmt };
-
-      const createData: Record<string, any> = {
-        memberId,
-        // initialize all fields to 0; set credited resource to amount
-        money: 0,
-        food: 0,
-        coal: 0,
-        oil: 0,
-        uranium: 0,
-        lead: 0,
-        iron: 0,
-        bauxite: 0,
-        gasoline: 0,
-        munitions: 0,
-        steel: 0,
-        aluminum: 0,
-      };
-      createData[resource] = dAmt;
-
-      await tx.safekeeping.upsert({
-        where: { memberId },
-        update: updateData,
-        create: createData,
-      });
-
-      const sk = await tx.safekeeping.findUnique({ where: { memberId } });
-      return { reason, balance: sk };
-    })
-    .catch((e: any) => {
-      // If duplicate, it's already been applied (skip)
-      if (e?.code === 'P2002') {
-        return { reason, duplicate: true as const };
-      }
-      throw e;
-    });
-}
-
-// ---- PnW live fetch (alliances -> bankrecs) --------------------------------
-
-async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) {
+async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date): Promise<(PnwBankrec & { created_at: Date; alliance_id_derived: number; })[]> {
   try {
     const keyrec = await prisma.allianceApiKey.findUnique({ where: { allianceId } });
     const apiKey = keyrec?.apiKey?.trim();
@@ -131,10 +35,11 @@ async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) 
       return [];
     }
 
-    const base = process.env.PNW_GRAPHQL_URL || 'https://api.politicsandwar.com/graphql';
+    const base = process.env.PNW_GRAPHQL_URL || "https://api.politicsandwar.com/graphql";
     const url = new URL(base);
-    url.searchParams.set('api_key', apiKey);
+    url.searchParams.set("api_key", apiKey);
 
+    // alliances(id:[AID]) { bankrecs { ... } }
     const query = `
       {
         alliances(id:[${allianceId}]) {
@@ -148,25 +53,14 @@ async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) 
             receiver_type
             receiver_id
             money
-            food
-            coal
-            oil
-            uranium
-            lead
-            iron
-            bauxite
-            gasoline
-            munitions
-            steel
-            aluminum
           }
         }
       }
     `;
 
     const resp = await fetch(url.toString(), {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      method: "POST",
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ query }),
     });
 
@@ -178,65 +72,63 @@ async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) 
     const json: any = await resp.json();
     if (Array.isArray(json?.errors) && json.errors.length > 0) {
       console.warn(
-        '[auto-credit] PnW API GraphQL errors:',
-        json.errors.map((e: any) => e?.message ?? e),
+        "[auto-credit] PnW API GraphQL errors:",
+        json.errors.map((e: any) => e?.message ?? e)
       );
       return [];
     }
 
     const recs: any[] = json?.data?.alliances?.[0]?.bankrecs ?? [];
     const cutoff = since.getTime();
-
-    const mapped: BankrecRow[] = recs
+    const mapped: (PnwBankrec & { created_at: Date; alliance_id_derived: number; })[] = recs
       .map((r) => {
         const d = new Date(String(r.date));
         const created_at = Number.isNaN(d.getTime()) ? new Date(0) : d;
         return {
-          ...r,
           id: String(r.id),
+          date: String(r.date),
+          note: r.note ?? null,
+          sender_type: Number(r.sender_type),
+          sender_id: String(r.sender_id),
+          receiver_type: Number(r.receiver_type),
+          receiver_id: String(r.receiver_id),
+          money: r.money == null ? null : Number(r.money),
           created_at,
           alliance_id_derived: allianceId,
-          sender_type: Number(r.sender_type),
-          receiver_type: Number(r.receiver_type),
-        } as BankrecRow;
+        };
       })
       .filter(
         (r) =>
           r.sender_type === SENDER_NATION &&
-          // Accept alliance-level receives (2) and explicit alliance (3)
-          (r.receiver_type === 2 || r.receiver_type === RECEIVER_ALLIANCE) &&
-          r.created_at instanceof Date &&
-          !Number.isNaN(r.created_at.getTime()) &&
-          r.created_at.getTime() > cutoff,
+          (r.receiver_type === RECEIVER_ALLIANCE || r.receiver_type === RECEIVER_ALLIANCE_BANK) &&
+          r.created_at.getTime() > cutoff
       )
-      .sort((a, b) => (a.created_at as Date).getTime() - (b.created_at as Date).getTime());
+      .sort((a, b) => a.created_at.getTime() - b.created_at.getTime());
 
     console.log(`[auto-credit] PnW API fallback fetched ${mapped.length} rows for alliance ${allianceId}`);
     return mapped;
   } catch (e) {
-    console.warn('[auto-credit] PnW API fallback error:', e);
+    console.warn("[auto-credit] PnW API fallback error:", e);
     return [];
   }
 }
 
-// ---- union of cache + legacy + live ----------------------------------------
-
-async function fetchRecentRows(p: PrismaClient, allianceId: number) {
+async function fetchRecentRows(p: PrismaClient, allianceId: number): Promise<{ rows: Array<any>, source: string }> {
   const since = new Date(Date.now() - WINDOW_MS);
 
-  // New cached table
+  // 1) union cache
   const cache = await p.allianceBankrec.findMany({
     where: {
       alliance_id_derived: allianceId,
-      created_at: { gt: since },
+      date: { gt: since },
       sender_type: SENDER_NATION,
-      receiver_type: { in: [2, RECEIVER_ALLIANCE] },
+      receiver_type: { in: [RECEIVER_ALLIANCE_BANK, RECEIVER_ALLIANCE] },
     },
-    orderBy: { created_at: 'asc' },
+    orderBy: { date: "asc" },
     take: 1000,
   });
 
-  // Legacy table
+  // 2) legacy table
   const legacy = await p.bankrec.findMany({
     where: {
       allianceId,
@@ -244,14 +136,13 @@ async function fetchRecentRows(p: PrismaClient, allianceId: number) {
       senderType: SENDER_NATION,
       receiverType: RECEIVER_ALLIANCE,
     },
-    orderBy: { date: 'asc' },
+    orderBy: { date: "asc" },
     take: 1000,
   });
 
-  // Live PnW
+  // 3) live PnW API
   const live = await fetchAllianceDepositsFromPnWAPI(allianceId, since);
 
-  // Merge & dedupe by raw bankrec id
   const combined: any[] = [...cache, ...legacy, ...live];
   const seen = new Set<string>();
   const deduped = combined.filter((r: any) => {
@@ -261,110 +152,131 @@ async function fetchRecentRows(p: PrismaClient, allianceId: number) {
     return true;
   });
 
-  // Sort by time (prefer created_at; fallback to date)
+  // Sort by time
   deduped.sort((a: any, b: any) => {
-    const ta = a.created_at ? new Date(a.created_at).getTime() : new Date(a.date).getTime();
-    const tb = b.created_at ? new Date(b.created_at).getTime() : new Date(b.date).getTime();
+    const ta = (a.created_at ? new Date(a.created_at).getTime() : new Date(a.date).getTime());
+    const tb = (b.created_at ? new Date(b.created_at).getTime() : new Date(b.date).getTime());
     return ta - tb;
   });
 
-  const source = live.length
-    ? 'union_local+pnw_api'
-    : cache.length
-    ? 'alliance_bankrec'
-    : legacy.length
-    ? 'bankrec'
-    : 'empty';
-
-  return { rows: deduped as BankrecRow[], source };
+  const source = live.length ? "union_local+pnw_api" : (cache.length ? "alliance_bankrec" : (legacy.length ? "bankrec" : "empty"));
+  return { rows: deduped, source };
 }
 
-// ---- small helpers ----------------------------------------------------------
-
-async function sendDM(client: DiscordClient | undefined, discordId: string | null, msg: string) {
-  if (!client || !discordId) return;
-  try {
-    const user = await client.users.fetch(discordId).catch(() => null);
-    if (user) await user.send(msg).catch(() => null);
-  } catch {
-    /* noop */
-  }
-}
-
-function fmtAmount(x: Prisma.Decimal | number | string | null | undefined) {
-  if (x == null) return '0';
-  const d = new Prisma.Decimal(x);
-  return d.toFixed(2);
-}
-
-// ---- main tick --------------------------------------------------------------
-
-async function processAlliance(p: PrismaClient, client: DiscordClient | undefined, allianceId: number) {
-  const { rows, source } = await fetchRecentRows(p, allianceId);
+async function processAlliance(prisma: PrismaClient, client: Client | undefined, allianceId: number): Promise<number> {
+  const { rows, source } = await fetchRecentRows(prisma, allianceId);
   console.log(`[auto-credit] alliance ${allianceId} fetched ${rows.length} rows (source=${source})`);
 
   let processed = 0;
 
   for (const r of rows) {
-    // Only nation -> alliance(-bank)
-    if (Number(r.sender_type) !== SENDER_NATION) continue;
-    if (![2, RECEIVER_ALLIANCE].includes(Number(r.receiver_type))) continue;
+    // Normalize shapes from different sources
+    const sender_type = Number(r.sender_type ?? r.senderType);
+    const receiver_type = Number(r.receiver_type ?? r.receiverType);
+    const sender_id = String(r.sender_id ?? r.senderId);
+    const moneyRaw = r.money ?? r.amount ?? null;
 
-    const nationId = Number(r.sender_id);
-    if (!nationId || Number.isNaN(nationId)) continue;
+    if (sender_type !== SENDER_NATION) continue;
+    if (![RECEIVER_ALLIANCE, RECEIVER_ALLIANCE_BANK].includes(receiver_type)) continue;
 
-    const member = await p.member.findFirst({ where: { nationId } });
+    const amount = moneyRaw == null ? 0 : Number(moneyRaw);
+    if (!amount || !Number.isFinite(amount) || amount <= 0) continue;
+
+    // Find the depositing member by nationId (and optionally alliance scope)
+    const nationIdNum = Number(sender_id);
+    const member = await prisma.member.findFirst({
+      where: { nationId: nationIdNum, allianceId },
+      select: { id: true, discordId: true, nationId: true, allianceId: true },
+    });
     if (!member) continue;
 
-    // MONEY only (extend for other resources if desired)
-    const money = r.money ? new Prisma.Decimal(r.money) : null;
-    if (money && money.gt(0)) {
-      const res = await creditDepositAtomic(p, member.id, 'money', money, String(r.id));
-      if (!('duplicate' in res)) {
-        processed++;
+    const reason = `BR:${String(r.id)}:money`;
 
-        // optional: DM
-        const newBal = res.balance?.money ? new Prisma.Decimal(res.balance.money).toFixed(2) : '—';
-        const msg =
-          `**Deposit Credited to Safekeeping**\n` +
-          `Alliance deposit detected\n` +
-          `• 💵 money — ${fmtAmount(money)} 💵\n\n` +
-          `Use /balance to view your updated safekeeping.\n` +
-          `Bank record ${r.id} • ${new Date(r.date).toLocaleString('en-US', { timeZone: 'UTC' })} UTC`;
+    // Upsert the SafeTxn using the unique reason (avoids double-credit)
+    await prisma.safeTxn.upsert({
+      where: { reason },
+      update: {}, // nothing to change if it already exists
+      create: {
+        memberId: member.id,
+        resource: "money",
+        amount: new Prisma.Decimal(amount.toString()),
+        type: SafeTxnType.AUTO_CREDIT,
+        actorDiscordId: null,
+        reason,
+      },
+    });
 
-        await sendDM(client, member.discordId, msg);
+    // Upsert Safekeeping; create must supply relation `member`
+    await prisma.safekeeping.upsert({
+      where: { memberId: member.id },
+      create: {
+        member: { connect: { id: member.id } },
+        money: new Prisma.Decimal(amount.toString()),
+        food: 0,
+        coal: 0,
+        oil: 0,
+        uranium: 0,
+        lead: 0,
+        iron: 0,
+        bauxite: 0,
+        gasoline: 0,
+        munitions: 0,
+        steel: 0,
+        aluminum: 0,
+      },
+      update: {
+        money: { increment: new Prisma.Decimal(amount.toString()) },
+      },
+    });
 
-        // optional: log new balance
-        console.log(
-          `[auto-credit] credited BR:${r.id} -> member ${member.id} (nation ${nationId}) money=${money.toFixed(
-            2,
-          )} newBalance=${newBal}`,
-        );
+    // Optional DM notify (best-effort)
+    try {
+      if (client && member.discordId) {
+        const user = await client.users.fetch(member.discordId).catch(() => null);
+        if (user) {
+          await user.send(
+            [
+              `**Deposit Credited to Safekeeping**`,
+              `Alliance deposit detected`,
+              `• 💵 money — ${amount} 💵`,
+              ``,
+              `Use /balance to view your updated safekeeping.`,
+              `Bank record ${String(r.id)}`,
+            ].join("\n")
+          ).catch(() => {});
+        }
       }
+    } catch {
+      // ignore DM failures
     }
+
+    processed++;
   }
 
   console.log(`[auto-credit] processed ${processed} deposit rows`);
+  return processed;
 }
 
-// ---- public entrypoints -----------------------------------------------------
+async function tickOnce(prismaArg?: PrismaClient, client?: Client) {
+  const p = prismaArg ?? prisma;
+  const alliances = await p.alliance.findMany({ select: { id: true } });
+  console.log(`[auto-credit] alliances in DB: ${alliances.map(a => a.id).join(", ")}`);
+  console.log(`[auto-credit] alliances in DB: ${alliances.map(a => a.id).join(", ")}`);
 
-export async function tickOnce(client?: DiscordClient) {
-  const alliances = await prisma.alliance.findMany({ select: { id: true } });
-  console.log(`[auto-credit] alliances in DB: ${alliances.map((a) => a.id).join(', ')}`);
-  console.log(`[auto-credit] alliances in DB: ${alliances.map((a) => a.id).join(', ')}`);
   for (const a of alliances) {
-    await processAlliance(prisma, client, a.id);
+    await processAlliance(p, client, a.id);
   }
 }
 
-export function startRollingWindow(client?: DiscordClient) {
-  console.log(
-    `[auto-credit] mode=rolling-window windowMs=${WINDOW_MS} pollMs=${POLL_MS}`,
-  );
-  // fire immediately, then interval
-  tickOnce(client).catch((e) => console.warn('[auto-credit] tickOnce error:', e));
+/**
+ * Exported entrypoint expected by src/index.ts
+ * Starts the rolling window poller and also runs an immediate tick.
+ */
+export async function startAutoApply(prismaArg?: PrismaClient, client?: Client) {
+  console.log(`[auto-credit] mode=rolling-window windowMs=${WINDOW_MS} pollMs=${POLL_MS}`);
+  await tickOnce(prismaArg ?? prisma, client).catch(() => { /* logged inside */ });
+
   setInterval(() => {
-    tickOnce(client).catch((e) => console.warn('[auto-credit] tickOnce error:', e));
+    tickOnce(prismaArg ?? prisma, client).catch(() => { /* logged inside */ });
   }, POLL_MS);
 }
