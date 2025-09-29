@@ -156,23 +156,33 @@ function bufToB64(b: any): string {
   return (Buffer.isBuffer(b) ? b : Buffer.from(b)).toString("base64");
 }
 
-async function getApiKeyForGuild(guildId?: string): Promise<string | null> {
+/**
+ * Always try DB key first (latest AllianceKey), regardless of guild.
+ * If none, fall back to process.env.PNW_API.
+ */
+async function getApiKeyForGuild(_guildId?: string): Promise<string | null> {
   try {
-    if (guildId) {
-      // Use the most recent AllianceKey (you can scope by guild/alliance later)
-      const k = await prisma.allianceKey.findFirst({
-        orderBy: { id: "desc" },
-        select: { encryptedApiKey: true, nonceApi: true },
-      });
-      if (k?.encryptedApiKey && k?.nonceApi) {
-        return open(bufToB64(k.encryptedApiKey as any), bufToB64(k.nonceApi as any));
+    const k = await prisma.allianceKey.findFirst({
+      orderBy: { id: "desc" },
+      select: { encryptedApiKey: true, nonceApi: true },
+    });
+    if (k?.encryptedApiKey && k?.nonceApi) {
+      const api = open(bufToB64(k.encryptedApiKey as any), bufToB64(k.nonceApi as any));
+      if (api && api.length > 10) {
+        console.log("[/who] using AllianceKey from DB");
+        return api;
       }
     }
   } catch (e) {
-    console.error("getApiKeyForGuild error:", e);
+    console.error("[/who] getApiKeyForGuild DB error:", e);
   }
   const env = process.env.PNW_API;
-  return env && env.trim().length ? env.trim() : null;
+  if (env && env.trim().length) {
+    console.log("[/who] using PNW_API from environment");
+    return env.trim();
+  }
+  console.warn("[/who] no API key found (DB or env)");
+  return null;
 }
 
 async function fetchNationById(id: number, guildId?: string): Promise<NationCore | null> {
@@ -212,6 +222,8 @@ async function fetchNationById(id: number, guildId?: string): Promise<NationCore
     if (r.ok) {
       const j: any = await r.json();
       if (j?.data?.nation) return mapNationGraphQL(j.data.nation);
+    } else {
+      console.warn("[/who] GraphQL fetchNationById HTTP", r.status);
     }
   }
 
@@ -219,6 +231,8 @@ async function fetchNationById(id: number, guildId?: string): Promise<NationCore
   if (rest.ok) {
     const j: any = await rest.json();
     if (j?.data) return mapNationREST(j.data);
+  } else {
+    console.warn("[/who] REST fetchNationById HTTP", rest.status);
   }
   return null;
 }
@@ -283,10 +297,14 @@ async function searchNations(
         out.sort((a, b) => (b.score ?? -1) - (a.score ?? -1));
         return out.slice(0, 5);
       }
+    } else {
+      console.warn("[/who] GraphQL searchNations HTTP", r.status);
     }
+  } else {
+    console.warn("[/who] No API key for search; REST keyword fallback only");
   }
 
-  // REST keyword fallback (public)
+  // REST keyword fallback (public; limited fidelity)
   const keyword = opts.nationName ?? opts.leaderName ?? "";
   if (keyword) {
     const r = await fetch(
@@ -296,6 +314,8 @@ async function searchNations(
       const j: any = await r.json();
       const arr = j?.data ?? [];
       for (const n of arr) out.push(mapNationREST(n));
+    } else {
+      console.warn("[/who] REST searchNations HTTP", r.status);
     }
   }
 
