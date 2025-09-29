@@ -66,7 +66,6 @@ function fmt(n: number): string {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LIVE (GraphQL) FETCH — robust to schema variations
-// Tries multiple query variants to handle both array and paginator shapes.
 // ─────────────────────────────────────────────────────────────────────────────
 async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) {
   const cutoff = since.getTime();
@@ -83,99 +82,44 @@ async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) 
     const url = new URL(base);
     url.searchParams.set("api_key", apiKey);
 
-    // We’ll try up to 3 queries to accommodate schema differences seen in logs.
     const queries: string[] = [
-      // Q1: Alliances as ARRAY with id:[...] — if supported
+      // Variant A: array shape with id: [...]
       `
       {
         alliances(id:[${allianceId}]) {
           id
           bankrecs(limit: 100) {
-            id
-            date
-            note
-            sender_type
-            sender_id
-            receiver_type
-            receiver_id
-            money
-            food
-            coal
-            oil
-            uranium
-            lead
-            iron
-            bauxite
-            gasoline
-            munitions
-            steel
-            aluminum
+            id date note sender_type sender_id receiver_type receiver_id
+            money food coal oil uranium lead iron bauxite gasoline munitions steel aluminum
           }
         }
-      }
-      `,
-      // Q2: AlliancePaginator with first + filter by id
+      }`,
+      // Variant B: paginator with filter
       `
       {
         alliances(first: 1, filter: { id: { in: [${allianceId}] } }) {
           data {
             id
             bankrecs(limit: 100) {
-              id
-              date
-              note
-              sender_type
-              sender_id
-              receiver_type
-              receiver_id
-              money
-              food
-              coal
-              oil
-              uranium
-              lead
-              iron
-              bauxite
-              gasoline
-              munitions
-              steel
-              aluminum
+              id date note sender_type sender_id receiver_type receiver_id
+              money food coal oil uranium lead iron bauxite gasoline munitions steel aluminum
             }
           }
         }
-      }
-      `,
-      // Q3: AlliancePaginator with first only; filter client-side by id
+      }`,
+      // Variant C: paginator without filter (client-side filter)
       `
       {
         alliances(first: 5) {
           data {
             id
             bankrecs(limit: 100) {
-              id
-              date
-              note
-              sender_type
-              sender_id
-              receiver_type
-              receiver_id
-              money
-              food
-              coal
-              oil
-              uranium
-              lead
-              iron
-              bauxite
-              gasoline
-              munitions
-              steel
-              aluminum
+              id date note sender_type sender_id receiver_type receiver_id
+              money food coal oil uranium lead iron bauxite gasoline munitions steel aluminum
             }
           }
         }
-      }
-      `,
+      }`,
     ];
 
     let mapped: any[] = [];
@@ -196,13 +140,9 @@ async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) 
       const json: any = await resp.json();
       if (Array.isArray(json?.errors) && json.errors.length > 0) {
         lastErrors = json.errors;
-        // Try the next query variant
-        continue;
+        continue; // try next variant
       }
 
-      // Normalize both data shapes:
-      //  - ARRAY: json.data.alliances -> [ { id, bankrecs: [...] } ]
-      //  - PAGINATOR: json.data.alliances.data -> [ { id, bankrecs: [...] } ]
       const alliancesArr: any[] =
         Array.isArray(json?.data?.alliances)
           ? json.data.alliances
@@ -227,7 +167,19 @@ async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) 
             receiver_type: Number(r.receiver_type),
             sender_id: String((r as any).sender_id ?? ""),
             receiver_id: String((r as any).receiver_id ?? ""),
+            // amounts as numbers
             money: Number((r as any).money ?? 0),
+            food: Number((r as any).food ?? 0),
+            coal: Number((r as any).coal ?? 0),
+            oil: Number((r as any).oil ?? 0),
+            uranium: Number((r as any).uranium ?? 0),
+            lead: Number((r as any).lead ?? 0),
+            iron: Number((r as any).iron ?? 0),
+            bauxite: Number((r as any).bauxite ?? 0),
+            gasoline: Number((r as any).gasoline ?? 0),
+            munitions: Number((r as any).munitions ?? 0),
+            steel: Number((r as any).steel ?? 0),
+            aluminum: Number((r as any).aluminum ?? 0),
           };
         })
         .filter(
@@ -240,8 +192,7 @@ async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) 
         )
         .sort((a, b) => (a.created_at as Date).getTime() - (b.created_at as Date).getTime());
 
-      // If this variant yielded parsable shape (even 0 rows but no errors), stop trying others.
-      if (alliancesArr.length >= 0) break;
+      break; // parsed OK, stop trying others
     }
 
     if (mapped.length === 0 && lastErrors) {
@@ -261,11 +212,13 @@ async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) 
   }
 }
 
-// ---------- MERGE RECENT (cache + legacy + live) ----------
+// ─────────────────────────────────────────────────────────────────────────────
+// MERGE RECENT (cache + legacy + live)
+// ─────────────────────────────────────────────────────────────────────────────
 async function fetchRecentRows(p: PrismaClient, allianceId: number) {
   const since = new Date(Date.now() - WINDOW_MS);
 
-  // 1) New cached table (if present)
+  // 1) Cached table: it does NOT have resource columns — set them to 0
   const cache = await p.allianceBankrec.findMany({
     where: {
       alliance_id_derived: allianceId,
@@ -273,9 +226,13 @@ async function fetchRecentRows(p: PrismaClient, allianceId: number) {
       sender_type: SENDER_NATION,
       receiver_type: { in: [RECEIVER_ALLIANCE, RECEIVER_TREASURY] },
     },
+    orderBy: { created_at: "asc" },
+    take: 1000,
   });
 
-  // 2) Legacy table
+  const zeros = Object.fromEntries(RESOURCE_KEYS.map((k) => [k, 0]));
+
+  // 2) Legacy table: has resource columns
   const legacy = await p.bankrec.findMany({
     where: {
       allianceId,
@@ -283,35 +240,26 @@ async function fetchRecentRows(p: PrismaClient, allianceId: number) {
       senderType: SENDER_NATION,
       receiverType: { in: [RECEIVER_ALLIANCE, RECEIVER_TREASURY] },
     },
+    orderBy: { date: "asc" },
+    take: 1000,
   });
 
-  // 3) Live
+  // 3) Live API
   const live = await fetchAllianceDepositsFromPnWAPI(allianceId, since);
 
   // Merge & dedupe by raw bankrec id
   const combined: any[] = [
     ...cache.map((r) => ({
       id: String(r.id),
-      date: r.created_at ?? r.date,
-      created_at: r.created_at ?? r.date,
+      date: r.created_at ?? (r as any).date,
+      created_at: r.created_at ?? (r as any).date,
       sender_type: r.sender_type,
       sender_id: String(r.sender_id),
       receiver_type: r.receiver_type,
       receiver_id: String(r.receiver_id),
       alliance_id_derived: r.alliance_id_derived,
       note: r.note ?? "",
-      money: r.money ?? 0,
-      food: r.food ?? 0,
-      coal: r.coal ?? 0,
-      oil: r.oil ?? 0,
-      uranium: r.uranium ?? 0,
-      lead: r.lead ?? 0,
-      iron: r.iron ?? 0,
-      bauxite: r.bauxite ?? 0,
-      gasoline: r.gasoline ?? 0,
-      munitions: r.munitions ?? 0,
-      steel: r.steel ?? 0,
-      aluminum: r.aluminum ?? 0,
+      ...zeros, // cache rows carry NO amounts
     })),
     ...legacy.map((r) => ({
       id: String(r.id),
@@ -365,7 +313,9 @@ async function fetchRecentRows(p: PrismaClient, allianceId: number) {
   return { rows: deduped, source };
 }
 
-// ---------- CREDIT ONE RESOURCE ----------
+// ─────────────────────────────────────────────────────────────────────────────
+// CREDIT ONE RESOURCE
+// ─────────────────────────────────────────────────────────────────────────────
 async function creditOneResource(
   memberId: number,
   resource: ResourceKey,
@@ -400,9 +350,7 @@ async function creditOneResource(
     });
   } else {
     // create with 0 for all resources, then set this one
-    const createData: any = {
-      member: { connect: { id: memberId } },
-    };
+    const createData: any = { member: { connect: { id: memberId } } };
     for (const key of RESOURCE_KEYS) createData[key] = 0;
     createData[resource] = amount;
     await prisma.safekeeping.create({ data: createData });
@@ -411,7 +359,9 @@ async function creditOneResource(
   return true;
 }
 
-// ---------- DM (embed) ----------
+// ─────────────────────────────────────────────────────────────────────────────
+// DM (embed)
+// ─────────────────────────────────────────────────────────────────────────────
 async function sendDepositDM(
   discord: Client | undefined,
   discordId: string | null | undefined,
@@ -434,7 +384,7 @@ async function sendDepositDM(
   }
 }
 
-// ---------- PROCESS BATCH ----------
+// ─────────────────────────────────────────────────────────────────────────────
 async function processAlliance(p: PrismaClient, discord: Client | undefined, allianceId: number) {
   const { rows, source } = await fetchRecentRows(p, allianceId);
   console.log(`[auto-credit] alliance ${allianceId} fetched ${rows.length} rows (source=${source})`);
@@ -445,7 +395,7 @@ async function processAlliance(p: PrismaClient, discord: Client | undefined, all
     const senderNationId = Number(r.sender_id);
     if (!Number.isFinite(senderNationId)) continue;
 
-    // Resolve member by nationId (and prefer same alliance)
+    // Resolve member by nationId (prefer same alliance, else any)
     const member =
       (await p.member.findFirst({
         where: { nationId: senderNationId, allianceId },
@@ -473,7 +423,7 @@ async function processAlliance(p: PrismaClient, discord: Client | undefined, all
     if (credited.length > 0) {
       processed += credited.length;
 
-      // Build pretty DM fields (group money first if present)
+      // money first for readability
       const moneyFirst = credited.sort((a, b) =>
         a.resource === "money" ? -1 : b.resource === "money" ? 1 : a.resource.localeCompare(b.resource)
       );
@@ -521,7 +471,9 @@ function emojiFor(res: ResourceKey): string {
   }
 }
 
-// ---------- PUBLIC START ----------
+// ─────────────────────────────────────────────────────────────────────────────
+// PUBLIC START
+// ─────────────────────────────────────────────────────────────────────────────
 let _timer: NodeJS.Timeout | null = null;
 let _running = false;
 
