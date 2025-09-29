@@ -4,7 +4,7 @@ import { fetchAveragePrices, computeTotalValue } from "../src/lib/market.js";
 const prisma = new PrismaClient();
 
 async function main() {
-  const discordId = process.env.DISCORD_ID || ""; // optionally pass your Discord ID
+  const discordId = process.env.DISCORD_ID || "";
   let member: any = null;
 
   if (discordId) {
@@ -19,6 +19,16 @@ async function main() {
   }
 
   let safe = await prisma.safekeeping.findFirst({ where: { memberId: member.id } });
+  if (!safe) {
+    const viaSafe = await prisma.safekeeping.findFirst({
+      where: { member: { discordId: discordId || member.discordId } },
+      include: { member: true },
+    });
+    if (viaSafe) {
+      safe = viaSafe;
+      member = viaSafe.member;
+    }
+  }
   if (!safe) {
     console.error("Member has no Safekeeping row.");
     process.exit(3);
@@ -44,3 +54,4 @@ async function main() {
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });
+
