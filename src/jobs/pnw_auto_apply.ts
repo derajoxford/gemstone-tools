@@ -64,8 +64,13 @@ function fmt(n: number): string {
   return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
 }
 
-// ---------- LIVE (GraphQL) FETCH ----------
+// ─────────────────────────────────────────────────────────────────────────────
+// LIVE (GraphQL) FETCH — robust to schema variations
+// Tries multiple query variants to handle both array and paginator shapes.
+// ─────────────────────────────────────────────────────────────────────────────
 async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) {
+  const cutoff = since.getTime();
+
   try {
     const keyrec = await prisma.allianceApiKey.findUnique({ where: { allianceId } });
     const apiKey = keyrec?.apiKey?.trim();
@@ -78,11 +83,12 @@ async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) 
     const url = new URL(base);
     url.searchParams.set("api_key", apiKey);
 
-    // alliances(first: 1, id: [AID]) { data { bankrecs(limit: N) { ... } } }
-    const query = `
-    {
-      alliances(first: 1, id: [${allianceId}]) {
-        data {
+    // We’ll try up to 3 queries to accommodate schema differences seen in logs.
+    const queries: string[] = [
+      // Q1: Alliances as ARRAY with id:[...] — if supported
+      `
+      {
+        alliances(id:[${allianceId}]) {
           id
           bankrecs(limit: 100) {
             id
@@ -107,56 +113,147 @@ async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) 
           }
         }
       }
-    }`;
+      `,
+      // Q2: AlliancePaginator with first + filter by id
+      `
+      {
+        alliances(first: 1, filter: { id: { in: [${allianceId}] } }) {
+          data {
+            id
+            bankrecs(limit: 100) {
+              id
+              date
+              note
+              sender_type
+              sender_id
+              receiver_type
+              receiver_id
+              money
+              food
+              coal
+              oil
+              uranium
+              lead
+              iron
+              bauxite
+              gasoline
+              munitions
+              steel
+              aluminum
+            }
+          }
+        }
+      }
+      `,
+      // Q3: AlliancePaginator with first only; filter client-side by id
+      `
+      {
+        alliances(first: 5) {
+          data {
+            id
+            bankrecs(limit: 100) {
+              id
+              date
+              note
+              sender_type
+              sender_id
+              receiver_type
+              receiver_id
+              money
+              food
+              coal
+              oil
+              uranium
+              lead
+              iron
+              bauxite
+              gasoline
+              munitions
+              steel
+              aluminum
+            }
+          }
+        }
+      }
+      `,
+    ];
 
-    const resp = await fetch(url.toString(), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ query }),
-    });
+    let mapped: any[] = [];
+    let lastErrors: any[] | null = null;
 
-    if (!resp.ok) {
-      console.warn(`[auto-credit] PnW API HTTP ${resp.status} for alliance ${allianceId}`);
-      return [];
+    for (const query of queries) {
+      const resp = await fetch(url.toString(), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ query }),
+      });
+
+      if (!resp.ok) {
+        console.warn(`[auto-credit] PnW API HTTP ${resp.status} for alliance ${allianceId}`);
+        continue;
+      }
+
+      const json: any = await resp.json();
+      if (Array.isArray(json?.errors) && json.errors.length > 0) {
+        lastErrors = json.errors;
+        // Try the next query variant
+        continue;
+      }
+
+      // Normalize both data shapes:
+      //  - ARRAY: json.data.alliances -> [ { id, bankrecs: [...] } ]
+      //  - PAGINATOR: json.data.alliances.data -> [ { id, bankrecs: [...] } ]
+      const alliancesArr: any[] =
+        Array.isArray(json?.data?.alliances)
+          ? json.data.alliances
+          : Array.isArray(json?.data?.alliances?.data)
+          ? json.data.alliances.data
+          : [];
+
+      const alliance =
+        alliancesArr.find((a: any) => String(a?.id) === String(allianceId)) || alliancesArr[0];
+
+      const recs: LiveBankrec[] = alliance?.bankrecs ?? [];
+      mapped = recs
+        .map((r) => {
+          const d = new Date(String(r.date));
+          const created_at = Number.isNaN(d.getTime()) ? new Date(0) : d;
+          return {
+            ...r,
+            id: String(r.id),
+            alliance_id_derived: allianceId,
+            created_at,
+            sender_type: Number(r.sender_type),
+            receiver_type: Number(r.receiver_type),
+            sender_id: String((r as any).sender_id ?? ""),
+            receiver_id: String((r as any).receiver_id ?? ""),
+            money: Number((r as any).money ?? 0),
+          };
+        })
+        .filter(
+          (r) =>
+            r.sender_type === SENDER_NATION &&
+            (r.receiver_type === RECEIVER_ALLIANCE || r.receiver_type === RECEIVER_TREASURY) &&
+            r.created_at instanceof Date &&
+            !Number.isNaN(r.created_at.getTime()) &&
+            r.created_at.getTime() > cutoff
+        )
+        .sort((a, b) => (a.created_at as Date).getTime() - (b.created_at as Date).getTime());
+
+      // If this variant yielded parsable shape (even 0 rows but no errors), stop trying others.
+      if (alliancesArr.length >= 0) break;
     }
 
-    const json: any = await resp.json();
-    if (Array.isArray(json?.errors) && json.errors.length > 0) {
+    if (mapped.length === 0 && lastErrors) {
       console.warn(
         "[auto-credit] PnW API GraphQL errors:",
-        json.errors.map((e: any) => e?.message ?? e)
+        lastErrors.map((e: any) => e?.message ?? e)
       );
-      return [];
     }
 
-    // Expect: { data: { alliances: { data: [ { id, bankrecs: [...] } ] } } }
-    const recs: LiveBankrec[] = json?.data?.alliances?.data?.[0]?.bankrecs ?? [];
-    const cutoff = since.getTime();
-
-    const mapped = recs
-      .map((r) => {
-        const d = new Date(String(r.date));
-        const created_at = Number.isNaN(d.getTime()) ? new Date(0) : d;
-        return {
-          ...r,
-          id: String(r.id),
-          alliance_id_derived: allianceId,
-          created_at,
-          sender_type: Number(r.sender_type),
-          receiver_type: Number(r.receiver_type),
-        };
-      })
-      .filter(
-        (r) =>
-          r.sender_type === SENDER_NATION &&
-          (r.receiver_type === RECEIVER_ALLIANCE || r.receiver_type === RECEIVER_TREASURY) &&
-          r.created_at instanceof Date &&
-          !Number.isNaN(r.created_at.getTime()) &&
-          r.created_at.getTime() > cutoff
-      )
-      .sort((a, b) => (a.created_at as Date).getTime() - (b.created_at as Date).getTime());
-
-    console.log(`[auto-credit] PnW API fallback fetched ${mapped.length} rows for alliance ${allianceId}`);
+    console.log(
+      `[auto-credit] PnW API fallback fetched ${mapped.length} rows for alliance ${allianceId}`
+    );
     return mapped;
   } catch (e) {
     console.warn("[auto-credit] PnW API fallback error:", e);
@@ -176,8 +273,6 @@ async function fetchRecentRows(p: PrismaClient, allianceId: number) {
       sender_type: SENDER_NATION,
       receiver_type: { in: [RECEIVER_ALLIANCE, RECEIVER_TREASURY] },
     },
-    orderBy: { created_at: "asc" },
-    take: 1000,
   });
 
   // 2) Legacy table
@@ -188,8 +283,6 @@ async function fetchRecentRows(p: PrismaClient, allianceId: number) {
       senderType: SENDER_NATION,
       receiverType: { in: [RECEIVER_ALLIANCE, RECEIVER_TREASURY] },
     },
-    orderBy: { date: "asc" },
-    take: 1000,
   });
 
   // 3) Live
@@ -207,7 +300,6 @@ async function fetchRecentRows(p: PrismaClient, allianceId: number) {
       receiver_id: String(r.receiver_id),
       alliance_id_derived: r.alliance_id_derived,
       note: r.note ?? "",
-      // quantities (may be missing in cache row, default to 0)
       money: r.money ?? 0,
       food: r.food ?? 0,
       coal: r.coal ?? 0,
@@ -399,7 +491,6 @@ async function processAlliance(p: PrismaClient, discord: Client | undefined, all
 }
 
 function emojiFor(res: ResourceKey): string {
-  // light-weight mapping; customize as you like
   switch (res) {
     case "money":
       return "💵";
