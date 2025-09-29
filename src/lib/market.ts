@@ -1,11 +1,10 @@
 // src/lib/market.ts
 import { PrismaClient } from "@prisma/client";
-import * as cryptoMod from "../lib/crypto.js"; // keep path consistent with your project
+import * as cryptoMod from "./crypto.js"; // same folder
 
 const prisma = new PrismaClient();
-// Your crypto.open expects base64 strings (in your repo pattern)
-// so we convert Buffers to base64 before calling.
-const open = (cryptoMod as any).open as (cipher: string, nonce: string) => string;
+// Your crypto.open expects Uint8Array/Buffer inputs.
+const open = (cryptoMod as any).open as (cipher: Uint8Array, nonce: Uint8Array) => string;
 
 export type Resource =
   | "money"
@@ -31,8 +30,9 @@ function normalize(n: any): number | null {
 }
 
 /**
- * Get any saved PnW API key (most recent). AllianceKey in your schema stores
- * encryptedApiKey: Buffer, and nonces as nonceApi (Buffer).
+ * Get any saved PnW API key (most recent). AllianceKey stores:
+ * - encryptedApiKey: Buffer
+ * - nonceApi: Buffer
  */
 async function getAnyPnwApiKey(): Promise<string | null> {
   const k = await prisma.allianceKey.findFirst({
@@ -40,9 +40,9 @@ async function getAnyPnwApiKey(): Promise<string | null> {
   });
   if (!k) return null;
   try {
-    // Convert Buffers -> base64 for your open() helper
-    const cipher = (k.encryptedApiKey as any as Buffer).toString("base64");
-    const nonce = (k.nonceApi as any as Buffer).toString("base64");
+    // Pass raw Buffers directly to open()
+    const cipher = k.encryptedApiKey as unknown as Uint8Array;
+    const nonce = k.nonceApi as unknown as Uint8Array;
     return open(cipher, nonce);
   } catch {
     return null;
@@ -88,7 +88,7 @@ export async function fetchAveragePrices(): Promise<{ prices: PriceMap; asOf: st
   if (!resp.ok) return null;
 
   const json = await resp.json().catch(() => null);
-  const row = json?.data?.tradeprices?.data?.[0];
+  const row = (json as any)?.data?.tradeprices?.data?.[0];
   if (!row) return null;
 
   const prices: PriceMap = {
