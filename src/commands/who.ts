@@ -8,7 +8,7 @@ import {
   type User,
 } from "discord.js";
 import { PrismaClient } from "@prisma/client";
-import fetch from "node-fetch";
+// ❌ removed: import fetch from "node-fetch";
 import * as cryptoMod from "../lib/crypto.js";
 
 const prisma = new PrismaClient();
@@ -40,22 +40,13 @@ export const data = new SlashCommandBuilder()
   .setName("who")
   .setDescription("Look up a nation by nation name, leader name, or Discord user (linked).")
   .addStringOption(o =>
-    o
-      .setName("nation")
-      .setDescription("Nation name (exact or partial)")
-      .setRequired(false),
+    o.setName("nation").setDescription("Nation name (exact or partial)").setRequired(false),
   )
   .addStringOption(o =>
-    o
-      .setName("leader")
-      .setDescription("Leader name (exact or partial)")
-      .setRequired(false),
+    o.setName("leader").setDescription("Leader name (exact or partial)").setRequired(false),
   )
   .addUserOption(o =>
-    o
-      .setName("user")
-      .setDescription("Discord user (uses linked nation if available)")
-      .setRequired(false),
+    o.setName("user").setDescription("Discord user (uses linked nation if available)").setRequired(false),
   );
 
 export async function execute(i: ChatInputCommandInteraction) {
@@ -219,9 +210,7 @@ async function fetchNationById(id: number, guildId?: string): Promise<NationCore
   return null;
 }
 
-/**
- * Returns up to 5 nations, sorted by score DESC, best match first.
- */
+/** Returns up to 5 nations, sorted by score DESC, best match first. */
 async function searchNations(
   opts: { nationName?: string; leaderName?: string },
   guildId?: string,
@@ -277,7 +266,10 @@ async function searchNations(
       const j: any = await r.json();
       const arr = j?.data?.nations?.data ?? [];
       for (const n of arr) out.push(mapNationGraphQL(n));
-      if (out.length) return out;
+      if (out.length) {
+        out.sort((a, b) => (b.score ?? -1) - (a.score ?? -1));
+        return out.slice(0, 5);
+      }
     }
   }
 
@@ -294,7 +286,6 @@ async function searchNations(
     }
   }
 
-  // sort best-first by score when we have it
   out.sort((a, b) => (b.score ?? -1) - (a.score ?? -1));
   return out.slice(0, 5);
 }
