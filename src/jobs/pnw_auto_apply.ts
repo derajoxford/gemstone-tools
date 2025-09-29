@@ -2,13 +2,13 @@
 import { Client } from "discord.js";
 import { Prisma, PrismaClient } from "@prisma/client";
 
-// --- constants --------------------------------------------------------------
 const prisma = new PrismaClient();
 
+// --- constants --------------------------------------------------------------
 const SENDER_NATION = 1;
-const RECEIVER_ALLIANCE = 3; // allow 2 (bank) and 3 (alliance)
-const WINDOW_MS = Number(process.env.AUTO_CREDIT_WINDOW_MS ?? 2 * 24 * 60 * 60 * 1000); // default 48h
-const POLL_MS = Number(process.env.AUTO_CREDIT_POLL_MS ?? 5 * 60 * 1000); // default 5m
+const RECEIVER_ALLIANCE = 3; // also accept 2 (bank) below
+const WINDOW_MS = Number(process.env.AUTO_CREDIT_WINDOW_MS ?? 2 * 24 * 60 * 60 * 1000); // 48h
+const POLL_MS = Number(process.env.AUTO_CREDIT_POLL_MS ?? 5 * 60 * 1000); // 5m
 
 // --- helpers ---------------------------------------------------------------
 function parseDateSafe(v: any): Date {
@@ -20,7 +20,11 @@ function toDecimal(n: number | string): Prisma.Decimal {
   return new Prisma.Decimal(Number(n) || 0);
 }
 
-async function dmUser(client: Client | undefined, discordId: string | null | undefined, lines: string[]) {
+async function dmUser(
+  client: Client | undefined,
+  discordId: string | null | undefined,
+  lines: string[]
+) {
   if (!client || !discordId) return;
   try {
     const user = await client.users.fetch(discordId).catch(() => null);
@@ -32,6 +36,9 @@ async function dmUser(client: Client | undefined, discordId: string | null | und
 }
 
 // --- live PnW API fallback --------------------------------------------------
+// NOTE: API schema differences:
+// - Root field often returns a paginator, so we query: alliances(id:[...]) { data { id bankrecs { ... } } }
+// - We also OMIT any args on bankrecs to avoid "first/limit" incompatibility across shards.
 async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) {
   try {
     const keyrec = await prisma.allianceApiKey.findUnique({ where: { allianceId } });
@@ -41,36 +48,36 @@ async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) 
       return [];
     }
 
-    // PnW v3 GraphQL works reliably with api_key in the query string
     const base = process.env.PNW_GRAPHQL_URL || "https://api.politicsandwar.com/graphql";
     const url = new URL(base);
     url.searchParams.set("api_key", apiKey);
 
-    // NOTE: API changed: bankrecs uses `limit:` (NOT `first:`)
     const query = `
       {
         alliances(id:[${allianceId}]) {
-          id
-          bankrecs(limit: 100) {
+          data {
             id
-            date
-            note
-            sender_type
-            sender_id
-            receiver_type
-            receiver_id
-            money
-            food
-            coal
-            oil
-            uranium
-            lead
-            iron
-            bauxite
-            gasoline
-            munitions
-            steel
-            aluminum
+            bankrecs {
+              id
+              date
+              note
+              sender_type
+              sender_id
+              receiver_type
+              receiver_id
+              money
+              food
+              coal
+              oil
+              uranium
+              lead
+              iron
+              bauxite
+              gasoline
+              munitions
+              steel
+              aluminum
+            }
           }
         }
       }
@@ -97,15 +104,19 @@ async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) 
       return [];
     }
 
-    // Expect: { data: { alliances: [ { id, bankrecs: [...] } ] } }
-    const recs: any[] = json?.data?.alliances?.[0]?.bankrecs ?? [];
+    // works whether API uses paginator or direct array
+    const alliancesArr: any[] =
+      json?.data?.alliances?.data ??
+      json?.data?.alliances ??
+      [];
+
+    const recs: any[] = alliancesArr?.[0]?.bankrecs ?? [];
     const cutoff = since.getTime();
 
     const mapped = recs
       .map((r) => {
         const created_at = parseDateSafe(r.date);
         return {
-          // normalize to one shape we use everywhere
           id: String(r.id),
           date: created_at,
           created_at,
@@ -126,7 +137,9 @@ async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) 
       )
       .sort((a, b) => a.created_at.getTime() - b.created_at.getTime());
 
-    console.log(`[auto-credit] PnW API fallback fetched ${mapped.length} rows for alliance ${allianceId}`);
+    console.log(
+      `[auto-credit] PnW API fallback fetched ${mapped.length} rows for alliance ${allianceId}`
+    );
     return mapped;
   } catch (e) {
     console.warn("[auto-credit] PnW API fallback error:", e);
@@ -138,7 +151,7 @@ async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) 
 async function fetchRecentRows(p: PrismaClient, allianceId: number) {
   const since = new Date(Date.now() - WINDOW_MS);
 
-  // Legacy table
+  // Legacy table (what you already have data in)
   const legacy = await p.bankrec.findMany({
     where: {
       allianceId,
@@ -150,7 +163,6 @@ async function fetchRecentRows(p: PrismaClient, allianceId: number) {
     take: 1000,
   });
 
-  // Map legacy to our normalized shape
   const mappedLegacy = legacy.map((r: any) => {
     const created_at = parseDateSafe(r.date);
     return {
@@ -167,10 +179,9 @@ async function fetchRecentRows(p: PrismaClient, allianceId: number) {
     };
   });
 
-  // Live API
+  // Live API fallback merged in
   const live = await fetchAllianceDepositsFromPnWAPI(allianceId, since);
 
-  // Merge + dedupe by bankrec id string
   const combined: any[] = [...mappedLegacy, ...live];
   const seen = new Set<string>();
   const deduped = combined.filter((r) => {
@@ -189,7 +200,9 @@ async function fetchRecentRows(p: PrismaClient, allianceId: number) {
 // --- per-alliance processing ------------------------------------------------
 async function processAlliance(allianceId: number, client: Client | undefined) {
   const { rows, source } = await fetchRecentRows(prisma, allianceId);
-  console.log(`[auto-credit] alliance ${allianceId} fetched ${rows.length} rows (source=${source})`);
+  console.log(
+    `[auto-credit] alliance ${allianceId} fetched ${rows.length} rows (source=${source})`
+  );
 
   let processed = 0;
 
@@ -199,11 +212,11 @@ async function processAlliance(allianceId: number, client: Client | undefined) {
     const amount = Number(r.money ?? 0);
     if (!amount || amount <= 0) continue;
 
-    // idempotency: if we already created a SafeTxn with this reason, skip
+    // idempotency (if reason exists, skip)
     const existing = await prisma.safeTxn.findFirst({ where: { reason } });
     if (existing) continue;
 
-    // find member by nationId within this alliance
+    // map sender nation -> member in same alliance
     const nationIdNum = Number(r.sender_id);
     if (!nationIdNum || Number.isNaN(nationIdNum)) continue;
 
@@ -213,20 +226,19 @@ async function processAlliance(allianceId: number, client: Client | undefined) {
     });
     if (!member) continue;
 
-    // apply credit in a transaction
     await prisma.$transaction(async (tx) => {
-      // create ledger txn
+      // 1) ledger
       await tx.safeTxn.create({
         data: {
           memberId: member.id,
           resource: "money",
           amount: toDecimal(amount),
-          type: "AUTO_CREDIT" as any, // enum in schema
+          type: "AUTO_CREDIT" as any,
           reason,
         },
       });
 
-      // upsert safekeeping balance
+      // 2) balance
       await tx.safekeeping.upsert({
         where: { memberId: member.id },
         create: {
@@ -248,7 +260,6 @@ async function processAlliance(allianceId: number, client: Client | undefined) {
       });
     });
 
-    // DM the depositor (if we know their Discord)
     await dmUser(client, member.discordId, [
       `**Deposit Credited to Safekeeping**`,
       `Alliance deposit detected`,
@@ -279,10 +290,8 @@ async function tickOnce(client: Client | undefined) {
 export function startAutoApply(client: Client | undefined) {
   console.log(`[auto-credit] mode=rolling-window windowMs=${WINDOW_MS} pollMs=${POLL_MS}`);
 
-  // first immediate tick
   tickOnce(client).catch((e) => console.warn("[auto-credit] initial tick error", e));
 
-  // then periodic
   setInterval(() => {
     tickOnce(client).catch((e) => console.warn("[auto-credit] periodic tick error", e));
   }, POLL_MS);
