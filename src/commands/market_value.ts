@@ -85,4 +85,151 @@ function collectSafekeep(safe: any): Partial<Record<Resource, number>> {
   return out;
 }
 
-export const data =
+export const data = new SlashCommandBuilder()
+  .setName("market_value")
+  .setDescription("Show the $ market value of a member's safekeeping (avg PnW prices).")
+  .addUserOption((opt) =>
+    opt
+      .setName("member")
+      .setDescription("View another member (must exist in Member table).")
+      .setRequired(false)
+  );
+
+export async function execute(i: ChatInputCommandInteraction) {
+  try {
+    await i.deferReply({ ephemeral: true });
+
+    const targetUser = i.options.getUser("member") ?? i.user;
+
+    // Resolve Member + Safekeeping robustly
+    let member =
+      (await prisma.member.findFirst({ where: { discordId: targetUser.id } })) ||
+      null;
+
+    let safe =
+      member &&
+      (await prisma.safekeeping.findFirst({ where: { memberId: member.id } }));
+
+    if (!safe) {
+      const viaSafe = await prisma.safekeeping.findFirst({
+        where: { member: { discordId: targetUser.id } },
+        include: { member: true },
+      });
+      if (viaSafe) {
+        safe = viaSafe;
+        member = viaSafe.member;
+      }
+    }
+
+    if (!member) {
+      await i.editReply(
+        "No safekeeping account found for that member. If this is you, link your account first (e.g., `/link_nation`) or ask a banker to add you."
+      );
+      return;
+    }
+
+    if (!safe) {
+      safe = await prisma.safekeeping.create({ data: { memberId: member.id } });
+    }
+
+    const qtys = collectSafekeep(safe);
+
+    // Prices (GraphQL → REST → money-only) with internal timeouts
+    const pricing = await fetchAveragePrices();
+    if (!pricing) {
+      await i.editReply("Market data is unavailable right now. Please try again later.");
+      return;
+    }
+    const { prices, asOf, source } = pricing;
+
+    // Build fields
+    const fields: { name: string; value: string; inline: boolean }[] = [];
+    const missing: string[] = [];
+    let anyPriced = false;
+
+    const getPrice = (res: Resource, pmap: PriceMap) =>
+      Number.isFinite(pmap[res] as number) ? (pmap[res] as number) : undefined;
+
+    for (const { key, label } of ORDER) {
+      const qty = Number(qtys[key] ?? 0);
+      if (!qty || qty <= 0) continue;
+
+      const price = getPrice(key, prices);
+      if (price === undefined) {
+        const qtyStr =
+          key === "money"
+            ? `$${Math.round(qty).toLocaleString("en-US")}`
+            : qty.toLocaleString("en-US");
+        fields.push({
+          name: `${E[key]} ${label}`,
+          value: `*price unavailable*\n${qtyStr}`,
+          inline: true,
+        });
+        if (key !== "money") missing.push(label);
+        continue;
+      }
+
+      const qtyStr =
+        key === "money"
+          ? `$${Math.round(qty).toLocaleString("en-US")}`
+          : qty.toLocaleString("en-US");
+      const priceStr =
+        key === "money"
+          ? "$1"
+          : `$${Number(price).toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
+      const valueStr = fmtMoney(qty * price);
+
+      fields.push({
+        name: `${E[key]} ${label}`,
+        value: `**${valueStr}**\n${qtyStr} × ${priceStr}`,
+        inline: true,
+      });
+      anyPriced = true;
+    }
+
+    if (!anyPriced && (qtys.money ?? 0) > 0) {
+      const money = Number(qtys.money ?? 0);
+      fields.push({
+        name: `${E.money} Money`,
+        value: `**${fmtMoney(money)}**\n$${Math.round(money).toLocaleString("en-US")} × $1`,
+        inline: true,
+      });
+    }
+
+    const total = computeTotalValue(
+      {
+        money: Number(qtys.money ?? 0),
+        food: Number(qtys.food ?? 0),
+        coal: Number(qtys.coal ?? 0),
+        oil: Number(qtys.oil ?? 0),
+        uranium: Number(qtys.uranium ?? 0),
+        lead: Number(qtys.lead ?? 0),
+        iron: Number(qtys.iron ?? 0),
+        bauxite: Number(qtys.bauxite ?? 0),
+        gasoline: Number(qtys.gasoline ?? 0),
+        munitions: Number(qtys.munitions ?? 0),
+        steel: Number(qtys.steel ?? 0),
+        aluminum: Number(qtys.aluminum ?? 0),
+      },
+      prices
+    );
+
+    const footerBits = [`Source: ${source}`, `As of ${new Date(asOf).toLocaleString()}`];
+    if (missing.length) footerBits.push(`No prices for: ${missing.join(", ")}`);
+
+    const embed = new EmbedBuilder()
+      .setTitle(`Market Value — ${member.nationName || targetUser.username}`)
+      .addFields(
+        ...fields,
+        { name: "Total Market Value", value: `🎯 **${fmtMoney(total)}**`, inline: false }
+      )
+      .setFooter({ text: footerBits.join(" • ") });
+
+    await i.editReply({ embeds: [embed] });
+  } catch (err) {
+    // Last-resort safety to avoid crashing the bot
+    try {
+      await i.editReply("Sorry, something went wrong while valuing the safekeeping.");
+    } catch {}
+  }
+}
