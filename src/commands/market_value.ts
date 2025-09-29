@@ -1,237 +1,229 @@
-// src/commands/market_value.ts
-import {
-  SlashCommandBuilder,
-  ChatInputCommandInteraction,
-  EmbedBuilder,
-} from "discord.js";
+// src/lib/market.ts
 import { PrismaClient } from "@prisma/client";
-import {
-  fetchAveragePrices,
-  computeTotalValue,
-  fmtMoney,
-  Resource,
-  PriceMap,
-} from "../lib/market.js";
+import * as cryptoMod from "./crypto.js";
 
 const prisma = new PrismaClient();
+// crypto.open expects Uint8Array/Buffer inputs.
+const open = (cryptoMod as any).open as (cipher: Uint8Array, nonce: Uint8Array) => string;
 
-// Emojis for quick scanning
-const E: Record<Resource, string> = {
-  money: "💵",
-  food: "🍞",
-  coal: "⚫",
-  oil: "🛢️",
-  uranium: "☢️",
-  lead: "🔩",
-  iron: "⛓️",
-  bauxite: "🧱",
-  gasoline: "⛽",
-  munitions: "💣",
-  steel: "🛠️",
-  aluminum: "🧪",
-  credits: "🎟️",
+export type Resource =
+  | "money"
+  | "food"
+  | "coal"
+  | "oil"
+  | "uranium"
+  | "lead"
+  | "iron"
+  | "bauxite"
+  | "gasoline"
+  | "munitions"
+  | "steel"
+  | "aluminum"
+  | "credits";
+
+export type PriceMap = Partial<Record<Resource, number>>;
+export type PriceResult = {
+  prices: PriceMap;
+  asOf: string;
+  source: "GraphQL avg" | "REST avg" | "money-only";
 };
 
-// Display order
-const ORDER: Array<{ key: Resource; label: string }> = [
-  { key: "money", label: "Money" },
-  { key: "food", label: "Food" },
-  { key: "coal", label: "Coal" },
-  { key: "oil", label: "Oil" },
-  { key: "uranium", label: "Uranium" },
-  { key: "lead", label: "Lead" },
-  { key: "iron", label: "Iron" },
-  { key: "bauxite", label: "Bauxite" },
-  { key: "gasoline", label: "Gasoline" },
-  { key: "munitions", label: "Munitions" },
-  { key: "steel", label: "Steel" },
-  { key: "aluminum", label: "Aluminum" },
-  // { key: "credits", label: "Credits" }, // enable if you store credits
+const RESOURCES_FOR_REST: Exclude<Resource, "money" | "credits">[] = [
+  "food",
+  "coal",
+  "oil",
+  "uranium",
+  "lead",
+  "iron",
+  "bauxite",
+  "gasoline",
+  "munitions",
+  "steel",
+  "aluminum",
 ];
 
-// Safekeep aliases → normalize to our Resource keys
-const SAFE_ALIASES: Record<Resource, string[]> = {
-  money: ["money", "cash", "bank"],
-  food: ["food"],
-  coal: ["coal"],
-  oil: ["oil"],
-  uranium: ["uranium", "uran"],
-  lead: ["lead"],
-  iron: ["iron"],
-  bauxite: ["bauxite", "baux"],
-  gasoline: ["gasoline", "gas", "fuel"],
-  munitions: ["munitions", "muni", "ammo", "ammunition"],
-  steel: ["steel"],
-  aluminum: ["aluminum", "aluminium", "alum"],
-  credits: ["credits", "credit"],
-};
-
-// Pull numeric qty from safekeep object by alias list
-function readQty(safe: any, aliases: string[]): number {
-  for (const k of aliases) {
-    const v = (safe as any)[k];
-    if (v !== undefined && v !== null) {
-      const n = Number(v);
-      if (Number.isFinite(n)) return n;
-    }
-  }
-  return 0;
+function normalize(n: any): number | null {
+  if (n === null || n === undefined) return null;
+  const x = Number(n);
+  return Number.isFinite(x) ? x : null;
 }
 
-// Collect all resource quantities from safekeep with alias support
-function collectSafekeep(safe: any): Partial<Record<Resource, number>> {
-  const out: Partial<Record<Resource, number>> = {};
-  (Object.keys(SAFE_ALIASES) as Resource[]).forEach((res) => {
-    const qty = readQty(safe, SAFE_ALIASES[res]);
-    if (qty > 0) out[res] = qty;
+async function getAnyPnwApiKey(): Promise<string | null> {
+  const k = await prisma.allianceKey.findFirst({ orderBy: { id: "desc" } });
+  if (!k) return null;
+  try {
+    const cipher = k.encryptedApiKey as unknown as Uint8Array;
+    const nonce = k.nonceApi as unknown as Uint8Array;
+    return open(cipher, nonce);
+  } catch {
+    return null;
+  }
+}
+
+/* ----------------------------- HTTP helpers ----------------------------- */
+
+async function fetchJsonLenient(url: string): Promise<any | null> {
+  try {
+    const r = await fetch(url, {
+      headers: {
+        Accept: "application/json,text/plain;q=0.9,*/*;q=0.8",
+        "User-Agent": "gemstone-tools/0.1 (+discord bot)",
+      },
+    });
+    if (!r.ok) return null;
+
+    try {
+      return await r.json();
+    } catch {
+      const txt = await r.text();
+      try {
+        return JSON.parse(
+          txt
+            .replace(/'/g, '"') // some legacy endpoints reply with single quotes
+            .replace(/,\s*}/g, "}")
+            .replace(/,\s*]/g, "]")
+        );
+      } catch {
+        return null;
+      }
+    }
+  } catch {
+    return null;
+  }
+}
+
+/* --------------------------- GraphQL tradeprices -------------------------- */
+/** Primary: GraphQL `tradeprices` (avg prices, daily). */
+async function fetchAveragePricesGraphQL(apiKey: string): Promise<PriceResult | null> {
+  try {
+    const url = `https://api.politicsandwar.com/graphql?api_key=${encodeURIComponent(apiKey)}`;
+    const query = `
+      query LatestTradeprices {
+        tradeprices(first: 1, orderBy: [{column: ID, order: DESC}]) {
+          data {
+            date
+            aluminum
+            bauxite
+            coal
+            food
+            gasoline
+            iron
+            lead
+            munitions
+            oil
+            steel
+            uranium
+            credits
+          }
+        }
+      }
+    `;
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        // Some clients use header auth; include it to avoid spurious 500s
+        "X-Api-Key": apiKey,
+        "User-Agent": "gemstone-tools/0.1 (+discord bot)",
+      },
+      body: JSON.stringify({ query }),
+    });
+    if (!resp.ok) return null;
+    const json = await resp.json().catch(() => null);
+    const row = (json as any)?.data?.tradeprices?.data?.[0];
+    if (!row) return null;
+
+    const prices: PriceMap = {
+      money: 1,
+      food: normalize(row.food) ?? undefined,
+      coal: normalize(row.coal) ?? undefined,
+      oil: normalize(row.oil) ?? undefined,
+      uranium: normalize(row.uranium) ?? undefined,
+      lead: normalize(row.lead) ?? undefined,
+      iron: normalize(row.iron) ?? undefined,
+      bauxite: normalize(row.bauxite) ?? undefined,
+      gasoline: normalize(row.gasoline) ?? undefined,
+      munitions: normalize(row.munitions) ?? undefined,
+      steel: normalize(row.steel) ?? undefined,
+      aluminum: normalize(row.aluminum) ?? undefined,
+      credits: normalize(row.credits) ?? undefined,
+    };
+
+    return { prices, asOf: String(row.date), source: "GraphQL avg" };
+  } catch {
+    return null;
+  }
+}
+
+/* ----------------------------- REST tradeprice ---------------------------- */
+/**
+ * Fallback: legacy `/api/tradeprice` endpoint on politicsandwar.com (returns `avgprice`).
+ * Tries both `?resource=iron` and `/resource=iron` URL styles, with and without key.
+ */
+async function fetchAveragePricesREST(apiKey: string): Promise<PriceResult | null> {
+  const prices: PriceMap = { money: 1 };
+  let gotAny = false;
+
+  for (const res of RESOURCES_FOR_REST) {
+    const q = encodeURIComponent(res);
+    const candidates = [
+      // canonical host (docs/examples)
+      `https://politicsandwar.com/api/tradeprice/?resource=${q}&key=${encodeURIComponent(apiKey)}`,
+      `https://politicsandwar.com/api/tradeprice?resource=${q}&key=${encodeURIComponent(apiKey)}`,
+      `https://politicsandwar.com/api/tradeprice/resource=${q}&key=${encodeURIComponent(apiKey)}`,
+      // public (no key)
+      `https://politicsandwar.com/api/tradeprice/?resource=${q}`,
+      `https://politicsandwar.com/api/tradeprice?resource=${q}`,
+      `https://politicsandwar.com/api/tradeprice/resource=${q}`,
+    ];
+
+    let avg: number | null = null;
+    for (const url of candidates) {
+      const json = await fetchJsonLenient(url);
+      const candidate = normalize((json as any)?.avgprice);
+      if (candidate !== null) {
+        avg = candidate;
+        break;
+      }
+    }
+
+    if (avg !== null) {
+      (prices as any)[res] = avg;
+      gotAny = true;
+    }
+  }
+
+  return gotAny ? { prices, asOf: new Date().toISOString(), source: "REST avg" } : null;
+}
+
+/* ------------------------------- Public API ------------------------------- */
+/** GraphQL first, then REST; last resort = money-only so the command never fails. */
+export async function fetchAveragePrices(): Promise<PriceResult | null> {
+  const apiKey = await getAnyPnwApiKey();
+  if (!apiKey) return null;
+
+  const g = await fetchAveragePricesGraphQL(apiKey);
+  if (g) return g;
+
+  const r = await fetchAveragePricesREST(apiKey);
+  if (r) return r;
+
+  return { prices: { money: 1 }, asOf: new Date().toISOString(), source: "money-only" };
+}
+
+export function computeTotalValue(
+  safekeep: Partial<Record<Resource, number>>,
+  prices: PriceMap
+): number {
+  let total = 0;
+  (Object.keys(prices) as Resource[]).forEach((res) => {
+    const qty = Number(safekeep[res] ?? 0);
+    const p = prices[res];
+    if (Number.isFinite(qty) && Number.isFinite(p)) total += qty * (p as number);
   });
-  // Always include money (even if 0) so totals still reflect cash
-  if (out.money === undefined) out.money = readQty(safe, SAFE_ALIASES.money);
-  return out;
+  return total;
 }
 
-export const data = new SlashCommandBuilder()
-  .setName("market_value")
-  .setDescription("Show the $ market value of a member's safekeeping (avg PnW prices).")
-  .addUserOption((opt) =>
-    opt
-      .setName("member")
-      .setDescription("View another member (must exist in Member table).")
-      .setRequired(false)
-  );
-
-export async function execute(i: ChatInputCommandInteraction) {
-  await i.deferReply({ ephemeral: true });
-
-  const targetUser = i.options.getUser("member") ?? i.user;
-
-  // Resolve Member + Safekeeping robustly
-  let member =
-    (await prisma.member.findFirst({ where: { discordId: targetUser.id } })) || null;
-
-  let safe =
-    member &&
-    (await prisma.safekeeping.findFirst({ where: { memberId: member.id } }));
-
-  if (!safe) {
-    const viaSafe = await prisma.safekeeping.findFirst({
-      where: { member: { discordId: targetUser.id } },
-      include: { member: true },
-    });
-    if (viaSafe) {
-      safe = viaSafe;
-      member = viaSafe.member;
-    }
-  }
-
-  if (!member) {
-    await i.editReply(
-      "No safekeeping account found for that member. If this is you, link your account first (e.g., `/link_nation`) or ask a banker to add you."
-    );
-    return;
-  }
-
-  if (!safe) {
-    safe = await prisma.safekeeping.create({ data: { memberId: member.id } });
-  }
-
-  // Quantities (alias-aware)
-  const qtys = collectSafekeep(safe);
-
-  // Fetch prices (GraphQL → REST → money-only)
-  const pricing = await fetchAveragePrices().catch(() => null);
-  if (!pricing) {
-    await i.editReply("Market data is unavailable right now. Please try again later.");
-    return;
-  }
-  const { prices, asOf, source } = pricing;
-
-  // Build fields — split into priced vs unpriced so we always show your holdings
-  const fields: { name: string; value: string; inline: boolean }[] = [];
-  const missing: string[] = [];
-  let anyPriced = false;
-
-  const getPrice = (res: Resource, pmap: PriceMap) =>
-    Number.isFinite(pmap[res] as number) ? (pmap[res] as number) : undefined;
-
-  for (const { key, label } of ORDER) {
-    const qty = Number(qtys[key] ?? 0);
-    if (!qty || qty <= 0) continue;
-
-    const price = getPrice(key, prices);
-    if (price === undefined) {
-      // Show the resource even if price is unavailable
-      const qtyStr =
-        key === "money"
-          ? `$${Math.round(qty).toLocaleString("en-US")}`
-          : qty.toLocaleString("en-US");
-      fields.push({
-        name: `${E[key]} ${label}`,
-        value: `*price unavailable*\n${qtyStr}`,
-        inline: true,
-      });
-      if (key !== "money") missing.push(label);
-      continue;
-    }
-
-    const qtyStr =
-      key === "money"
-        ? `$${Math.round(qty).toLocaleString("en-US")}`
-        : qty.toLocaleString("en-US");
-    const priceStr =
-      key === "money"
-        ? "$1"
-        : `$${Number(price).toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
-    const valueStr = fmtMoney(qty * price);
-
-    fields.push({
-      name: `${E[key]} ${label}`,
-      value: `**${valueStr}**\n${qtyStr} × ${priceStr}`,
-      inline: true,
-    });
-    anyPriced = true;
-  }
-
-  if (!anyPriced && (qtys.money ?? 0) > 0) {
-    // fall back to money line if literally nothing else priced
-    const money = Number(qtys.money ?? 0);
-    fields.push({
-      name: `${E.money} Money`,
-      value: `**${fmtMoney(money)}**\n$${Math.round(money).toLocaleString("en-US")} × $1`,
-      inline: true,
-    });
-  }
-
-  // Compute total using priced resources only
-  const total = computeTotalValue(
-    {
-      money: Number(qtys.money ?? 0),
-      food: Number(qtys.food ?? 0),
-      coal: Number(qtys.coal ?? 0),
-      oil: Number(qtys.oil ?? 0),
-      uranium: Number(qtys.uranium ?? 0),
-      lead: Number(qtys.lead ?? 0),
-      iron: Number(qtys.iron ?? 0),
-      bauxite: Number(qtys.bauxite ?? 0),
-      gasoline: Number(qtys.gasoline ?? 0),
-      munitions: Number(qtys.munitions ?? 0),
-      steel: Number(qtys.steel ?? 0),
-      aluminum: Number(qtys.aluminum ?? 0),
-      // credits: Number(qtys.credits ?? 0),
-    },
-    prices
-  );
-
-  const footerBits = [`Source: ${source}`, `As of ${new Date(asOf).toLocaleString()}`];
-  if (missing.length) footerBits.push(`No prices for: ${missing.join(", ")}`);
-
-  const embed = new EmbedBuilder()
-    .setTitle(`Market Value — ${member.nationName || targetUser.username}`)
-    .addFields(
-      ...fields,
-      { name: "Total Market Value", value: `🎯 **${fmtMoney(total)}**`, inline: false }
-    )
-    .setFooter({ text: footerBits.join(" • ") });
-
-  await i.editReply({ embeds: [embed] });
+export function fmtMoney(n: number): string {
+  return `$${Math.round(n).toLocaleString("en-US")}`;
 }
