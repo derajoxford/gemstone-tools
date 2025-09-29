@@ -14,7 +14,6 @@ import {
 
 const prisma = new PrismaClient();
 
-// Order & labels for display
 const RESOURCE_ORDER: Array<{ key: Resource; label: string }> = [
   { key: "money", label: "Money" },
   { key: "food", label: "Food" },
@@ -37,7 +36,7 @@ export const data = new SlashCommandBuilder()
   .addUserOption((opt) =>
     opt
       .setName("member")
-      .setDescription("View another member (admin/banker rules still apply).")
+      .setDescription("View another member (must exist in Member table).")
       .setRequired(false)
   );
 
@@ -46,9 +45,9 @@ export async function execute(i: ChatInputCommandInteraction) {
 
   const targetUser = i.options.getUser("member") ?? i.user;
 
+  // Member has no 'safekeeping' relation in your Prisma schema; fetch separately.
   const member = await prisma.member.findFirst({
     where: { discordId: targetUser.id },
-    include: { safekeeping: true },
   });
 
   if (!member) {
@@ -56,22 +55,22 @@ export async function execute(i: ChatInputCommandInteraction) {
     return;
   }
 
-  const safe =
-    member.safekeeping ??
-    (await prisma.safekeeping.create({ data: { memberId: member.id } }));
-
-  const pricing = await fetchAveragePrices().catch(() => null);
-
-  if (!pricing) {
-    await i.editReply(
-      "Market data is unavailable right now. Please try again later."
-    );
-    return;
+  // Safekeeping is a separate table; fetch or create it by memberId
+  let safe = await prisma.safekeeping.findFirst({
+    where: { memberId: member.id },
+  });
+  if (!safe) {
+    safe = await prisma.safekeeping.create({ data: { memberId: member.id } });
   }
 
+  const pricing = await fetchAveragePrices().catch(() => null);
+  if (!pricing) {
+    await i.editReply("Market data is unavailable right now. Please try again later.");
+    return;
+  }
   const { prices, asOf } = pricing;
 
-  // Build valuation lines (only show rows with a positive quantity)
+  // Per-resource lines (only show positive qty & known price)
   const lines: string[] = [];
   let any = false;
   for (const { key, label } of RESOURCE_ORDER) {
@@ -80,28 +79,20 @@ export async function execute(i: ChatInputCommandInteraction) {
     if (!qty || qty <= 0 || !Number.isFinite(price)) continue;
 
     const value = qty * (price as number);
-
     const qtyStr =
       key === "money"
         ? `$${Math.round(qty).toLocaleString("en-US")}`
         : qty.toLocaleString("en-US");
-
     const priceStr =
       key === "money"
         ? "$1"
-        : `$${Number(price).toLocaleString("en-US", {
-            maximumFractionDigits: 0,
-          })}`;
-
+        : `$${Number(price).toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
     const valueStr = fmtMoney(value);
 
     lines.push(`**${label}** — ${qtyStr} × ${priceStr} = **${valueStr}**`);
     any = true;
   }
-
-  if (!any) {
-    lines.push("_No positive balances to value._");
-  }
+  if (!any) lines.push("_No positive balances to value._");
 
   // Total
   const total = computeTotalValue(
@@ -118,13 +109,13 @@ export async function execute(i: ChatInputCommandInteraction) {
       munitions: Number(safe.munitions ?? 0),
       steel: Number(safe.steel ?? 0),
       aluminum: Number(safe.aluminum ?? 0),
-      // credits: Number((safe as any).credits ?? 0), // enable if present
+      // credits: Number((safe as any).credits ?? 0),
     },
     prices
   );
 
   const embed = new EmbedBuilder()
-    .setTitle(`Market Value — ${member.discordHandle ?? targetUser.username}`)
+    .setTitle(`Market Value — ${member.nationName || targetUser.username}`)
     .setDescription(lines.join("\n"))
     .addFields({
       name: "Total Market Value",
