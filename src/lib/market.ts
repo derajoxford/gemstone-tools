@@ -3,7 +3,7 @@ import { PrismaClient } from "@prisma/client";
 import * as cryptoMod from "./crypto.js"; // same folder
 
 const prisma = new PrismaClient();
-// Your crypto.open expects Uint8Array/Buffer inputs.
+// crypto.open expects Uint8Array/Buffer inputs.
 const open = (cryptoMod as any).open as (cipher: Uint8Array, nonce: Uint8Array) => string;
 
 export type Resource =
@@ -52,7 +52,6 @@ async function getAnyPnwApiKey(): Promise<string | null> {
   const k = await prisma.allianceKey.findFirst({ orderBy: { id: "desc" } });
   if (!k) return null;
   try {
-    // Pass raw Buffers directly to open()
     const cipher = k.encryptedApiKey as unknown as Uint8Array;
     const nonce = k.nonceApi as unknown as Uint8Array;
     return open(cipher, nonce);
@@ -61,7 +60,41 @@ async function getAnyPnwApiKey(): Promise<string | null> {
   }
 }
 
-/** Primary: GraphQL tradeprices (average market prices, daily). */
+/* ----------------------------- HTTP helpers ----------------------------- */
+
+async function fetchJsonLenient(url: string): Promise<any | null> {
+  try {
+    const r = await fetch(url, {
+      headers: {
+        "Accept": "application/json,text/plain;q=0.9,*/*;q=0.8",
+        "User-Agent": "gemstone-tools/0.1 (+discord bot)",
+      },
+    });
+    if (!r.ok) return null;
+
+    // Prefer JSON, but fall back to text->JSON (some old endpoints return weird quotes)
+    try {
+      return await r.json();
+    } catch {
+      const txt = await r.text();
+      try {
+        return JSON.parse(
+          txt
+            .replace(/'/g, '"')       // normalize single quotes
+            .replace(/,\s*}/g, "}")   // trailing commas
+            .replace(/,\s*]/g, "]")
+        );
+      } catch {
+        return null;
+      }
+    }
+  } catch {
+    return null;
+  }
+}
+
+/* --------------------------- GraphQL tradeprices -------------------------- */
+/** Primary: GraphQL `tradeprices` (avg prices, daily). */
 async function fetchAveragePricesGraphQL(apiKey: string): Promise<PriceResult | null> {
   try {
     const url = `https://api.politicsandwar.com/graphql?api_key=${encodeURIComponent(apiKey)}`;
@@ -88,12 +121,15 @@ async function fetchAveragePricesGraphQL(apiKey: string): Promise<PriceResult | 
     `;
     const resp = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": "gemstone-tools/0.1 (+discord bot)",
+      },
       body: JSON.stringify({ query }),
     });
     if (!resp.ok) return null;
-    const json: any = await resp.json().catch(() => null);
-    const row = json?.data?.tradeprices?.data?.[0];
+    const json = await resp.json().catch(() => null);
+    const row = (json as any)?.data?.tradeprices?.data?.[0];
     if (!row) return null;
 
     const prices: PriceMap = {
@@ -118,31 +154,41 @@ async function fetchAveragePricesGraphQL(apiKey: string): Promise<PriceResult | 
   }
 }
 
+/* ----------------------------- REST tradeprice ---------------------------- */
 /**
- * Fallback: REST /tradeprice per resource (deprecated, returns avgprice).
- * Tries with key first; if that fails, retries without a key. Keeps any successes.
+ * Fallback: legacy `/tradeprice` endpoint (returns `avgprice` per resource).
+ * Try several URL variants (with/without key, slash/no-slash, https/http).
  */
 async function fetchAveragePricesREST(apiKey: string): Promise<PriceResult | null> {
-  const base = "https://api.politicsandwar.com/tradeprice/";
   const prices: PriceMap = { money: 1 };
   let gotAny = false;
 
   for (const res of RESOURCES_FOR_REST) {
-    // 1) Try with key
-    let url = `${base}?resource=${encodeURIComponent(res)}&key=${encodeURIComponent(apiKey)}&format=json`;
-    let r: any = null;
-    try { r = await fetch(url); } catch { r = null; }
+    const candidates = [
+      // https with key
+      `https://api.politicsandwar.com/tradeprice/?resource=${encodeURIComponent(res)}&key=${encodeURIComponent(apiKey)}&format=json`,
+      `https://api.politicsandwar.com/tradeprice?resource=${encodeURIComponent(res)}&key=${encodeURIComponent(apiKey)}&format=json`,
+      // https no key
+      `https://api.politicsandwar.com/tradeprice/?resource=${encodeURIComponent(res)}&format=json`,
+      `https://api.politicsandwar.com/tradeprice?resource=${encodeURIComponent(res)}&format=json`,
+      // http with key
+      `http://api.politicsandwar.com/tradeprice/?resource=${encodeURIComponent(res)}&key=${encodeURIComponent(apiKey)}&format=json`,
+      `http://api.politicsandwar.com/tradeprice?resource=${encodeURIComponent(res)}&key=${encodeURIComponent(apiKey)}&format=json`,
+      // http no key
+      `http://api.politicsandwar.com/tradeprice/?resource=${encodeURIComponent(res)}&format=json`,
+      `http://api.politicsandwar.com/tradeprice?resource=${encodeURIComponent(res)}&format=json`,
+    ];
 
-    // 2) If failed or non-200, retry without key (public)
-    if (!r || !r.ok) {
-      url = `${base}?resource=${encodeURIComponent(res)}&format=json`;
-      try { r = await fetch(url); } catch { r = null; }
+    let avg: number | null = null;
+    for (const url of candidates) {
+      const json = await fetchJsonLenient(url);
+      const candidate = normalize((json as any)?.avgprice);
+      if (candidate !== null) {
+        avg = candidate;
+        break;
+      }
     }
 
-    if (!r || !r.ok) continue;
-
-    const json: any = await r.json().catch(() => null);
-    const avg = normalize(json?.avgprice);
     if (avg !== null) {
       (prices as any)[res] = avg;
       gotAny = true;
@@ -154,7 +200,8 @@ async function fetchAveragePricesREST(apiKey: string): Promise<PriceResult | nul
     : null;
 }
 
-/** Public: GraphQL first, then REST; final money-only fallback so command never fails. */
+/* ------------------------------- Public API ------------------------------- */
+/** GraphQL first, then REST; last resort = money-only so the command never fails. */
 export async function fetchAveragePrices(): Promise<PriceResult | null> {
   const apiKey = await getAnyPnwApiKey();
   if (!apiKey) return null;
