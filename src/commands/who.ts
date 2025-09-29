@@ -188,4 +188,166 @@ async function fetchNationById(id: number, guildId?: string): Promise<NationCore
           color
           continent
           soldiers
-          ta
+          tanks
+          aircraft
+          ships
+          spies
+          missiles
+          nukes
+          projects
+          founded
+          last_active
+        }
+      }
+    `;
+    const r = await fetch("https://api.politicsandwar.com/graphql?api_key=" + api, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: gql, variables: { id: String(id) } }),
+    });
+    if (r.ok) {
+      const j: any = await r.json();
+      if (j?.data?.nation) return mapNationGraphQL(j.data.nation);
+    }
+  }
+
+  const rest = await fetch(`https://api.politicsandwar.com/v3/nations/${id}`);
+  if (rest.ok) {
+    const j: any = await rest.json();
+    if (j?.data) return mapNationREST(j.data);
+  }
+  return null;
+}
+
+/**
+ * Returns up to 5 nations, sorted by score DESC, best match first.
+ */
+async function searchNations(
+  opts: { nationName?: string; leaderName?: string },
+  guildId?: string,
+): Promise<NationCore[]> {
+  const api = await getApiKeyForGuild(guildId);
+  const out: NationCore[] = [];
+
+  if (api) {
+    const gql = `
+      query($name: String, $leader: String) {
+        nations(
+          first: 5,
+          filter: {
+            ${opts.nationName ? "nation_name: { like: $name }" : ""}
+            ${opts.leaderName ? "leader_name: { like: $leader }" : ""}
+          }
+          orderBy: [{ column: SCORE, order: DESC }]
+        ) {
+          data {
+            id
+            nation_name
+            leader_name
+            alliance_id
+            alliance { id name }
+            score
+            cities
+            color
+            continent
+            soldiers
+            tanks
+            aircraft
+            ships
+            spies
+            missiles
+            nukes
+            projects
+            founded
+            last_active
+          }
+        }
+      }
+    `;
+    const variables: any = {
+      name: opts.nationName ? `%${opts.nationName}%` : undefined,
+      leader: opts.leaderName ? `%${opts.leaderName}%` : undefined,
+    };
+    const r = await fetch("https://api.politicsandwar.com/graphql?api_key=" + api, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: gql, variables }),
+    });
+    if (r.ok) {
+      const j: any = await r.json();
+      const arr = j?.data?.nations?.data ?? [];
+      for (const n of arr) out.push(mapNationGraphQL(n));
+      if (out.length) return out;
+    }
+  }
+
+  // REST keyword fallback (public)
+  const keyword = opts.nationName ?? opts.leaderName ?? "";
+  if (keyword) {
+    const r = await fetch(
+      `https://api.politicsandwar.com/v3/nations?keyword=${encodeURIComponent(keyword)}&limit=5`,
+    );
+    if (r.ok) {
+      const j: any = await r.json();
+      const arr = j?.data ?? [];
+      for (const n of arr) out.push(mapNationREST(n));
+    }
+  }
+
+  // sort best-first by score when we have it
+  out.sort((a, b) => (b.score ?? -1) - (a.score ?? -1));
+  return out.slice(0, 5);
+}
+
+function mapNationGraphQL(n: any): NationCore {
+  return {
+    id: Number(n.id),
+    name: n.nation_name,
+    leader: n.leader_name,
+    allianceId: n.alliance?.id ? Number(n.alliance.id) : n.alliance_id ? Number(n.alliance_id) : null,
+    allianceName: n.alliance?.name ?? null,
+    score: safeNum(n.score),
+    cities: safeNum(n.cities),
+    color: n.color ?? null,
+    continent: n.continent ?? null,
+    soldiers: safeNum(n.soldiers),
+    tanks: safeNum(n.tanks),
+    aircraft: safeNum(n.aircraft),
+    ships: safeNum(n.ships),
+    spies: safeNum(n.spies),
+    missiles: safeNum(n.missiles),
+    nukes: safeNum(n.nukes),
+    projects: safeNum(n.projects),
+    founded: n.founded ?? null,
+    lastActive: n.last_active ?? null,
+  };
+}
+
+function mapNationREST(n: any): NationCore {
+  return {
+    id: Number(n.id),
+    name: n.nation_name ?? n.name ?? "",
+    leader: n.leader_name ?? n.leader ?? "",
+    allianceId: n.alliance_id ? Number(n.alliance_id) : null,
+    allianceName: n.alliance ?? n.alliance_name ?? null,
+    score: safeNum(n.score),
+    cities: safeNum(n.cities),
+    color: n.color ?? null,
+    continent: n.continent ?? null,
+    soldiers: safeNum(n.soldiers),
+    tanks: safeNum(n.tanks),
+    aircraft: safeNum(n.aircraft),
+    ships: safeNum(n.ships),
+    spies: safeNum(n.spies),
+    missiles: safeNum(n.missiles),
+    nukes: safeNum(n.nukes),
+    projects: safeNum(n.projects),
+    founded: n.founded ?? null,
+    lastActive: n.last_active ?? null,
+  };
+}
+
+function safeNum(v: any): number | null {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
