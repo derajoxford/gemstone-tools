@@ -39,10 +39,10 @@ export const data = new SlashCommandBuilder()
   .setName("who")
   .setDescription("Look up a nation by nation name, leader name, or Discord user (linked).")
   .addStringOption(o =>
-    o.setName("nation").setDescription("Nation name (exact or partial)").setRequired(false),
+    o.setName("nation").setDescription("Nation name (full or partial)").setRequired(false),
   )
   .addStringOption(o =>
-    o.setName("leader").setDescription("Leader name (exact or partial)").setRequired(false),
+    o.setName("leader").setDescription("Leader name (full or partial)").setRequired(false),
   )
   .addUserOption(o =>
     o.setName("user").setDescription("Discord user (uses linked nation if available)").setRequired(false),
@@ -50,19 +50,19 @@ export const data = new SlashCommandBuilder()
 
 export async function execute(i: ChatInputCommandInteraction) {
   await i.deferReply();
-
   try {
     const nationName = (i.options.getString("nation") || "").trim();
     const leaderName = (i.options.getString("leader") || "").trim();
     const user: User | null = i.options.getUser("user");
+    console.log("[/who] start", { nationName, leaderName, user: !!user });
 
-    // PRIORITY: nation → leader → linked Discord user (or self)
     let nation: NationCore | null = null;
     let lookedUp = "";
     let multiNote = "";
 
     if (nationName) {
       const res = await searchNations({ nationName }, i.guildId || undefined);
+      console.log("[/who] nation search results", res.length);
       if (res.length) {
         nation = res[0];
         lookedUp = `nation name "${nationName}"`;
@@ -72,6 +72,7 @@ export async function execute(i: ChatInputCommandInteraction) {
 
     if (!nation && leaderName) {
       const res = await searchNations({ leaderName }, i.guildId || undefined);
+      console.log("[/who] leader search results", res.length);
       if (res.length) {
         nation = res[0];
         lookedUp = `leader name "${leaderName}"`;
@@ -85,6 +86,7 @@ export async function execute(i: ChatInputCommandInteraction) {
         where: { discordId: targetUser.id },
         select: { nationId: true, discordId: true },
       });
+      console.log("[/who] linked member", { hasMember: !!member, nationId: member?.nationId });
       if (member?.nationId) {
         nation = await fetchNationById(member.nationId, i.guildId || undefined);
         lookedUp = `linked nation for <@${targetUser.id}>`;
@@ -94,7 +96,7 @@ export async function execute(i: ChatInputCommandInteraction) {
     if (!nation) {
       await i.editReply({
         content:
-          "I couldn't find a nation. Try one of:\n• `/who nation:<nation name>` (partial ok)\n• `/who leader:<leader name>` (partial ok)\n• `/who user:@member` (requires nation link)",
+          "I couldn't find a nation. Try one of:\n• `/who nation:<nation name>`\n• `/who leader:<leader name>`\n• `/who user:@member` (requires nation link)",
       });
       return;
     }
@@ -151,16 +153,10 @@ function fmtNum(n: number | null | undefined): string {
 }
 
 function bufToB64(b: any): string {
-  // AllianceKey buffers may come as Buffer, Uint8Array, or ArrayBuffer-like — normalize then base64.
-  // @ts-ignore
   return (Buffer.isBuffer(b) ? b : Buffer.from(b)).toString("base64");
 }
 
-/**
- * Always try DB key first (latest AllianceKey), regardless of guild.
- * If none, fall back to process.env.PNW_API.
- */
-async function getApiKeyForGuild(_guildId?: string): Promise<string | null> {
+async function getApiKeyForGuild(): Promise<string | null> {
   try {
     const k = await prisma.allianceKey.findFirst({
       orderBy: { id: "desc" },
@@ -185,8 +181,8 @@ async function getApiKeyForGuild(_guildId?: string): Promise<string | null> {
   return null;
 }
 
-async function fetchNationById(id: number, guildId?: string): Promise<NationCore | null> {
-  const api = await getApiKeyForGuild(guildId);
+async function fetchNationById(id: number): Promise<NationCore | null> {
+  const api = await getApiKeyForGuild();
 
   if (api) {
     const gql = `
@@ -222,37 +218,27 @@ async function fetchNationById(id: number, guildId?: string): Promise<NationCore
     if (r.ok) {
       const j: any = await r.json();
       if (j?.data?.nation) return mapNationGraphQL(j.data.nation);
-    } else {
-      console.warn("[/who] GraphQL fetchNationById HTTP", r.status);
     }
-  }
-
-  const rest = await fetch(`https://api.politicsandwar.com/v3/nations/${id}`);
-  if (rest.ok) {
-    const j: any = await rest.json();
-    if (j?.data) return mapNationREST(j.data);
-  } else {
-    console.warn("[/who] REST fetchNationById HTTP", rest.status);
   }
   return null;
 }
 
-/** Returns up to 5 nations, sorted by score DESC, best match first. */
 async function searchNations(
   opts: { nationName?: string; leaderName?: string },
-  guildId?: string,
 ): Promise<NationCore[]> {
-  const api = await getApiKeyForGuild(guildId);
   const out: NationCore[] = [];
+  const api = await getApiKeyForGuild();
+  const keyword = (opts.nationName ?? opts.leaderName ?? "").trim();
+  console.log("[/who] search input", { keyword, hasApi: !!api });
 
-  if (api) {
+  if (api && keyword.length >= 2) {
     const gql = `
       query($name: String, $leader: String) {
         nations(
           first: 5,
           filter: {
-            ${opts.nationName ? "nation_name: { like: $name }" : ""}
-            ${opts.leaderName ? "leader_name: { like: $leader }" : ""}
+            ${opts.nationName ? "nation_name: { contains: $name }" : ""}
+            ${opts.leaderName ? "leader_name: { contains: $leader }" : ""}
           }
           orderBy: [{ column: SCORE, order: DESC }]
         ) {
@@ -281,8 +267,8 @@ async function searchNations(
       }
     `;
     const variables: any = {
-      name: opts.nationName ? `%${opts.nationName}%` : undefined,
-      leader: opts.leaderName ? `%${opts.leaderName}%` : undefined,
+      name: opts.nationName ? keyword : undefined,
+      leader: opts.leaderName ? keyword : undefined,
     };
     const r = await fetch("https://api.politicsandwar.com/graphql?api_key=" + api, {
       method: "POST",
@@ -292,34 +278,18 @@ async function searchNations(
     if (r.ok) {
       const j: any = await r.json();
       const arr = j?.data?.nations?.data ?? [];
+      console.log("[/who] GraphQL results", arr.length);
       for (const n of arr) out.push(mapNationGraphQL(n));
       if (out.length) {
         out.sort((a, b) => (b.score ?? -1) - (a.score ?? -1));
         return out.slice(0, 5);
       }
     } else {
-      console.warn("[/who] GraphQL searchNations HTTP", r.status);
-    }
-  } else {
-    console.warn("[/who] No API key for search; REST keyword fallback only");
-  }
-
-  // REST keyword fallback (public; limited fidelity)
-  const keyword = opts.nationName ?? opts.leaderName ?? "";
-  if (keyword) {
-    const r = await fetch(
-      `https://api.politicsandwar.com/v3/nations?keyword=${encodeURIComponent(keyword)}&limit=5`,
-    );
-    if (r.ok) {
-      const j: any = await r.json();
-      const arr = j?.data ?? [];
-      for (const n of arr) out.push(mapNationREST(n));
-    } else {
-      console.warn("[/who] REST searchNations HTTP", r.status);
+      console.warn("[/who] GraphQL search HTTP", r.status);
     }
   }
 
-  out.sort((a, b) => (b.score ?? -1) - (a.score ?? -1));
+  console.warn("[/who] fallback REST (likely to be empty on your host)", { keyword });
   return out.slice(0, 5);
 }
 
@@ -330,30 +300,6 @@ function mapNationGraphQL(n: any): NationCore {
     leader: n.leader_name,
     allianceId: n.alliance?.id ? Number(n.alliance.id) : n.alliance_id ? Number(n.alliance_id) : null,
     allianceName: n.alliance?.name ?? null,
-    score: safeNum(n.score),
-    cities: safeNum(n.cities),
-    color: n.color ?? null,
-    continent: n.continent ?? null,
-    soldiers: safeNum(n.soldiers),
-    tanks: safeNum(n.tanks),
-    aircraft: safeNum(n.aircraft),
-    ships: safeNum(n.ships),
-    spies: safeNum(n.spies),
-    missiles: safeNum(n.missiles),
-    nukes: safeNum(n.nukes),
-    projects: safeNum(n.projects),
-    founded: n.founded ?? null,
-    lastActive: n.last_active ?? null,
-  };
-}
-
-function mapNationREST(n: any): NationCore {
-  return {
-    id: Number(n.id),
-    name: n.nation_name ?? n.name ?? "",
-    leader: n.leader_name ?? n.leader ?? "",
-    allianceId: n.alliance_id ? Number(n.alliance_id) : null,
-    allianceName: n.alliance ?? n.alliance_name ?? null,
     score: safeNum(n.score),
     cities: safeNum(n.cities),
     color: n.color ?? null,
