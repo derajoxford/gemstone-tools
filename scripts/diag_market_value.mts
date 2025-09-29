@@ -5,14 +5,10 @@ const prisma = new PrismaClient();
 
 async function main() {
   const discordId = process.env.DISCORD_ID || "";
-  let member: any = null;
+  let member: any =
+    (discordId && (await prisma.member.findFirst({ where: { discordId } }))) ||
+    (await prisma.member.findFirst({ orderBy: { id: "desc" } }));
 
-  if (discordId) {
-    member = await prisma.member.findFirst({ where: { discordId } });
-  }
-  if (!member) {
-    member = await prisma.member.findFirst({ orderBy: { id: "desc" } });
-  }
   if (!member) {
     console.error("No Member rows found.");
     process.exit(2);
@@ -54,4 +50,3 @@ async function main() {
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });
-
