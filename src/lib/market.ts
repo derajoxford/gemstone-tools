@@ -1,9 +1,10 @@
 // src/lib/market.ts
-import fetch from "node-fetch";
 import { PrismaClient } from "@prisma/client";
-import * as cryptoMod from "./crypto.js";
+import * as cryptoMod from "../lib/crypto.js"; // keep path consistent with your project
 
 const prisma = new PrismaClient();
+// Your crypto.open expects base64 strings (in your repo pattern)
+// so we convert Buffers to base64 before calling.
 const open = (cryptoMod as any).open as (cipher: string, nonce: string) => string;
 
 export type Resource =
@@ -29,11 +30,20 @@ function normalize(n: any): number | null {
   return Number.isFinite(x) ? x : null;
 }
 
+/**
+ * Get any saved PnW API key (most recent). AllianceKey in your schema stores
+ * encryptedApiKey: Buffer, and nonces as nonceApi (Buffer).
+ */
 async function getAnyPnwApiKey(): Promise<string | null> {
-  const k = await prisma.allianceKey.findFirst({ orderBy: { id: "desc" } });
+  const k = await prisma.allianceKey.findFirst({
+    orderBy: { id: "desc" },
+  });
   if (!k) return null;
   try {
-    return open(k.encryptedApiKey, k.nonce);
+    // Convert Buffers -> base64 for your open() helper
+    const cipher = (k.encryptedApiKey as any as Buffer).toString("base64");
+    const nonce = (k.nonceApi as any as Buffer).toString("base64");
+    return open(cipher, nonce);
   } catch {
     return null;
   }
@@ -41,7 +51,7 @@ async function getAnyPnwApiKey(): Promise<string | null> {
 
 /**
  * Fetch the most recent average market prices from PnW GraphQL.
- * Returns a { prices, asOf } pair where asOf is an ISO timestamp string.
+ * Uses Node 20 global fetch (no node-fetch dependency).
  */
 export async function fetchAveragePrices(): Promise<{ prices: PriceMap; asOf: string } | null> {
   const apiKey = await getAnyPnwApiKey();
