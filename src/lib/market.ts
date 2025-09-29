@@ -3,7 +3,7 @@ import { PrismaClient } from "@prisma/client";
 import * as cryptoMod from "./crypto.js"; // same folder
 
 const prisma = new PrismaClient();
-// Your crypto.open expects Uint8Array/Buffer inputs.
+// crypto.open expects Uint8Array/Buffer inputs.
 const open = (cryptoMod as any).open as (cipher: Uint8Array, nonce: Uint8Array) => string;
 
 export type Resource =
@@ -23,24 +23,31 @@ export type Resource =
 
 export type PriceMap = Partial<Record<Resource, number>>;
 
+const RESOURCES_FOR_REST: Exclude<Resource, "money">[] = [
+  "food",
+  "coal",
+  "oil",
+  "uranium",
+  "lead",
+  "iron",
+  "bauxite",
+  "gasoline",
+  "munitions",
+  "steel",
+  "aluminum",
+  // "credits", // REST /tradeprice historically doesn’t support credits; leave off unless confirmed
+];
+
 function normalize(n: any): number | null {
   if (n === null || n === undefined) return null;
   const x = Number(n);
   return Number.isFinite(x) ? x : null;
 }
 
-/**
- * Get any saved PnW API key (most recent). AllianceKey stores:
- * - encryptedApiKey: Buffer
- * - nonceApi: Buffer
- */
 async function getAnyPnwApiKey(): Promise<string | null> {
-  const k = await prisma.allianceKey.findFirst({
-    orderBy: { id: "desc" },
-  });
+  const k = await prisma.allianceKey.findFirst({ orderBy: { id: "desc" } });
   if (!k) return null;
   try {
-    // Pass raw Buffers directly to open()
     const cipher = k.encryptedApiKey as unknown as Uint8Array;
     const nonce = k.nonceApi as unknown as Uint8Array;
     return open(cipher, nonce);
@@ -49,14 +56,8 @@ async function getAnyPnwApiKey(): Promise<string | null> {
   }
 }
 
-/**
- * Fetch the most recent average market prices from PnW GraphQL.
- * Uses Node 20 global fetch (no node-fetch dependency).
- */
-export async function fetchAveragePrices(): Promise<{ prices: PriceMap; asOf: string } | null> {
-  const apiKey = await getAnyPnwApiKey();
-  if (!apiKey) return null;
-
+/** Try GraphQL tradeprices (avg market prices, daily). Returns null on failure. */
+async function fetchAveragePricesGraphQL(apiKey: string): Promise<{ prices: PriceMap; asOf: string } | null> {
   const url = `https://api.politicsandwar.com/graphql?api_key=${encodeURIComponent(apiKey)}`;
   const query = `
     query LatestTradeprices {
@@ -85,8 +86,8 @@ export async function fetchAveragePrices(): Promise<{ prices: PriceMap; asOf: st
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ query }),
   });
-  if (!resp.ok) return null;
 
+  if (!resp.ok) return null;
   const json = await resp.json().catch(() => null);
   const row = (json as any)?.data?.tradeprices?.data?.[0];
   if (!row) return null;
@@ -108,6 +109,57 @@ export async function fetchAveragePrices(): Promise<{ prices: PriceMap; asOf: st
   };
 
   return { prices, asOf: String(row.date) };
+}
+
+/** Fallback: REST /tradeprice per resource (deprecated, but returns avgprice). */
+async function fetchAveragePricesREST(apiKey: string): Promise<{ prices: PriceMap; asOf: string } | null> {
+  try {
+    const base = "https://api.politicsandwar.com/tradeprice/";
+    const queries = RESOURCES_FOR_REST.map(async (res) => {
+      const u = `${base}?resource=${encodeURIComponent(res)}&key=${encodeURIComponent(apiKey)}`;
+      const r = await fetch(u);
+      if (!r.ok) throw new Error(`REST ${res} http ${r.status}`);
+      const txt = await r.text();
+      // The legacy API can return non-minified single quotes; try to parse safely:
+      const json = JSON.parse(
+        txt
+          .replace(/'/g, '"') // normalize quotes
+          .replace(/,\s*}/g, "}") // trailing commas safety
+          .replace(/,\s*]/g, "]"),
+      );
+      const avg = normalize((json as any).avgprice);
+      return [res, avg] as const;
+    });
+
+    const pairs = await Promise.all(queries);
+    const p: PriceMap = { money: 1 };
+    for (const [res, avg] of pairs) {
+      if (avg !== null) (p as any)[res] = avg;
+    }
+    // REST doesn’t return a date; synthesize “as of now”.
+    return { prices: p, asOf: new Date().toISOString() };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Public: fetch average prices with GraphQL first, fallback to REST.
+ * Returns null only if both sources fail.
+ */
+export async function fetchAveragePrices(): Promise<{ prices: PriceMap; asOf: string } | null> {
+  const apiKey = await getAnyPnwApiKey();
+  if (!apiKey) return null;
+
+  // Primary: GraphQL
+  const g = await fetchAveragePricesGraphQL(apiKey);
+  if (g) return g;
+
+  // Fallback: REST per-resource avgprice
+  const r = await fetchAveragePricesREST(apiKey);
+  if (r) return r;
+
+  return null;
 }
 
 export function computeTotalValue(
