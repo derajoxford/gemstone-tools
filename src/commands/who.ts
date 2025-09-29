@@ -8,7 +8,6 @@ import {
   type User,
 } from "discord.js";
 import { PrismaClient } from "@prisma/client";
-// ❌ removed: import fetch from "node-fetch";
 import * as cryptoMod from "../lib/crypto.js";
 
 const prisma = new PrismaClient();
@@ -151,13 +150,27 @@ function fmtNum(n: number | null | undefined): string {
   return Intl.NumberFormat().format(n);
 }
 
+function bufToB64(b: any): string {
+  // AllianceKey buffers may come as Buffer, Uint8Array, or ArrayBuffer-like — normalize then base64.
+  // @ts-ignore
+  return (Buffer.isBuffer(b) ? b : Buffer.from(b)).toString("base64");
+}
+
 async function getApiKeyForGuild(guildId?: string): Promise<string | null> {
   try {
     if (guildId) {
-      const k = await prisma.allianceKey.findFirst({ orderBy: { id: "desc" } });
-      if (k) return open(k.encryptedApiKey, k.nonce);
+      // Use the most recent AllianceKey (you can scope by guild/alliance later)
+      const k = await prisma.allianceKey.findFirst({
+        orderBy: { id: "desc" },
+        select: { encryptedApiKey: true, nonceApi: true },
+      });
+      if (k?.encryptedApiKey && k?.nonceApi) {
+        return open(bufToB64(k.encryptedApiKey as any), bufToB64(k.nonceApi as any));
+      }
     }
-  } catch {}
+  } catch (e) {
+    console.error("getApiKeyForGuild error:", e);
+  }
   const env = process.env.PNW_API;
   return env && env.trim().length ? env.trim() : null;
 }
