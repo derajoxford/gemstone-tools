@@ -132,7 +132,7 @@ client.once('ready', async () => {
   await register();
 
   // ✅ Start the hourly auto-apply job (safe stub if disabled)
-  startAutoApply(client);
+  startAutoApply(prisma);
 });
 
 // ---------- Helpers ----------
