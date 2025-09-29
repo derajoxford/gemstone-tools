@@ -1,6 +1,6 @@
 // src/jobs/pnw_auto_apply.ts
 import { Client, EmbedBuilder, Colors } from "discord.js";
-import { PrismaClient, SafeTxnType, Prisma } from "@prisma/client";
+import { PrismaClient, Prisma, SafeTxnType } from "@prisma/client";
 
 const prisma = new PrismaClient();
 
@@ -232,18 +232,26 @@ async function fetchRecentRows(allianceId: number) {
   return { rows: deduped, source };
 }
 
-// --- core crediting ---------------------------------------------------------
+// --- core crediting (fixed) -------------------------------------------------
+// Returns true ONLY if we actually created a new SafeTxn and incremented balance.
+// If a duplicate reason already exists (or a race causes a unique violation), returns false.
 async function creditOneResource(
   memberId: number,
   resource: Resource,
   amount: number,
   reason: string
-) {
-  // Prisma client currently does NOT have reason marked unique in your build,
-  // so we do a find-then-create (best-effort idempotency).
+): Promise<boolean> {
+  let created = false;
+
   await prisma.$transaction(async (tx) => {
+    // If SafeTxn already exists -> do nothing (NO increment)
     const existing = await tx.safeTxn.findFirst({ where: { reason } });
-    if (!existing) {
+    if (existing) {
+      created = false;
+      return;
+    }
+
+    try {
       await tx.safeTxn.create({
         data: {
           memberId,
@@ -253,31 +261,44 @@ async function creditOneResource(
           reason,
         },
       });
-    }
 
-    await tx.safekeeping.upsert({
-      where: { memberId },
-      create: {
-        memberId,
-        money: resource === "money" ? new Prisma.Decimal(amount) : new Prisma.Decimal(0),
-        food: resource === "food" ? amount : 0,
-        coal: resource === "coal" ? amount : 0,
-        oil: resource === "oil" ? amount : 0,
-        uranium: resource === "uranium" ? amount : 0,
-        lead: resource === "lead" ? amount : 0,
-        iron: resource === "iron" ? amount : 0,
-        bauxite: resource === "bauxite" ? amount : 0,
-        gasoline: resource === "gasoline" ? amount : 0,
-        munitions: resource === "munitions" ? amount : 0,
-        steel: resource === "steel" ? amount : 0,
-        aluminum: resource === "aluminum" ? amount : 0,
-      },
-      update:
-        resource === "money"
-          ? { money: { increment: new Prisma.Decimal(amount) } }
-          : { [resource]: { increment: amount } as any },
-    });
+      // Only increment on first create
+      await tx.safekeeping.upsert({
+        where: { memberId },
+        create: {
+          memberId,
+          money: resource === "money" ? new Prisma.Decimal(amount) : new Prisma.Decimal(0),
+          food: resource === "food" ? amount : 0,
+          coal: resource === "coal" ? amount : 0,
+          oil: resource === "oil" ? amount : 0,
+          uranium: resource === "uranium" ? amount : 0,
+          lead: resource === "lead" ? amount : 0,
+          iron: resource === "iron" ? amount : 0,
+          bauxite: resource === "bauxite" ? amount : 0,
+          gasoline: resource === "gasoline" ? amount : 0,
+          munitions: resource === "munitions" ? amount : 0,
+          steel: resource === "steel" ? amount : 0,
+          aluminum: resource === "aluminum" ? amount : 0,
+        },
+        update:
+          resource === "money"
+            ? { money: { increment: new Prisma.Decimal(amount) } }
+            : { [resource]: { increment: amount } as any },
+      });
+
+      created = true;
+    } catch (err: any) {
+      // If a concurrent worker created the same reason row, Prisma throws P2002 (unique violation)
+      // Treat as duplicate -> no increment (we didn't do one yet), and created=false.
+      if (err?.code === "P2002") {
+        created = false;
+        return;
+      }
+      throw err;
+    }
   });
+
+  return created;
 }
 
 async function processAllianceRows(client: Client, allianceId: number) {
@@ -298,16 +319,15 @@ async function processAllianceRows(client: Client, allianceId: number) {
     if (!member) continue;
 
     const changes: Array<{ resource: Resource; amount: number }> = [];
+
     for (const resource of RESOURCE_LIST) {
       const raw = (r as any)[resource];
       if (isPositive(raw)) {
         const amount = Number(raw);
         const reason = `BR:${bankrecId}:${resource}`;
-        try {
-          await creditOneResource(member.id, resource, amount, reason);
+        const didCreate = await creditOneResource(member.id, resource, amount, reason);
+        if (didCreate) {
           changes.push({ resource, amount });
-        } catch {
-          // ignore (duplicate, etc.)
         }
       }
     }
@@ -328,7 +348,6 @@ export function startAutoApply(client: Client) {
   const tick = async () => {
     try {
       const alliances = await prisma.alliance.findMany({ select: { id: true } });
-      console.log(`[auto-credit] alliances in DB: ${alliances.map((a) => a.id).join(", ")}`);
       console.log(`[auto-credit] alliances in DB: ${alliances.map((a) => a.id).join(", ")}`);
       for (const a of alliances) await processAllianceRows(client, a.id);
     } catch (e) {
