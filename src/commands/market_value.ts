@@ -44,7 +44,7 @@ const ORDER: Array<{ key: Resource; label: string }> = [
   { key: "munitions", label: "Munitions" },
   { key: "steel", label: "Steel" },
   { key: "aluminum", label: "Aluminum" },
-  // { key: "credits", label: "Credits" }, // enable when you store credits
+  // { key: "credits", label: "Credits" }, // enable if/when you store credits
 ];
 
 export const data = new SlashCommandBuilder()
@@ -62,20 +62,41 @@ export async function execute(i: ChatInputCommandInteraction) {
 
   const targetUser = i.options.getUser("member") ?? i.user;
 
-  const member = await prisma.member.findFirst({
-    where: { discordId: targetUser.id },
-  });
+  // --- Resolve Member + Safekeeping robustly ---
+  let member =
+    (await prisma.member.findFirst({ where: { discordId: targetUser.id } })) ||
+    null;
 
+  // Try a direct safekeeping join if Member wasn’t found (handles odd data drift)
+  let safe =
+    member &&
+    (await prisma.safekeeping.findFirst({ where: { memberId: member.id } }));
+
+  if (!safe) {
+    const viaSafe = await prisma.safekeeping.findFirst({
+      where: { member: { discordId: targetUser.id } },
+      include: { member: true },
+    });
+    if (viaSafe) {
+      safe = viaSafe;
+      member = viaSafe.member;
+    }
+  }
+
+  // If still no Member, advise how to link
   if (!member) {
-    await i.editReply("No safekeeping account found for that member.");
+    await i.editReply(
+      "No safekeeping account found for that member. If this is you, link your account first (e.g., `/link_nation`) or ask a banker to add you."
+    );
     return;
   }
 
-  // Safekeeping per member
-  let safe = await prisma.safekeeping.findFirst({ where: { memberId: member.id } });
-  if (!safe) safe = await prisma.safekeeping.create({ data: { memberId: member.id } });
+  // Ensure a Safekeeping row exists for this member
+  if (!safe) {
+    safe = await prisma.safekeeping.create({ data: { memberId: member.id } });
+  }
 
-  // Prices (GraphQL → REST → money-only)
+  // --- Fetch prices (GraphQL → REST → money-only) ---
   const pricing = await fetchAveragePrices().catch(() => null);
   if (!pricing) {
     await i.editReply("Market data is unavailable right now. Please try again later.");
@@ -83,7 +104,7 @@ export async function execute(i: ChatInputCommandInteraction) {
   }
   const { prices, asOf, source } = pricing;
 
-  // Build inline fields for valued resources (qty>0 AND price available)
+  // --- Build inline fields for valued resources (qty>0 AND price available) ---
   const fields: { name: string; value: string; inline: boolean }[] = [];
   let valuedAny = false;
 
@@ -118,7 +139,9 @@ export async function execute(i: ChatInputCommandInteraction) {
     const money = Number(safe.money ?? 0);
     fields.push({
       name: `${E.money} Money`,
-      value: `**${fmtMoney(money)}**\n$${Math.round(money).toLocaleString("en-US")} × $1`,
+      value: `**${fmtMoney(money)}**\n$${Math.round(money).toLocaleString(
+        "en-US"
+      )} × $1`,
       inline: true,
     });
   }
@@ -152,7 +175,7 @@ export async function execute(i: ChatInputCommandInteraction) {
     .setFooter({
       text: `Source: ${source} • As of ${new Date(asOf).toLocaleString()}`,
     });
-    // (Intentionally omitting setTimestamp to avoid duplicate time in footer)
+  // (No timestamp to avoid duplicate time in footer)
 
   await i.editReply({ embeds: [embed] });
 }
