@@ -5,15 +5,14 @@ import { PrismaClient, SafeTxnType, Prisma } from "@prisma/client";
 const prisma = new PrismaClient();
 
 // --- constants --------------------------------------------------------------
-const WINDOW_MS = 2 * 24 * 60 * 60 * 1000; // rolling lookback window (48h)
+const WINDOW_MS = 2 * 24 * 60 * 60 * 1000; // 48h lookback
 const POLL_MS = Number(process.env.AUTO_APPLY_POLL_MS ?? 5 * 60 * 1000); // 5m default
 
-// PnW type ids (stable)
+// PnW type ids
 const SENDER_NATION = 1;
 const RECEIVER_ALLIANCE = 2;
 const RECEIVER_TREASURY = 3;
 
-// Supported resources we will read from bankrecs and credit to Safekeeping.
 const RESOURCE_LIST = [
   "money",
   "food",
@@ -28,7 +27,6 @@ const RESOURCE_LIST = [
   "steel",
   "aluminum",
 ] as const;
-
 type Resource = (typeof RESOURCE_LIST)[number];
 
 const EMOJI: Record<Resource, string> = {
@@ -46,24 +44,23 @@ const EMOJI: Record<Resource, string> = {
   aluminum: "🧰",
 };
 
-// --- small helpers ----------------------------------------------------------
+// --- helpers ---------------------------------------------------------------
 function fmtAmount(resource: Resource, n: number) {
-  if (resource === "money") return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (resource === "money")
+    return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   return n.toLocaleString();
 }
-
 function isPositive(n: any) {
   const v = Number(n ?? 0);
   return Number.isFinite(v) && v > 0;
 }
-
 function dmLines(changes: Array<{ resource: Resource; amount: number }>) {
   return changes
     .map(({ resource, amount }) => `• ${EMOJI[resource]} **${resource}** — ${fmtAmount(resource, amount)}`)
     .join("\n");
 }
 
-// --- DM embed ---------------------------------------------------------------
+// --- DM embed --------------------------------------------------------------
 async function sendDepositEmbedDM(
   client: Client,
   discordId: string | null,
@@ -71,20 +68,21 @@ async function sendDepositEmbedDM(
   bankrecId: string
 ) {
   if (!discordId) return;
-
   const user = await client.users.fetch(discordId).catch(() => null);
   if (!user) return;
 
   const embed = new EmbedBuilder()
     .setColor(Colors.Green)
     .setTitle("Deposit Credited to Safekeeping")
-    .setDescription(`**Alliance deposit detected**\n\n${dmLines(items)}\n\nUse \`/balance\` to view your updated safekeeping.`)
+    .setDescription(
+      `**Alliance deposit detected**\n\n${dmLines(items)}\n\nUse \`/balance\` to view your updated safekeeping.`
+    )
     .setFooter({ text: `Bank record ${bankrecId}` });
 
   await user.send({ embeds: [embed] }).catch(() => null);
 }
 
-// --- PnW v3 GraphQL live fetch (fallback/augment) --------------------------
+// --- PnW v3 GraphQL fetch (augment) ----------------------------------------
 async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) {
   try {
     const keyrec = await prisma.allianceApiKey.findUnique({ where: { allianceId } });
@@ -94,12 +92,10 @@ async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) 
       return [];
     }
 
-    // Build URL with ?api_key=... (works reliably for PnW v3 GraphQL)
     const base = process.env.PNW_GRAPHQL_URL || "https://api.politicsandwar.com/graphql";
     const url = new URL(base);
     url.searchParams.set("api_key", apiKey);
 
-    // bankrecs(limit:..., offset:...) on alliances(id:[...])
     const query = `
       {
         alliances(id:[${allianceId}]) {
@@ -134,7 +130,6 @@ async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) 
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ query }),
     });
-
     if (!resp.ok) {
       console.warn(`[auto-credit] PnW API HTTP ${resp.status} for alliance ${allianceId}`);
       return [];
@@ -183,11 +178,10 @@ async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) 
   }
 }
 
-// --- DB fetch & merge (cache + legacy + live) ------------------------------
+// --- DB fetch & merge -------------------------------------------------------
 async function fetchRecentRows(allianceId: number) {
   const since = new Date(Date.now() - WINDOW_MS);
 
-  // 1) Cached table
   const cache = await prisma.allianceBankrec.findMany({
     where: {
       alliance_id_derived: allianceId,
@@ -199,7 +193,6 @@ async function fetchRecentRows(allianceId: number) {
     take: 1000,
   });
 
-  // 2) Legacy table
   const legacy = await prisma.bankrec.findMany({
     where: {
       allianceId,
@@ -211,10 +204,8 @@ async function fetchRecentRows(allianceId: number) {
     take: 1000,
   });
 
-  // 3) Live augment
   const live = await fetchAllianceDepositsFromPnWAPI(allianceId, since);
 
-  // Merge & dedupe by raw id
   const combined: any[] = [...cache, ...legacy, ...live];
   const seen = new Set<string>();
   const deduped = combined.filter((r: any) => {
@@ -224,7 +215,6 @@ async function fetchRecentRows(allianceId: number) {
     return true;
   });
 
-  // Sort by time (prefer created_at; fallback to date)
   deduped.sort((a: any, b: any) => {
     const ta = a.created_at ? new Date(a.created_at).getTime() : new Date(a.date).getTime();
     const tb = b.created_at ? new Date(b.created_at).getTime() : new Date(b.date).getTime();
@@ -242,45 +232,45 @@ async function fetchRecentRows(allianceId: number) {
   return { rows: deduped, source };
 }
 
-// --- core crediting logic ---------------------------------------------------
+// --- core crediting ---------------------------------------------------------
 async function creditOneResource(
   memberId: number,
   resource: Resource,
   amount: number,
   reason: string
 ) {
-  // idempotency: rely on unique reason on SafeTxn.reason
+  // Prisma client currently does NOT have reason marked unique in your build,
+  // so we do a find-then-create (best-effort idempotency).
   await prisma.$transaction(async (tx) => {
-    // Upsert the journal line (unique on reason)
-    await tx.safeTxn.upsert({
-      where: { reason }, // unique
-      create: {
-        memberId,
-        resource,
-        amount: resource === "money" ? new Prisma.Decimal(amount) : new Prisma.Decimal(amount), // stored as Decimal
-        type: SafeTxnType.AUTO_CREDIT,
-        reason,
-      },
-      update: {}, // nothing to update; if it exists, we stop here
-    });
+    const existing = await tx.safeTxn.findFirst({ where: { reason } });
+    if (!existing) {
+      await tx.safeTxn.create({
+        data: {
+          memberId,
+          resource,
+          amount: new Prisma.Decimal(amount),
+          type: SafeTxnType.AUTO_CREDIT,
+          reason,
+        },
+      });
+    }
 
-    // Apply the increment to Safekeeping
     await tx.safekeeping.upsert({
       where: { memberId },
       create: {
         memberId,
         money: resource === "money" ? new Prisma.Decimal(amount) : new Prisma.Decimal(0),
-        food: resource === "food" ? 1 * amount : 0,
-        coal: resource === "coal" ? 1 * amount : 0,
-        oil: resource === "oil" ? 1 * amount : 0,
-        uranium: resource === "uranium" ? 1 * amount : 0,
-        lead: resource === "lead" ? 1 * amount : 0,
-        iron: resource === "iron" ? 1 * amount : 0,
-        bauxite: resource === "bauxite" ? 1 * amount : 0,
-        gasoline: resource === "gasoline" ? 1 * amount : 0,
-        munitions: resource === "munitions" ? 1 * amount : 0,
-        steel: resource === "steel" ? 1 * amount : 0,
-        aluminum: resource === "aluminum" ? 1 * amount : 0,
+        food: resource === "food" ? amount : 0,
+        coal: resource === "coal" ? amount : 0,
+        oil: resource === "oil" ? amount : 0,
+        uranium: resource === "uranium" ? amount : 0,
+        lead: resource === "lead" ? amount : 0,
+        iron: resource === "iron" ? amount : 0,
+        bauxite: resource === "bauxite" ? amount : 0,
+        gasoline: resource === "gasoline" ? amount : 0,
+        munitions: resource === "munitions" ? amount : 0,
+        steel: resource === "steel" ? amount : 0,
+        aluminum: resource === "aluminum" ? amount : 0,
       },
       update:
         resource === "money"
@@ -301,14 +291,12 @@ async function processAllianceRows(client: Client, allianceId: number) {
     const senderNationId = Number((r as any).sender_id ?? r.senderId ?? 0);
     if (!senderNationId) continue;
 
-    // Find the member by nationId in this alliance
     const member = await prisma.member.findFirst({
       where: { allianceId, nationId: senderNationId },
       select: { id: true, discordId: true },
     });
     if (!member) continue;
 
-    // Gather resource deltas from this row
     const changes: Array<{ resource: Resource; amount: number }> = [];
     for (const resource of RESOURCE_LIST) {
       const raw = (r as any)[resource];
@@ -319,7 +307,7 @@ async function processAllianceRows(client: Client, allianceId: number) {
           await creditOneResource(member.id, resource, amount, reason);
           changes.push({ resource, amount });
         } catch {
-          // unique reason hit -> already credited, skip
+          // ignore (duplicate, etc.)
         }
       }
     }
@@ -333,7 +321,7 @@ async function processAllianceRows(client: Client, allianceId: number) {
   console.log(`[auto-credit] processed ${processed} deposit rows`);
 }
 
-// --- public entrypoint ------------------------------------------------------
+// --- public entry -----------------------------------------------------------
 export function startAutoApply(client: Client) {
   console.log(`[auto-credit] mode=rolling-window windowMs=${WINDOW_MS} pollMs=${POLL_MS}`);
 
@@ -342,16 +330,13 @@ export function startAutoApply(client: Client) {
       const alliances = await prisma.alliance.findMany({ select: { id: true } });
       console.log(`[auto-credit] alliances in DB: ${alliances.map((a) => a.id).join(", ")}`);
       console.log(`[auto-credit] alliances in DB: ${alliances.map((a) => a.id).join(", ")}`);
-
-      for (const a of alliances) {
-        await processAllianceRows(client, a.id);
-      }
+      for (const a of alliances) await processAllianceRows(client, a.id);
     } catch (e) {
       console.warn("[auto-credit] tick error:", e);
     }
   };
 
-  // run immediately, then interval
+  // run now, then on interval
   tick().catch(() => null);
   setInterval(() => tick().catch(() => null), POLL_MS);
 }
