@@ -1,6 +1,6 @@
 // src/lib/market.ts
 import { PrismaClient } from "@prisma/client";
-import * as cryptoMod from "./crypto.js"; // same folder
+import * as cryptoMod from "./crypto.js";
 
 const prisma = new PrismaClient();
 // crypto.open expects Uint8Array/Buffer inputs.
@@ -48,6 +48,10 @@ function normalize(n: any): number | null {
   return Number.isFinite(x) ? x : null;
 }
 
+function fmtNowISO() {
+  return new Date().toISOString();
+}
+
 async function getAnyPnwApiKey(): Promise<string | null> {
   const k = await prisma.allianceKey.findFirst({ orderBy: { id: "desc" } });
   if (!k) return null;
@@ -60,41 +64,39 @@ async function getAnyPnwApiKey(): Promise<string | null> {
   }
 }
 
-/* ----------------------------- HTTP helpers ----------------------------- */
+/* ------------------------------- Fetch utils ------------------------------ */
 
-async function fetchJsonLenient(url: string): Promise<any | null> {
+async function fetchWithTimeout(
+  url: string,
+  opts: RequestInit & { timeoutMs?: number } = {}
+): Promise<Response> {
+  const { timeoutMs = 2500, ...rest } = opts;
+  const ctrl = new AbortController();
+  const id = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const r = await fetch(url, {
-      headers: {
-        "Accept": "application/json,text/plain;q=0.9,*/*;q=0.8",
-        "User-Agent": "gemstone-tools/0.1 (+discord bot)",
-      },
-    });
-    if (!r.ok) return null;
+    return await fetch(url, { ...rest, signal: ctrl.signal });
+  } finally {
+    clearTimeout(id);
+  }
+}
 
-    // Prefer JSON, but fall back to text->JSON (some old endpoints return weird quotes)
-    try {
-      return await r.json();
-    } catch {
-      const txt = await r.text();
-      try {
-        return JSON.parse(
-          txt
-            .replace(/'/g, '"')       // normalize single quotes
-            .replace(/,\s*}/g, "}")   // trailing commas
-            .replace(/,\s*]/g, "]")
-        );
-      } catch {
-        return null;
-      }
-    }
+async function safeJson(resp: Response): Promise<any | null> {
+  try {
+    return await resp.json();
   } catch {
-    return null;
+    try {
+      const txt = await resp.text();
+      return JSON.parse(
+        txt.replace(/'/g, '"').replace(/,\s*}/g, "}").replace(/,\s*]/g, "]")
+      );
+    } catch {
+      return null;
+    }
   }
 }
 
 /* --------------------------- GraphQL tradeprices -------------------------- */
-/** Primary: GraphQL `tradeprices` (avg prices, daily). */
+/** Primary: GraphQL `tradeprices` (avg prices, daily) with 4s timeout. */
 async function fetchAveragePricesGraphQL(apiKey: string): Promise<PriceResult | null> {
   try {
     const url = `https://api.politicsandwar.com/graphql?api_key=${encodeURIComponent(apiKey)}`;
@@ -119,16 +121,18 @@ async function fetchAveragePricesGraphQL(apiKey: string): Promise<PriceResult | 
         }
       }
     `;
-    const resp = await fetch(url, {
+    const resp = await fetchWithTimeout(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        "X-Api-Key": apiKey,
         "User-Agent": "gemstone-tools/0.1 (+discord bot)",
       },
       body: JSON.stringify({ query }),
+      timeoutMs: 4000,
     });
     if (!resp.ok) return null;
-    const json = await resp.json().catch(() => null);
+    const json = await safeJson(resp);
     const row = (json as any)?.data?.tradeprices?.data?.[0];
     if (!row) return null;
 
@@ -156,47 +160,45 @@ async function fetchAveragePricesGraphQL(apiKey: string): Promise<PriceResult | 
 
 /* ----------------------------- REST tradeprice ---------------------------- */
 /**
- * Fallback: legacy `/tradeprice` endpoint (returns `avgprice` per resource).
- * Try several URL variants (with/without key, slash/no-slash, https/http).
+ * Fallback: `/api/tradeprice` (avgprice). We do **parallel** requests with a strict timeout
+ * and try two variants per resource: with key and without key.
  */
 async function fetchAveragePricesREST(apiKey: string): Promise<PriceResult | null> {
   const prices: PriceMap = { money: 1 };
-  let gotAny = false;
 
-  for (const res of RESOURCES_FOR_REST) {
-    const candidates = [
-      // https with key
-      `https://api.politicsandwar.com/tradeprice/?resource=${encodeURIComponent(res)}&key=${encodeURIComponent(apiKey)}&format=json`,
-      `https://api.politicsandwar.com/tradeprice?resource=${encodeURIComponent(res)}&key=${encodeURIComponent(apiKey)}&format=json`,
-      // https no key
-      `https://api.politicsandwar.com/tradeprice/?resource=${encodeURIComponent(res)}&format=json`,
-      `https://api.politicsandwar.com/tradeprice?resource=${encodeURIComponent(res)}&format=json`,
-      // http with key
-      `http://api.politicsandwar.com/tradeprice/?resource=${encodeURIComponent(res)}&key=${encodeURIComponent(apiKey)}&format=json`,
-      `http://api.politicsandwar.com/tradeprice?resource=${encodeURIComponent(res)}&key=${encodeURIComponent(apiKey)}&format=json`,
-      // http no key
-      `http://api.politicsandwar.com/tradeprice/?resource=${encodeURIComponent(res)}&format=json`,
-      `http://api.politicsandwar.com/tradeprice?resource=${encodeURIComponent(res)}&format=json`,
+  const tasks = RESOURCES_FOR_REST.map(async (res) => {
+    const q = encodeURIComponent(res);
+    const variants = [
+      `https://politicsandwar.com/api/tradeprice/?resource=${q}&key=${encodeURIComponent(apiKey)}&format=json`,
+      `https://politicsandwar.com/api/tradeprice/?resource=${q}&format=json`,
     ];
 
-    let avg: number | null = null;
-    for (const url of candidates) {
-      const json = await fetchJsonLenient(url);
-      const candidate = normalize((json as any)?.avgprice);
-      if (candidate !== null) {
-        avg = candidate;
-        break;
+    for (const url of variants) {
+      try {
+        const r = await fetchWithTimeout(url, {
+          headers: {
+            Accept: "application/json,text/plain;q=0.9,*/*;q=0.8",
+            "User-Agent": "gemstone-tools/0.1 (+discord bot)",
+          },
+          timeoutMs: 2500,
+        });
+        if (!r.ok) continue;
+        const js = await safeJson(r);
+        const avg = normalize(js?.avgprice);
+        if (avg !== null) {
+          (prices as any)[res] = avg;
+          return;
+        }
+      } catch {
+        // try next variant
       }
     }
+  });
 
-    if (avg !== null) {
-      (prices as any)[res] = avg;
-      gotAny = true;
-    }
-  }
-
+  await Promise.allSettled(tasks);
+  const gotAny = Object.keys(prices).length > 1; // money + something
   return gotAny
-    ? { prices, asOf: new Date().toISOString(), source: "REST avg" }
+    ? { prices, asOf: fmtNowISO(), source: "REST avg" }
     : null;
 }
 
@@ -212,7 +214,7 @@ export async function fetchAveragePrices(): Promise<PriceResult | null> {
   const r = await fetchAveragePricesREST(apiKey);
   if (r) return r;
 
-  return { prices: { money: 1 }, asOf: new Date().toISOString(), source: "money-only" };
+  return { prices: { money: 1 }, asOf: fmtNowISO(), source: "money-only" };
 }
 
 export function computeTotalValue(
