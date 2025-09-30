@@ -15,6 +15,9 @@ import { RES_EMOJI, ORDER } from './lib/emojis.js';
 import { extraCommandsJSON, findCommandByName } from './commands/registry';
 import { startAutoApply } from "./jobs/pnw_auto_apply";
 
+// ✅ NEW: import the who command (TS source)
+import * as Who from "./commands/who";
+
 const log = pino({ level: process.env.LOG_LEVEL || 'info' });
 const prisma = new PrismaClient();
 
@@ -94,6 +97,9 @@ const baseCommands = [
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 ];
 
+// ✅ NEW: ensure /who is part of the registered commands
+baseCommands.push(Who.data as any);
+
 // Convert to JSON for registration
 const baseCommandsJSON = baseCommands.map(c => c.toJSON());
 
@@ -165,6 +171,9 @@ client.on('interactionCreate', async (i: Interaction) => {
       if (i.commandName === 'withdraw_list') return handleWithdrawList(i);
       if (i.commandName === 'withdraw_set') return handleWithdrawSet(i);
       if (i.commandName === 'safekeeping_edit') return handleSafekeepingStart(i);
+
+      // ✅ NEW: route /who directly to the loaded module
+      if (i.commandName === 'who') return (Who as any).execute(i as any);
 
       // Fallback for commands defined in ./commands (registry)
       {
@@ -536,7 +545,7 @@ async function handleApprovalButton(i: ButtonInteraction) {
 
   // DM requester with details
   try {
-    const member = await prisma.member.findUnique({ where: { id: req.memberId } });
+    const member = await prisma.member.findUnique({ where: { id: req.memberId }, include: { balance: true } });
     if (member) {
       const user = await client.users.fetch(member.discordId);
       const reqLine = Object.entries(req.payload as any).map(([k, v]) => fmtLine(k, Number(v))).join(' · ') || '—';
