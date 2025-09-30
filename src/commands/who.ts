@@ -1,3 +1,4 @@
+// src/commands/who.ts
 import {
   SlashCommandBuilder,
   type ChatInputCommandInteraction,
@@ -8,10 +9,12 @@ import {
   type User,
 } from "discord.js";
 import { PrismaClient } from "@prisma/client";
+import * as cryptoMod from "../lib/crypto.js";
 
-// ===== Minimal, robust version (env API only) =====
 const prisma = new PrismaClient();
-const WHO_VERSION = "who-lean-2025-09-29";
+const open = (cryptoMod as any).open as (cipher: string, nonce: string) => string;
+
+const WHO_VERSION = "who-env-2025-09-29";
 
 type NationCore = {
   id: number;
@@ -35,7 +38,6 @@ type NationCore = {
   lastActive?: string | null;
 };
 
-// ---------- Slash command ----------
 export const data = new SlashCommandBuilder()
   .setName("who")
   .setDescription("Look up a nation by nation name, leader name, Discord user (linked), or nation ID.")
@@ -58,10 +60,10 @@ export async function execute(i: ChatInputCommandInteraction) {
   });
 
   try {
-    const api = getApiKey();
+    const api = await getApiKey();
     if (!api) {
       await i.editReply(
-        "Admin setup required: no `PNW_API` configured for this bot service. Set it in the systemd env and restart.",
+        "Admin setup required: no PNW API key. Set `PNW_API` in the service env (or save an alliance API key) and restart.",
       );
       return;
     }
@@ -74,17 +76,17 @@ export async function execute(i: ChatInputCommandInteraction) {
     let lookedUp = "";
     let multiNote = "";
 
-    // 0) numeric ID path (fastest, most reliable)
+    // 0) numeric ID path (fastest + guaranteed)
     if (nationArg && /^\d+$/.test(nationArg)) {
       const id = Number(nationArg);
-      nation = await gqlFetchNationById(api, id);
+      nation = await fetchNationById(api, id);
       console.log("[/who] ID lookup", { id, found: !!nation });
       lookedUp = `ID ${id}`;
     }
 
     // 1) nation name search
     if (!nation && nationArg) {
-      const res = await gqlSearch(api, { nationName: nationArg });
+      const res = await searchNations(api, { nationName: nationArg });
       console.log("[/who] nation name results", res.length);
       if (res.length) {
         nation = res[0];
@@ -95,7 +97,7 @@ export async function execute(i: ChatInputCommandInteraction) {
 
     // 2) leader name search
     if (!nation && leaderArg) {
-      const res = await gqlSearch(api, { leaderName: leaderArg });
+      const res = await searchNations(api, { leaderName: leaderArg });
       console.log("[/who] leader name results", res.length);
       if (res.length) {
         nation = res[0];
@@ -113,7 +115,7 @@ export async function execute(i: ChatInputCommandInteraction) {
       });
       console.log("[/who] linked member", { hasMember: !!member, nationId: member?.nationId });
       if (member?.nationId) {
-        nation = await gqlFetchNationById(api, member.nationId);
+        nation = await fetchNationById(api, member.nationId);
         lookedUp = `linked nation for <@${targetUser.id}>`;
       }
     }
@@ -123,13 +125,12 @@ export async function execute(i: ChatInputCommandInteraction) {
         "I couldn't find a nation. Try one of:\n" +
           "• `/who nation:<nation name>`\n" +
           "• `/who leader:<leader name>`\n" +
-          "• `/who nation:<numeric nation id>`\n" + // <-- note the numeric ID hint to confirm this build is live
+          "• `/who nation:<numeric nation id>`\n" +
           "• `/who user:@member` (requires nation link)",
       );
       return;
     }
 
-    // Build embed
     const urlNation = `https://politicsandwar.com/nation/id=${nation.id}`;
     const urlWars = `https://politicsandwar.com/nation/id=${nation.id}&display=war`;
     const urlTrades = `https://politicsandwar.com/nation/id=${nation.id}&display=trade`;
@@ -158,7 +159,6 @@ export async function execute(i: ChatInputCommandInteraction) {
           inline: true,
         },
       )
-      .setFooter({ text: `Requested by ${i.user.username}` })
       .setTimestamp(new Date());
 
     const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -174,24 +174,48 @@ export async function execute(i: ChatInputCommandInteraction) {
   }
 }
 
-// ---------- Helpers ----------
+/* ===================== Helpers & API ===================== */
+
 function fmtNum(n: number | null | undefined): string {
   if (n === null || n === undefined) return "—";
   return Intl.NumberFormat().format(n);
 }
-function getApiKey(): string | null {
-  const env = process.env.PNW_API;
-  if (env && env.trim().length) {
-    console.log("[/who] using PNW_API from environment", { len: env.trim().length });
-    return env.trim();
+
+function toB64(b: any): string {
+  // normalize Buffer/Uint8Array/ArrayBuffer to base64
+  // @ts-ignore
+  return (Buffer.isBuffer(b) ? b : Buffer.from(b)).toString("base64");
+}
+
+async function getApiKey(): Promise<string | null> {
+  // 1) Global env key (your key for everyone)
+  const env = process.env.PNW_API?.trim();
+  if (env) {
+    console.log("[/who] using PNW_API from environment", { len: env.length });
+    return env;
   }
-  console.warn("[/who] no PNW_API in env");
+
+  // 2) Fallback to latest stored alliance API key (encrypted)
+  try {
+    const k = await prisma.allianceKey.findFirst({
+      orderBy: { id: "desc" },
+      select: { encryptedApiKey: true, nonceApi: true },
+    });
+    if (k?.encryptedApiKey && k?.nonceApi) {
+      const api = open(toB64(k.encryptedApiKey as any), toB64(k.nonceApi as any));
+      if (api && api.length > 10) {
+        console.log("[/who] using AllianceKey from DB");
+        return api;
+      }
+    }
+  } catch (e) {
+    console.error("[/who] getApiKey DB error:", e);
+  }
+
+  console.warn("[/who] no API key (env or DB)");
   return null;
 }
-function safeNum(v: any): number | null {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-}
+
 function mapNationGraphQL(n: any): NationCore {
   return {
     id: Number(n.id),
@@ -215,10 +239,15 @@ function mapNationGraphQL(n: any): NationCore {
     lastActive: n.last_active ?? null,
   };
 }
+function safeNum(v: any): number | null {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
 
-// ---------- GraphQL calls (correct schema: nations(...)) ----------
-async function gqlFetchNationById(api: string, id: number): Promise<NationCore | null> {
-  const q = `
+// ---------- GraphQL (correct schema: nations(...)) ----------
+
+async function fetchNationById(api: string, id: number): Promise<NationCore | null> {
+  const gql = `
     query($id:[ID!]) {
       nations(id:$id, first:1) {
         data {
@@ -232,20 +261,20 @@ async function gqlFetchNationById(api: string, id: number): Promise<NationCore |
   const r = await fetch("https://api.politicsandwar.com/graphql?api_key=" + api, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query: q, variables: { id: [String(id)] } }),
+    body: JSON.stringify({ query: gql, variables: { id: [String(id)] } }),
   });
   if (!r.ok) {
-    console.warn("[/who] gqlFetchNationById HTTP", r.status);
+    console.warn("[/who] fetchNationById HTTP", r.status);
     return null;
   }
   const j: any = await r.json();
   const row = j?.data?.nations?.data?.[0];
-  console.log("[/who] gqlFetchNationById rows", row ? 1 : 0);
+  console.log("[/who] fetchNationById rows", row ? 1 : 0);
   return row ? mapNationGraphQL(row) : null;
 }
 
-/** Search via nations(name:$name) or nations(leader_name:$leaders) */
-async function gqlSearch(
+/** Returns up to 5 nations; tries nations(name:$name) then nations(leader_name:[...]) */
+async function searchNations(
   api: string,
   opts: { nationName?: string; leaderName?: string },
 ): Promise<NationCore[]> {
@@ -254,7 +283,7 @@ async function gqlSearch(
   if (kw.length < 2) return out;
 
   const run = async (variables: any, argLine: string, tag: string) => {
-    const q = `
+    const gql = `
       query($name:String, $leaders:[String!]) {
         nations(${argLine}, first:5, orderBy:{column:SCORE, order:DESC}) {
           data {
@@ -268,15 +297,15 @@ async function gqlSearch(
     const r = await fetch("https://api.politicsandwar.com/graphql?api_key=" + api, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query: q, variables }),
+      body: JSON.stringify({ query: gql, variables }),
     });
     if (!r.ok) {
-      console.warn("[/who] gqlSearch HTTP", tag, r.status);
+      console.warn("[/who] search HTTP", tag, r.status);
       return;
     }
     const j: any = await r.json();
     const arr = j?.data?.nations?.data ?? [];
-    console.log("[/who] gqlSearch results", tag, arr.length);
+    console.log("[/who] GraphQL results", tag, arr.length);
     for (const n of arr) out.push(mapNationGraphQL(n));
   };
 
@@ -287,7 +316,7 @@ async function gqlSearch(
     await run({ leaders: [kw] }, "leader_name:$leaders", "leader_name");
   }
 
-  // Dedup + sort
+  // Dedup + rank
   const dedup = new Map<number, NationCore>();
   for (const n of out) dedup.set(n.id, n);
   return Array.from(dedup.values()).sort((a, b) => (b.score ?? -1) - (a.score ?? -1)).slice(0, 5);
