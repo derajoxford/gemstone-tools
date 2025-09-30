@@ -10,7 +10,6 @@ import {
 import { PrismaClient } from "@prisma/client";
 import * as cryptoMod from "../lib/crypto.js";
 
-// ---- setup ----
 const prisma = new PrismaClient();
 const open = (cryptoMod as any).open as (cipher: string, nonce: string) => string;
 
@@ -36,10 +35,9 @@ type NationCore = {
   lastActive?: string | null;
 };
 
-// ---- command ----
 export const data = new SlashCommandBuilder()
   .setName("who")
-  .setDescription("Look up a nation by nation name, leader name, Discord user (linked), or ID.")
+  .setDescription("Look up a nation by nation name, leader name, Discord user (linked), or nation ID.")
   .addStringOption(o =>
     o.setName("nation").setDescription("Nation name (full/partial) OR numeric ID").setRequired(false),
   )
@@ -61,14 +59,14 @@ export async function execute(i: ChatInputCommandInteraction) {
     let lookedUp = "";
     let multiNote = "";
 
-    // 0) If the nation arg is purely digits, treat as an ID (most reliable path)
+    // 0) numeric -> treat as nation ID
     if (nationArg && /^\d+$/.test(nationArg)) {
       const id = Number(nationArg);
       nation = await fetchNationById(id);
       lookedUp = `ID ${id}`;
     }
 
-    // 1) Try nation name search
+    // 1) nation name search
     if (!nation && nationArg) {
       const res = await searchNations({ nationName: nationArg });
       if (res.length) {
@@ -78,7 +76,7 @@ export async function execute(i: ChatInputCommandInteraction) {
       }
     }
 
-    // 2) Try leader name search
+    // 2) leader name search
     if (!nation && leaderArg) {
       const res = await searchNations({ leaderName: leaderArg });
       if (res.length) {
@@ -88,7 +86,7 @@ export async function execute(i: ChatInputCommandInteraction) {
       }
     }
 
-    // 3) Try linked Discord user (or self)
+    // 3) linked Discord user (or self)
     if (!nation && (user || (!nationArg && !leaderArg))) {
       const targetUser = user ?? i.user;
       const member = await prisma.member.findFirst({
@@ -113,7 +111,6 @@ export async function execute(i: ChatInputCommandInteraction) {
       return;
     }
 
-    // Build embed
     const urlNation = `https://politicsandwar.com/nation/id=${nation.id}`;
     const urlWars = `https://politicsandwar.com/nation/id=${nation.id}&display=war`;
     const urlTrades = `https://politicsandwar.com/nation/id=${nation.id}&display=trade`;
@@ -156,7 +153,8 @@ export async function execute(i: ChatInputCommandInteraction) {
   }
 }
 
-// ---- helpers ----
+/* ===================== Helpers & API ===================== */
+
 function fmtNum(n: number | null | undefined): string {
   if (n === null || n === undefined) return "—";
   return Intl.NumberFormat().format(n);
@@ -204,7 +202,6 @@ function mapNationGraphQL(n: any): NationCore {
     lastActive: n.last_active ?? null,
   };
 }
-
 function mapNationREST(n: any): NationCore {
   return {
     id: Number(n.id),
@@ -228,114 +225,91 @@ function mapNationREST(n: any): NationCore {
     lastActive: n.last_active ?? null,
   };
 }
-
 function safeNum(v: any): number | null {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
 }
 
-// ---- data fetchers ----
+/* -------- GraphQL (correct schema: nations(...)) -------- */
 
 async function fetchNationById(id: number): Promise<NationCore | null> {
-  // GraphQL by ID (fast, reliable)
   const api = await getApiKey();
-  if (api) {
-    const gql = `
-      query($id: ID!) {
-        nation(id: $id) {
-          id nation_name leader_name alliance_id alliance { id name }
+  if (!api) return null;
+
+  const gql = `
+    query($id:[ID!]) {
+      nations(id:$id, first:1) {
+        data {
+          id nation_name leader_name
+          alliance_id alliance { id name }
           score cities color continent soldiers tanks aircraft ships spies missiles nukes projects
           founded last_active
         }
-      }`;
-    const r = await fetch("https://api.politicsandwar.com/graphql?api_key=" + api, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query: gql, variables: { id: String(id) } }),
-    });
-    if (r.ok) {
-      const j: any = await r.json();
-      if (j?.data?.nation) return mapNationGraphQL(j.data.nation);
-    }
-  }
-
-  // REST by ID (public)
-  const rest = await fetch(`https://api.politicsandwar.com/v3/nations/${id}`);
-  if (rest.ok) {
-    const j: any = await rest.json();
-    if (j?.data) return mapNationREST(j.data);
-  }
-  return null;
+      }
+    }`;
+  const r = await fetch("https://api.politicsandwar.com/graphql?api_key=" + api, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query: gql, variables: { id: [String(id)] } }),
+  });
+  if (!r.ok) return null;
+  const j: any = await r.json();
+  const row = j?.data?.nations?.data?.[0];
+  return row ? mapNationGraphQL(row) : null;
 }
 
-/** Returns up to 5 nations, best match first. Tries GQL (contains), then several REST variants. */
+/** Returns up to 5 nations, best match first, using GraphQL nations(...) args. */
 async function searchNations(
   opts: { nationName?: string; leaderName?: string },
 ): Promise<NationCore[]> {
-  const keyword = (opts.nationName ?? opts.leaderName ?? "").trim();
-  const results: NationCore[] = [];
   const api = await getApiKey();
+  if (!api) return [];
 
-  // A) GraphQL "contains" search (if we have a key)
-  if (api && keyword.length >= 2) {
+  const kw = (opts.nationName ?? opts.leaderName ?? "").trim();
+  if (kw.length < 2) return [];
+
+  const out: NationCore[] = [];
+  const tryQuery = async (variables: any, argLine: string) => {
     const gql = `
-      query($name: String, $leader: String) {
-        nations(
-          first: 5,
-          filter: {
-            ${opts.nationName ? "nation_name: { contains: $name }" : ""}
-            ${opts.leaderName ? "leader_name: { contains: $leader }" : ""}
-          }
-          orderBy: [{ column: SCORE, order: DESC }]
-        ) {
+      query($name:String, $nationNames:[String!], $leaderNames:[String!]) {
+        nations(${argLine}, first:5, orderBy:{column:SCORE, order:DESC}) {
           data {
-            id nation_name leader_name alliance_id alliance { id name }
+            id nation_name leader_name
+            alliance_id alliance { id name }
             score cities color continent soldiers tanks aircraft ships spies missiles nukes projects
             founded last_active
           }
         }
       }`;
-    const variables: any = {
-      name: opts.nationName ? keyword : undefined,
-      leader: opts.leaderName ? keyword : undefined,
-    };
     const r = await fetch("https://api.politicsandwar.com/graphql?api_key=" + api, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ query: gql, variables }),
     });
-    if (r.ok) {
-      const j: any = await r.json();
-      const arr = j?.data?.nations?.data ?? [];
-      for (const n of arr) results.push(mapNationGraphQL(n));
-      if (results.length) return sortTop(results);
+    if (!r.ok) return;
+    const j: any = await r.json();
+    const arr = j?.data?.nations?.data ?? [];
+    for (const n of arr) out.push(mapNationGraphQL(n));
+  };
+
+  if (opts.nationName) {
+    // 1) name: "foo" (server may do partial match)
+    await tryQuery({ name: kw }, `name:$name`);
+    if (out.length === 0) {
+      // 2) nation_name: ["exact"] (strict)
+      await tryQuery({ nationNames: [kw] }, `nation_name:$nationNames`);
     }
   }
 
-  // B) REST variants (public): name=, leader_name=, keyword=
-  if (keyword.length >= 2) {
-    for (const url of [
-      `https://api.politicsandwar.com/v3/nations?name=${encodeURIComponent(keyword)}&limit=5`,
-      `https://api.politicsandwar.com/v3/nations?leader_name=${encodeURIComponent(keyword)}&limit=5`,
-      `https://api.politicsandwar.com/v3/nations?keyword=${encodeURIComponent(keyword)}&limit=5`,
-      `https://api.politicsandwar.com/v3/nations?keyword=${encodeURIComponent(keyword)}`, // no limit
-    ]) {
-      try {
-        const r = await fetch(url);
-        if (r.ok) {
-          const j: any = await r.json();
-          const arr = j?.data ?? [];
-          for (const n of arr) results.push(mapNationREST(n));
-          if (results.length) return sortTop(results);
-        }
-      } catch {}
-    }
+  if (opts.leaderName && out.length === 0) {
+    // 3) leader_name: ["exact leader"]
+    await tryQuery({ leaderNames: [kw] }, `leader_name:$leaderNames`);
   }
 
-  return [];
-}
-
-function sortTop(arr: NationCore[]): NationCore[] {
-  arr.sort((a, b) => (b.score ?? -1) - (a.score ?? -1));
-  return arr.slice(0, 5);
+  // dedup + sort by score
+  const dedup = new Map<number, NationCore>();
+  for (const n of out) dedup.set(n.id, n);
+  return Array.from(dedup.values())
+    .sort((a, b) => (b.score ?? -1) - (a.score ?? -1))
+    .slice(0, 5);
 }
