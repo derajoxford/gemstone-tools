@@ -76,7 +76,7 @@ export async function execute(i: ChatInputCommandInteraction) {
     let lookedUp = "";
     let multiNote = "";
 
-    // 0) numeric ID path
+    // 0) numeric ID path (fastest + guaranteed)
     if (nationArg && /^\d+$/.test(nationArg)) {
       const id = Number(nationArg);
       nation = await fetchNationById(api, id);
@@ -84,7 +84,7 @@ export async function execute(i: ChatInputCommandInteraction) {
       lookedUp = `ID ${id}`;
     }
 
-    // 1) nation name
+    // 1) nation name search
     if (!nation && nationArg) {
       const res = await searchNations(api, { nationName: nationArg });
       console.log("[/who] nation name results", res.length);
@@ -95,7 +95,7 @@ export async function execute(i: ChatInputCommandInteraction) {
       }
     }
 
-    // 2) leader name
+    // 2) leader name search
     if (!nation && leaderArg) {
       const res = await searchNations(api, { leaderName: leaderArg });
       console.log("[/who] leader name results", res.length);
@@ -106,7 +106,7 @@ export async function execute(i: ChatInputCommandInteraction) {
       }
     }
 
-    // 3) linked user (or self)
+    // 3) linked Discord user (or self)
     if (!nation && (user || (!nationArg && !leaderArg))) {
       const targetUser = user ?? i.user;
       const member = await prisma.member.findFirst({
