@@ -14,7 +14,7 @@ import * as cryptoMod from "../lib/crypto.js";
 const prisma = new PrismaClient();
 const open = (cryptoMod as any).open as (cipherB64: string, nonceB64: string) => string;
 
-const WHO_VERSION = "who-env-2025-09-29";
+const WHO_VERSION = "who-env-2025-09-29b";
 
 type NationCore = {
   id: number;
@@ -76,7 +76,7 @@ export async function execute(i: ChatInputCommandInteraction) {
     let lookedUp = "";
     let multiNote = "";
 
-    // 0) numeric ID path (fastest + guaranteed)
+    // 0) numeric ID path (fastest + most reliable)
     if (nationArg && /^\d+$/.test(nationArg)) {
       const id = Number(nationArg);
       nation = await fetchNationById(api, id);
@@ -244,12 +244,15 @@ function safeNum(v: any): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
-// ---------- GraphQL (correct schema: nations(...)) ----------
+/* ---------- GraphQL + REST ---------- */
 
+/**
+ * IMPORTANT: embed the numeric ID literally; the variables form sometimes returns 0 rows.
+ */
 async function fetchNationById(api: string, id: number): Promise<NationCore | null> {
   const gql = `
-    query($id:[ID!]) {
-      nations(id:$id, first:1) {
+    {
+      nations(id:[${id}], first:1) {
         data {
           id nation_name leader_name
           alliance_id alliance { id name }
@@ -258,22 +261,44 @@ async function fetchNationById(api: string, id: number): Promise<NationCore | nu
         }
       }
     }`;
+
   const r = await fetch("https://api.politicsandwar.com/graphql?api_key=" + api, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query: gql, variables: { id: [String(id)] } }),
+    body: JSON.stringify({ query: gql }),
   });
+
   if (!r.ok) {
     console.warn("[/who] fetchNationById HTTP", r.status);
     return null;
   }
-  const j: any = await r.json();
-  const row = j?.data?.nations?.data?.[0];
-  console.log("[/who] fetchNationById rows", row ? 1 : 0);
+  const j: any = await r.json().catch(() => ({}));
+  const count = j?.data?.nations?.data?.length ?? 0;
+  console.log("[/who] fetchNationById rows", count, j?.errors ? JSON.stringify(j.errors) : "");
+  const row = count ? j.data.nations.data[0] : null;
   return row ? mapNationGraphQL(row) : null;
 }
 
-/** Returns up to 5 nations; tries nations(name:$name) then nations(leader_name:[...]) */
+/**
+ * REST keyword search fallback. Returns nation IDs; we hydrate each via GraphQL by ID.
+ */
+async function restKeywordSearch(api: string, kw: string, limit = 5): Promise<number[]> {
+  if (!kw || kw.length < 2) return [];
+  const url = `https://api.politicsandwar.com/v3/nations?api_key=${encodeURIComponent(api)}&keyword=${encodeURIComponent(kw)}&limit=${limit}`;
+  const r = await fetch(url);
+  if (!r.ok) {
+    console.warn("[/who] REST search HTTP", r.status);
+    return [];
+  }
+  const j: any = await r.json().catch(() => ({}));
+  const arr = Array.isArray(j?.data) ? j.data : [];
+  console.log("[/who] REST results", arr.length);
+  return arr.slice(0, limit).map((n: any) => Number(n?.id)).filter(Boolean);
+}
+
+/**
+ * Returns up to 5 nations; tries GraphQL (name/leader) first, then REST fallback → hydrate by ID.
+ */
 async function searchNations(
   api: string,
   opts: { nationName?: string; leaderName?: string },
@@ -282,6 +307,7 @@ async function searchNations(
   const out: NationCore[] = [];
   if (kw.length < 2) return out;
 
+  // GraphQL attempt
   const run = async (variables: any, argLine: string, tag: string) => {
     const gql = `
       query($name:String, $leaders:[String!]) {
@@ -303,7 +329,7 @@ async function searchNations(
       console.warn("[/who] search HTTP", tag, r.status);
       return;
     }
-    const j: any = await r.json();
+    const j: any = await r.json().catch(() => ({}));
     const arr = j?.data?.nations?.data ?? [];
     console.log("[/who] GraphQL results", tag, arr.length);
     for (const n of arr) out.push(mapNationGraphQL(n));
@@ -314,6 +340,15 @@ async function searchNations(
   }
   if (opts.leaderName && out.length === 0) {
     await run({ leaders: [kw] }, "leader_name:$leaders", "leader_name");
+  }
+
+  // REST fallback if GraphQL yielded nothing
+  if (out.length === 0) {
+    const ids = await restKeywordSearch(api, kw, 5);
+    for (const id of ids) {
+      const n = await fetchNationById(api, id);
+      if (n) out.push(n);
+    }
   }
 
   // Dedup + rank
