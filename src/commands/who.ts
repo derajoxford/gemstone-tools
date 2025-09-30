@@ -12,7 +12,7 @@ import { PrismaClient } from "@prisma/client";
 import * as cryptoMod from "../lib/crypto.js";
 
 const prisma = new PrismaClient();
-const open = (cryptoMod as any).open as (cipher: string, nonce: string) => string;
+const open = (cryptoMod as any).open as (cipherB64: string, nonceB64: string) => string;
 
 const WHO_VERSION = "who-env-2025-09-29";
 
@@ -76,7 +76,7 @@ export async function execute(i: ChatInputCommandInteraction) {
     let lookedUp = "";
     let multiNote = "";
 
-    // 0) numeric ID path (fastest + guaranteed)
+    // 0) numeric ID path
     if (nationArg && /^\d+$/.test(nationArg)) {
       const id = Number(nationArg);
       nation = await fetchNationById(api, id);
@@ -84,7 +84,7 @@ export async function execute(i: ChatInputCommandInteraction) {
       lookedUp = `ID ${id}`;
     }
 
-    // 1) nation name search
+    // 1) nation name
     if (!nation && nationArg) {
       const res = await searchNations(api, { nationName: nationArg });
       console.log("[/who] nation name results", res.length);
@@ -95,7 +95,7 @@ export async function execute(i: ChatInputCommandInteraction) {
       }
     }
 
-    // 2) leader name search
+    // 2) leader name
     if (!nation && leaderArg) {
       const res = await searchNations(api, { leaderName: leaderArg });
       console.log("[/who] leader name results", res.length);
@@ -106,7 +106,7 @@ export async function execute(i: ChatInputCommandInteraction) {
       }
     }
 
-    // 3) linked Discord user (or self)
+    // 3) linked user (or self)
     if (!nation && (user || (!nationArg && !leaderArg))) {
       const targetUser = user ?? i.user;
       const member = await prisma.member.findFirst({
@@ -188,7 +188,7 @@ function toB64(b: any): string {
 }
 
 async function getApiKey(): Promise<string | null> {
-  // 1) Global env key (your key for everyone)
+  // 1) Prefer global env key (your key, for everyone)
   const env = process.env.PNW_API?.trim();
   if (env) {
     console.log("[/who] using PNW_API from environment", { len: env.length });
