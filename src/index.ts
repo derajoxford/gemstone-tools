@@ -135,6 +135,7 @@ async function register() {
 
 client.once('ready', async () => {
   log.info({ tag: client.user?.tag }, 'Gemstone Tools online ✨');
+  log.info('WHO_BRIDGE_ACTIVE'); // breadcrumb so you can confirm this build is live
   await register();
 
   // ✅ Start the hourly auto-apply job (safe stub if disabled)
