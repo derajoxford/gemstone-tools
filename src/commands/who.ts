@@ -14,8 +14,9 @@ import * as cryptoMod from "../lib/crypto.js";
 const prisma = new PrismaClient();
 const open = (cryptoMod as any).open as (cipherB64: string, nonceB64: string) => string;
 
-const WHO_VERSION = "who-env-2025-09-29b";
+const WHO_VERSION = "who-env-2025-09-29c";
 
+/** Minimal nation view used by the embed */
 type NationCore = {
   id: number;
   name: string;
@@ -23,7 +24,6 @@ type NationCore = {
   allianceId?: number | null;
   allianceName?: string | null;
   score?: number | null;
-  cities?: number | null;
   color?: string | null;
   continent?: string | null;
   soldiers?: number | null;
@@ -33,8 +33,6 @@ type NationCore = {
   spies?: number | null;
   missiles?: number | null;
   nukes?: number | null;
-  projects?: number | null;
-  founded?: string | null;
   lastActive?: string | null;
 };
 
@@ -76,7 +74,7 @@ export async function execute(i: ChatInputCommandInteraction) {
     let lookedUp = "";
     let multiNote = "";
 
-    // 0) numeric ID path (fastest + most reliable)
+    // 0) numeric ID path (fastest + safest)
     if (nationArg && /^\d+$/.test(nationArg)) {
       const id = Number(nationArg);
       nation = await fetchNationById(api, id);
@@ -84,7 +82,7 @@ export async function execute(i: ChatInputCommandInteraction) {
       lookedUp = `ID ${id}`;
     }
 
-    // 1) nation name search
+    // 1) nation name search (GraphQL filter like "%term%")
     if (!nation && nationArg) {
       const res = await searchNations(api, { nationName: nationArg });
       console.log("[/who] nation name results", res.length);
@@ -147,15 +145,13 @@ export async function execute(i: ChatInputCommandInteraction) {
       .addFields(
         { name: "Alliance", value: alliance, inline: true },
         { name: "Score", value: fmtNum(nation.score), inline: true },
-        { name: "Cities", value: fmtNum(nation.cities), inline: true },
+        { name: "Color / Continent", value: `${nation.color ?? "—"} / ${nation.continent ?? "—"}`, inline: true },
         { name: "Soldiers / Tanks", value: `${fmtNum(nation.soldiers)} / ${fmtNum(nation.tanks)}`, inline: true },
         { name: "Aircraft / Ships", value: `${fmtNum(nation.aircraft)} / ${fmtNum(nation.ships)}`, inline: true },
         { name: "Spies / Missiles / Nukes", value: `${fmtNum(nation.spies)} / ${fmtNum(nation.missiles)} / ${fmtNum(nation.nukes)}`, inline: true },
-        { name: "Projects", value: fmtNum(nation.projects), inline: true },
-        { name: "Color / Continent", value: `${nation.color ?? "—"} / ${nation.continent ?? "—"}`, inline: true },
         {
-          name: "Active / Founded",
-          value: `${nation.lastActive ? new Date(nation.lastActive).toLocaleString() : "—"}\n${nation.founded ? new Date(nation.founded).toLocaleDateString() : "—"}`,
+          name: "Last Active",
+          value: nation.lastActive ? new Date(nation.lastActive).toLocaleString() : "—",
           inline: true,
         },
       )
@@ -224,7 +220,6 @@ function mapNationGraphQL(n: any): NationCore {
     allianceId: n.alliance?.id ? Number(n.alliance.id) : n.alliance_id ? Number(n.alliance_id) : null,
     allianceName: n.alliance?.name ?? null,
     score: safeNum(n.score),
-    cities: safeNum(n.cities),
     color: n.color ?? null,
     continent: n.continent ?? null,
     soldiers: safeNum(n.soldiers),
@@ -234,8 +229,6 @@ function mapNationGraphQL(n: any): NationCore {
     spies: safeNum(n.spies),
     missiles: safeNum(n.missiles),
     nukes: safeNum(n.nukes),
-    projects: safeNum(n.projects),
-    founded: n.founded ?? null,
     lastActive: n.last_active ?? null,
   };
 }
@@ -244,20 +237,33 @@ function safeNum(v: any): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
-/* ---------- GraphQL + REST ---------- */
+/* ---------- GraphQL (schema-safe) ---------- */
 
 /**
- * IMPORTANT: embed the numeric ID literally; the variables form sometimes returns 0 rows.
+ * IMPORTANT: embed the numeric ID literally; variables sometimes return 0 rows on this endpoint.
+ * Also, only select scalar fields supported by the current schema (avoid 'cities' array and 'founded').
  */
 async function fetchNationById(api: string, id: number): Promise<NationCore | null> {
   const gql = `
     {
       nations(id:[${id}], first:1) {
         data {
-          id nation_name leader_name
-          alliance_id alliance { id name }
-          score cities color continent soldiers tanks aircraft ships spies missiles nukes projects
-          founded last_active
+          id
+          nation_name
+          leader_name
+          alliance_id
+          alliance { id name }
+          score
+          color
+          continent
+          soldiers
+          tanks
+          aircraft
+          ships
+          spies
+          missiles
+          nukes
+          last_active
         }
       }
     }`;
@@ -280,24 +286,7 @@ async function fetchNationById(api: string, id: number): Promise<NationCore | nu
 }
 
 /**
- * REST keyword search fallback. Returns nation IDs; we hydrate each via GraphQL by ID.
- */
-async function restKeywordSearch(api: string, kw: string, limit = 5): Promise<number[]> {
-  if (!kw || kw.length < 2) return [];
-  const url = `https://api.politicsandwar.com/v3/nations?api_key=${encodeURIComponent(api)}&keyword=${encodeURIComponent(kw)}&limit=${limit}`;
-  const r = await fetch(url);
-  if (!r.ok) {
-    console.warn("[/who] REST search HTTP", r.status);
-    return [];
-  }
-  const j: any = await r.json().catch(() => ({}));
-  const arr = Array.isArray(j?.data) ? j.data : [];
-  console.log("[/who] REST results", arr.length);
-  return arr.slice(0, limit).map((n: any) => Number(n?.id)).filter(Boolean);
-}
-
-/**
- * Returns up to 5 nations; tries GraphQL (name/leader) first, then REST fallback → hydrate by ID.
+ * Returns up to 5 nations; tries GraphQL filter with LIKE on name/leader.
  */
 async function searchNations(
   api: string,
@@ -307,16 +296,29 @@ async function searchNations(
   const out: NationCore[] = [];
   if (kw.length < 2) return out;
 
-  // GraphQL attempt
-  const run = async (variables: any, argLine: string, tag: string) => {
+  const like = `%${kw}%`;
+
+  const run = async (variables: any, filterLine: string, tag: string) => {
     const gql = `
-      query($name:String, $leaders:[String!]) {
-        nations(${argLine}, first:5, orderBy:{column:SCORE, order:DESC}) {
+      query($q:String) {
+        nations(first:5, ${filterLine}, orderBy:[{column:SCORE, order:DESC}]) {
           data {
-            id nation_name leader_name
-            alliance_id alliance { id name }
-            score cities color continent soldiers tanks aircraft ships spies missiles nukes projects
-            founded last_active
+            id
+            nation_name
+            leader_name
+            alliance_id
+            alliance { id name }
+            score
+            color
+            continent
+            soldiers
+            tanks
+            aircraft
+            ships
+            spies
+            missiles
+            nukes
+            last_active
           }
         }
       }`;
@@ -331,24 +333,17 @@ async function searchNations(
     }
     const j: any = await r.json().catch(() => ({}));
     const arr = j?.data?.nations?.data ?? [];
-    console.log("[/who] GraphQL results", tag, arr.length);
+    console.log("[/who] GraphQL results", tag, arr.length, j?.errors ? JSON.stringify(j.errors) : "");
     for (const n of arr) out.push(mapNationGraphQL(n));
   };
 
   if (opts.nationName) {
-    await run({ name: kw }, "name:$name", "name");
+    // nation name LIKE
+    await run({ q: like }, `filter:{ nation_name:{ like:$q } }`, "filter:nation_name");
   }
   if (opts.leaderName && out.length === 0) {
-    await run({ leaders: [kw] }, "leader_name:$leaders", "leader_name");
-  }
-
-  // REST fallback if GraphQL yielded nothing
-  if (out.length === 0) {
-    const ids = await restKeywordSearch(api, kw, 5);
-    for (const id of ids) {
-      const n = await fetchNationById(api, id);
-      if (n) out.push(n);
-    }
+    // leader name LIKE
+    await run({ q: like }, `filter:{ leader_name:{ like:$q } }`, "filter:leader_name");
   }
 
   // Dedup + rank
