@@ -209,3 +209,14 @@ model SafeTxn {
 
   @@index([memberId, createdAt])
 }
+model AllianceGuild {
+  id         Int      @id @default(autoincrement())
+  allianceId Int
+  guildId    String   @unique
+  createdAt  DateTime @default(now())
+
+  alliance   Alliance @relation(fields: [allianceId], references: [id], onDelete: Cascade)
+
+  @@index([allianceId])
+}
+
