@@ -11,6 +11,10 @@ import * as safekeeping_history from "./safekeeping_history";
 import * as market_value from './market_value';
 import * as who from './who';
 import * as send from './send';
+import * as guild_link_alliance from "./guild_link_alliance";
+import * as guild_unlink_alliance from "./guild_unlink_alliance";
+import * as offshore_set from "./offshore_set";
+
 
 
 export type CommandModule = {
@@ -29,6 +33,10 @@ export const commandModules: CommandModule[] = [
   market_value,
   who,
   send,
+  guild_link_alliance,
+  guild_unlink_alliance,
+  offshore_set,
+
 ].filter((m) => m?.data && m?.execute);
 
 // JSON payloads for registration (consumed by src/index.ts)
