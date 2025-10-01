@@ -11,6 +11,7 @@ import {
   SlashCommandBuilder,
   TextInputBuilder,
   TextInputStyle,
+  Colors,
 } from "discord.js";
 import { PrismaClient } from "@prisma/client";
 
@@ -18,14 +19,13 @@ const prisma = new PrismaClient();
 
 // ---------- helpers ----------
 function parseNumericIdFromInput(input: string): number | null {
-  // Accept either plain number or any link containing id=12345 or /id=12345
+  // Accept plain number or any link containing id=12345
   const raw = input.trim();
   const match = raw.match(/id\s*=\s*(\d+)/i);
   if (match?.[1]) {
     const n = Number(match[1]);
     return Number.isFinite(n) && n > 0 ? n : null;
   }
-  // If not a link, permit plain integer
   const digits = raw.replace(/[^\d]/g, "");
   if (digits.length) {
     const n = Number(digits);
@@ -34,58 +34,48 @@ function parseNumericIdFromInput(input: string): number | null {
   return null;
 }
 
-async function getMemberByDiscord(discordId: string) {
-  // Adjust field name if your schema differs (we've used Member.discordId in prior work)
-  return prisma.member.findFirst({ where: { discordId } });
+function nice(n: number) {
+  return n.toLocaleString("en-US");
 }
 
-async function getSafekeeping(memberId: number) {
-  // Ensure a row exists; create zeros if missing
+async function getAllianceByGuild(guildId?: string | null) {
+  if (!guildId) return null;
+  return prisma.alliance.findFirst({ where: { guildId } });
+}
+
+async function getMember(allianceId: number, discordId: string) {
+  return prisma.member.findFirst({
+    where: { allianceId, discordId },
+    include: { balance: true },
+  });
+}
+
+async function ensureSafekeeping(memberId: number) {
   let sk = await prisma.safekeeping.findFirst({ where: { memberId } });
   if (!sk) {
     sk = await prisma.safekeeping.create({
       data: {
         memberId,
-        money: 0,
-        food: 0,
-        coal: 0,
-        oil: 0,
-        uranium: 0,
-        lead: 0,
-        iron: 0,
-        bauxite: 0,
-        gasoline: 0,
-        munitions: 0,
-        steel: 0,
-        aluminum: 0,
+        money: 0, food: 0, coal: 0, oil: 0, uranium: 0,
+        lead: 0, iron: 0, bauxite: 0, gasoline: 0,
+        munitions: 0, steel: 0, aluminum: 0,
       },
     });
   }
   return sk;
 }
 
-function nice(n: number) {
-  return n.toLocaleString("en-US");
-}
-
 // ---------- slash command ----------
 export const data = new SlashCommandBuilder()
   .setName("send")
-  .setDescription("Send from your Safekeeping: choose Nation or Alliance, then fill the modal.");
+  .setDescription("Send from your Safekeeping: pick Nation or Alliance, then fill the modal.");
 
-// On /send => show two buttons (NO autodetect)
+// On /send => show two buttons (explicit choice; no autodetect)
 export async function execute(i: ChatInputCommandInteraction) {
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder()
-      .setCustomId("send:pick:nation")
-      .setLabel("Send to Nation")
-      .setStyle(ButtonStyle.Primary),
-    new ButtonBuilder()
-      .setCustomId("send:pick:alliance")
-      .setLabel("Send to Alliance")
-      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("send:pick:nation").setLabel("Send to Nation").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("send:pick:alliance").setLabel("Send to Alliance").setStyle(ButtonStyle.Secondary),
   );
-
   await i.reply({
     content: "Choose where to send funds from your Safekeeping:",
     components: [row],
@@ -93,7 +83,7 @@ export async function execute(i: ChatInputCommandInteraction) {
   });
 }
 
-// ---------- button handlers: open modals ----------
+// ---------- buttons → open the correct modal ----------
 export async function handleButton(i: ButtonInteraction) {
   if (i.customId === "send:pick:nation") {
     const modal = new ModalBuilder().setCustomId("send:modal:nation").setTitle("Send to Nation");
@@ -168,25 +158,22 @@ export async function handleButton(i: ButtonInteraction) {
   }
 }
 
-// ---------- modal handlers: validate + create request ----------
+// ---------- modal submit → validate + create request (PENDING) ----------
 export async function handleModal(i: ModalSubmitInteraction) {
   const isNation = i.customId === "send:modal:nation";
   const isAlliance = i.customId === "send:modal:alliance";
   if (!isNation && !isAlliance) return;
 
-  // Inputs
   const rawAmt = (i.fields.getTextInputValue("send:amount") || "").trim();
   const rawRecipient = (i.fields.getTextInputValue("send:recipient") || "").trim();
   const note = (i.fields.getTextInputValue("send:note") || "").trim();
 
-  // Amount → number
   const amount = Number(rawAmt.replace(/[,$\s_]/g, ""));
   if (!Number.isFinite(amount) || amount <= 0) {
     await i.reply({ ephemeral: true, content: "❌ Amount must be a positive number." });
     return;
   }
 
-  // Recipient ID (only numeric parsing; we DO NOT infer type)
   const recipientId = parseNumericIdFromInput(rawRecipient);
   if (!recipientId) {
     await i.reply({
@@ -198,14 +185,19 @@ export async function handleModal(i: ModalSubmitInteraction) {
     return;
   }
 
-  // Member + balance
-  const member = await getMemberByDiscord(i.user.id);
+  const alliance = await getAllianceByGuild(i.guildId);
+  if (!alliance) {
+    await i.reply({ ephemeral: true, content: "This server is not linked yet. Run /setup_alliance first." });
+    return;
+  }
+
+  const member = await getMember(alliance.id, i.user.id);
   if (!member) {
     await i.reply({ ephemeral: true, content: "❌ You’re not linked to a Member yet. Use /link_nation first." });
     return;
   }
 
-  const sk = await getSafekeeping(member.id);
+  const sk = await ensureSafekeeping(member.id);
   if ((sk.money ?? 0) < amount) {
     await i.reply({
       ephemeral: true,
@@ -214,40 +206,40 @@ export async function handleModal(i: ModalSubmitInteraction) {
     return;
   }
 
-  // Create PENDING request. We do NOT deduct yet; deduction happens on approval.
+  // NOTE: We store only money for now; resources later if needed.
+  // Matches your schema: WithdrawalRequest { allianceId, memberId, payload, createdBy, status, ... }
+  // We also include our extra fields (kind/recipientX/note) if they exist in your Prisma schema.
   const data: any = {
+    allianceId: alliance.id,
     memberId: member.id,
-    // If your schema uses JSON 'resources', keep as below. If columns, adapt.
-    resources: { money: amount },
-    status: "PENDING", // your existing WithdrawalStatus enum value
-    kind: isNation ? "NATION" : "ALLIANCE", // your WithdrawalKind enum
-    note: note || null,
+    createdBy: i.user.id,
+    status: "PENDING",                 // WithdrawStatus
+    payload: { money: amount },        // your JSON payload field
+    note: note || null,                // if present in schema
+    kind: isNation ? "NATION" : "ALLIANCE", // if enum field present (WithdrawalKind)
   };
-  if (isNation) data.recipientNationId = recipientId;
-  if (isAlliance) data.recipientAllianceId = recipientId;
+  if (isNation) data.recipientNationId = recipientId;      // if column exists
+  if (isAlliance) data.recipientAllianceId = recipientId;  // if column exists
 
   const wr = await prisma.withdrawalRequest.create({ data });
 
-  // Confirm to requester
+  // Ephemeral confirmation to requester. (Banker approval wiring comes next.)
   const e = new EmbedBuilder()
     .setTitle(isNation ? "Send to Nation — Request Submitted" : "Send to Alliance — Request Submitted")
-    .setDescription("Your request will be reviewed by a Banker before it’s executed in-game.")
+    .setDescription("Your request is pending banker review.")
     .addFields(
       { name: "Amount", value: `$${nice(amount)}`, inline: true },
-      {
-        name: isNation ? "Nation ID" : "Alliance ID",
-        value: String(recipientId),
-        inline: true,
-      },
+      { name: isNation ? "Nation ID" : "Alliance ID", value: String(recipientId), inline: true },
       { name: "Note", value: note ? note : "—", inline: false },
       { name: "Request ID", value: String(wr.id), inline: true },
       { name: "Kind", value: isNation ? "NATION" : "ALLIANCE", inline: true },
     )
-    .setFooter({ text: "Gemstone Tools • Safekeeping ➜ Recipient" })
+    .setColor(Colors.Blurple)
     .setTimestamp(new Date());
 
   await i.reply({ ephemeral: true, embeds: [e] });
 
-  // Step 3 (next message): I’ll wire this into your approvals channel with Approve/Reject buttons,
-  // and on Approve we’ll deduct Safekeeping and mark processed.
+  // We intentionally DO NOT post to review channel yet to avoid using your generic
+  // w:approve flow (which auto-pays to the requester). Next step will add a dedicated
+  // approvals embed + buttons for "send" that pay the correct recipient.
 }
