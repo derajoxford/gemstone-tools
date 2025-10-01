@@ -202,7 +202,19 @@ client.on('interactionCreate', async (i: Interaction) => {
       if (i.customId.startsWith('sk:modal:')) return handleSafekeepingModalSubmit(i as any);
 
     } else if (i.isButton()) {
-      // ✅ NEW: /send button handling (picker)
+      // ✅ NEW: /send banker approval buttons (place BEFORE the generic approval handler)
+      if (i.customId.startsWith('send:req:approve:') || i.customId.startsWith('send:req:deny:')) {
+        try {
+          const mod = await import('./commands/send.js');
+          if ((mod as any)?.handleApprovalButton) return (mod as any).handleApprovalButton(i as any);
+        } catch (err) {
+          console.error('send approval button error', err);
+          try { await (i as any).reply({ content: 'Something went wrong.', ephemeral: true }); } catch {}
+          return;
+        }
+      }
+
+      // ✅ NEW: /send picker buttons (Nation vs Alliance)
       if (i.customId === 'send:pick:nation' || i.customId === 'send:pick:alliance') {
         try {
           const mod = await import('./commands/send.js');
@@ -220,6 +232,7 @@ client.on('interactionCreate', async (i: Interaction) => {
       if (i.customId.startsWith('sk:open:')) return handleSafekeepingOpenPaged(i as any);
       if (i.customId === 'sk:done') return handleSafekeepingDone(i as any);
 
+      // Existing global approval buttons for withdrawals
       return handleApprovalButton(i);
     }
   } catch (err) {
