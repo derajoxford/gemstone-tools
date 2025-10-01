@@ -9,11 +9,16 @@ import {
 import pino from 'pino';
 // @ts-ignore - types may not be installed; not needed for runtime
 import cron from 'node-cron';
-import { PrismaClient, WithdrawStatus } from '@prisma/client';
+import { PrismaClient, Prisma } from '@prisma/client';
 import { seal, open } from './lib/crypto.js';
 import { RES_EMOJI, ORDER } from './lib/emojis.js';
 import { extraCommandsJSON, findCommandByName } from './commands/registry';
 import { startAutoApply } from "./jobs/pnw_auto_apply";
+
+// ✅ Prisma enum runtime alias (ESM-safe)
+const WithdrawStatus = Prisma.$Enums.WithdrawStatus;
+// (Optional) TS type alias if you reference it in annotations:
+// type WithdrawStatusT = Prisma.WithdrawStatus;
 
 // ✅ Commands with TS source
 import * as Who from "./commands/who";
@@ -502,7 +507,7 @@ async function handleWithdrawList(i: ChatInputCommandInteraction) {
   const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? '' } });
   if (!alliance) return i.reply({ content: 'No alliance linked here.', ephemeral: true });
 
-  const statusStr = i.options.getString('status') as WithdrawStatus | null;
+  const statusStr = i.options.getString('status') as Prisma.WithdrawStatus | null;
   const status = statusStr ?? 'PENDING';
 
   const rows = await prisma.withdrawalRequest.findMany({
@@ -539,7 +544,7 @@ async function handleWithdrawSet(i: ChatInputCommandInteraction) {
   if (!alliance) return i.reply({ content: 'No alliance linked here.', ephemeral: true });
 
   const id = i.options.getString('id', true);
-  const status = i.options.getString('status', true) as WithdrawStatus;
+  const status = i.options.getString('status', true) as Prisma.WithdrawStatus;
 
   try {
     const updated = await prisma.withdrawalRequest.update({
@@ -571,7 +576,7 @@ async function handleApprovalButton(i: ButtonInteraction) {
   }
   const [prefix, action, id] = i.customId.split(':');
   if (prefix !== 'w' || !id) return;
-  const status: WithdrawStatus = action === 'approve' ? 'APPROVED' : 'REJECTED';
+  const status: Prisma.WithdrawStatus = action === 'approve' ? 'APPROVED' : 'REJECTED';
   const req = await prisma.withdrawalRequest.findUnique({ where: { id } });
   if (!req) return i.reply({ content: 'Request not found.', ephemeral: true });
   if (req.status !== 'PENDING') return i.reply({ content: `Already ${req.status}.`, ephemeral: true });
