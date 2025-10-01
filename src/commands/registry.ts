@@ -10,6 +10,7 @@ import * as manual_adjust_log_channel from "./manual_adjust_log_channel";
 import * as safekeeping_history from "./safekeeping_history";
 import * as market_value from './market_value';
 import * as who from './who';
+import * as send from './send';
 
 
 export type CommandModule = {
@@ -27,6 +28,7 @@ export const commandModules: CommandModule[] = [
   safekeeping_history,
   market_value,
   who,
+  send,
 ].filter((m) => m?.data && m?.execute);
 
 // JSON payloads for registration (consumed by src/index.ts)
