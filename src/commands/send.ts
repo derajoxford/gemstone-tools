@@ -35,6 +35,13 @@ function onlyResourceEntries(obj: Record<string, any>) {
   }
   return out;
 }
+function httpsOrNull(url?: string | null) {
+  if (!url) return null;
+  try {
+    const u = new URL(url);
+    return u.protocol === "https:" ? u.toString() : null;
+  } catch { return null; }
+}
 
 // ---- Session (per user)
 type DestType = "NATION" | "ALLIANCE";
@@ -42,7 +49,8 @@ type SendSession = {
   destType: DestType | null;
   targetId: number | null;
   targetLink?: string | null;
-  targetName?: string | null; // NEW: resolved name (best-effort)
+  targetName?: string | null; // resolved name
+  targetFlag?: string | null; // resolved https flag url
   note?: string | null;
   payload: Record<string, number>;
   createdAt: number;
@@ -77,11 +85,14 @@ function extractId(input: string): number | null {
   return null;
 }
 
-// ---- PnW GraphQL name lookup (best-effort)
-// Requires an API key (alliance key or PNW_DEFAULT_API_KEY). If lookup fails, return null.
-async function lookupRecipientName(destType: DestType, id: number, guildId?: string | null): Promise<string | null> {
+// ---- PnW GraphQL lookup (name + flag) — best-effort
+async function lookupRecipient(
+  destType: DestType,
+  id: number,
+  guildId?: string | null
+): Promise<{ name: string | null; flag: string | null }> {
   try {
-    // pull a usable key: alliance API key for this guild, else env default
+    // get API key: guild alliance key > env default
     let apiKey = process.env.PNW_DEFAULT_API_KEY || "";
 
     if (guildId) {
@@ -92,15 +103,15 @@ async function lookupRecipientName(destType: DestType, id: number, guildId?: str
       const apiKeyEnc = alliance?.keys?.[0];
       if (apiKeyEnc) apiKey = open(apiKeyEnc.encryptedApiKey as any, apiKeyEnc.nonceApi as any) || apiKey;
     }
-    if (!apiKey) return null;
+    if (!apiKey) return { name: null, flag: null };
 
     const url = "https://api.politicsandwar.com/graphql?api_key=" + encodeURIComponent(apiKey);
     let q = "";
     if (destType === "NATION") {
-      // nation(id: ...) shape may vary; this is best-effort
-      q = `query{ nation(id:${id}){ nation_name name } }`;
+      // fields may vary slightly by API version; try common ones
+      q = `query{ nation(id:${id}){ nation_name name flag } }`;
     } else {
-      q = `query{ alliance(id:${id}){ name } }`;
+      q = `query{ alliance(id:${id}){ name flag } }`;
     }
 
     const res = await fetch(url, {
@@ -113,17 +124,21 @@ async function lookupRecipientName(destType: DestType, id: number, guildId?: str
     });
 
     const data = await res.json().catch(() => ({} as any));
-    if (!res.ok || (data as any)?.errors) return null;
+    if (!res.ok || (data as any)?.errors) return { name: null, flag: null };
 
     if (destType === "NATION") {
       const n = (data as any)?.data?.nation;
-      return n?.nation_name || n?.name || null;
+      const name = n?.nation_name || n?.name || null;
+      const flag = httpsOrNull(n?.flag || null);
+      return { name, flag };
     } else {
       const a = (data as any)?.data?.alliance;
-      return a?.name || null;
+      const name = a?.name || null;
+      const flag = httpsOrNull(a?.flag || null);
+      return { name, flag };
     }
   } catch {
-    return null;
+    return { name: null, flag: null };
   }
 }
 
@@ -180,6 +195,7 @@ export async function execute(i: ChatInputCommandInteraction) {
     targetId: null,
     targetLink: null,
     targetName: null,
+    targetFlag: null,
     note: null,
     payload: {},
     createdAt: Date.now(),
@@ -206,7 +222,7 @@ export async function handleButton(i: ButtonInteraction) {
 
   // Ensure session
   const sess = sendSessions.get(i.user.id) || {
-    destType: null, targetId: null, targetLink: null, targetName: null, payload: {}, note: null, createdAt: Date.now()
+    destType: null, targetId: null, targetLink: null, targetName: null, targetFlag: null, payload: {}, note: null, createdAt: Date.now()
   };
   sendSessions.set(i.user.id, sess);
 
@@ -252,7 +268,7 @@ export async function handleModal(i: any) {
   const page = Math.max(0, parseInt(String(i.customId).split(":")[2] || "0", 10));
   const keys = sendSliceAll(page, page === 0);
 
-  // First page: target + note + resolve name (best-effort)
+  // First page: target + note + resolve name & flag (best-effort)
   if (page === 0) {
     const targetRaw = (i.fields.getTextInputValue("target") || "").trim();
     const noteRaw = (i.fields.getTextInputValue("note") || "").trim();
@@ -268,10 +284,11 @@ export async function handleModal(i: any) {
     sess.targetLink = targetRaw || null;
     sess.note = noteRaw || null;
 
-    // attempt name lookup (non-blocking; if fails, we still proceed)
+    // attempt lookup
     try {
-      const name = await lookupRecipientName(sess.destType, id, i.guildId);
+      const { name, flag } = await lookupRecipient(sess.destType, id, i.guildId);
       if (name) sess.targetName = name;
+      if (flag) sess.targetFlag = flag;
     } catch { /* ignore */ }
   }
 
@@ -287,7 +304,7 @@ export async function handleModal(i: any) {
   }
   sendSessions.set(i.user.id, sess);
 
-  // Build progress view with summary and resolved name/link
+  // Build progress view with summary and resolved name/link/flag
   const total = sendPageCountAll();
 
   const btns: ButtonBuilder[] = [];
@@ -322,22 +339,22 @@ export async function handleModal(i: any) {
     ? (sess.targetId ? `https://politicsandwar.com/nation/id=${sess.targetId}` : null)
     : (sess.targetId ? `https://politicsandwar.com/alliance/id=${sess.targetId}` : null);
 
-  const prettyTarget = [
-    `**Recipient**: ${destStr}${sess.targetId ? ` #${sess.targetId}` : ""}`,
-    sess.targetName ? `**Name**: ${sess.targetName}` : null,
-    targetUrl ? `[Open link](${targetUrl})` : null
-  ].filter(Boolean).join(" — ");
+  const lines: string[] = [];
+  lines.push(`**Recipient**: ${destStr}${sess.targetId ? ` #${sess.targetId}` : ""}`);
+  if (sess.targetName) lines.push(`**Name**: ${sess.targetName}`);
+  if (targetUrl) lines.push(`[Open link](${targetUrl})`);
+  lines.push(``);
+  lines.push(`**Note**: ${sess.note && sess.note.length ? sess.note : "—"}`);
+  lines.push(``);
+  lines.push(`**Selected so far**:`);
+  lines.push(summary);
 
   const embed = new EmbedBuilder()
     .setTitle("🧾 Send — In Progress")
-    .setDescription([
-      prettyTarget || "**Recipient**: —",
-      `**Note**: ${sess.note && sess.note.length ? sess.note : "—"}`,
-      "",
-      `**Selected so far**:`,
-      summary
-    ].join("\n"))
+    .setDescription(lines.join("\n"))
     .setColor(Colors.Gold);
+
+  if (sess.targetFlag) embed.setThumbnail(sess.targetFlag);
 
   await i.reply({ embeds: [embed], components: rows, ephemeral: true });
 }
@@ -373,35 +390,41 @@ async function handleReview(i: ButtonInteraction) {
     return i.reply({ ephemeral: true, content: `Requested more than available:\n• ${over.join("\n• ")}` });
   }
 
+  // Ensure we have a name/flag if possible
+  if (!sess.targetName || !sess.targetFlag) {
+    try {
+      const { name, flag } = await lookupRecipient(sess.destType, sess.targetId, i.guildId);
+      if (!sess.targetName && name) sess.targetName = name;
+      if (!sess.targetFlag && flag) sess.targetFlag = flag;
+      sendSessions.set(i.user.id, sess);
+    } catch { /* ignore */ }
+  }
+
   const totalStr = Object.entries(sess.payload)
     .filter(([k, v]) => ORDER.includes(k as any) && Number(v) > 0)
     .map(([k, v]) => fmtLine(k, Number(v)))
     .join(" · ") || "—";
-
-  // Ensure we have a name if possible
-  if (!sess.targetName) {
-    try {
-      const name = await lookupRecipientName(sess.destType, sess.targetId, i.guildId);
-      if (name) { sess.targetName = name; sendSessions.set(i.user.id, sess); }
-    } catch { /* ignore */ }
-  }
 
   const destStr = sess.destType === "NATION" ? "Nation" : "Alliance";
   const targetUrl = sess.destType === "NATION"
     ? `https://politicsandwar.com/nation/id=${sess.targetId}`
     : `https://politicsandwar.com/alliance/id=${sess.targetId}`;
 
+  const desc = [
+    `You are about to send **from your safekeeping** to **${destStr} #${sess.targetId}**.`,
+    sess.targetName ? `**Name**: ${sess.targetName}` : "",
+    `${targetUrl ? `[Open target link](${targetUrl})` : ""}`,
+    "",
+    `**Note**: ${sess.note && sess.note.length ? sess.note : "—"}`,
+  ].filter(Boolean).join("\n");
+
   const embed = new EmbedBuilder()
     .setTitle("✅ Review Send")
-    .setDescription([
-      `You are about to send **from your safekeeping** to **${destStr} #${sess.targetId}**.`,
-      sess.targetName ? `**Name**: ${sess.targetName}` : "",
-      `${targetUrl ? `[Open target link](${targetUrl})` : ""}`,
-      "",
-      `**Note**: ${sess.note && sess.note.length ? sess.note : "—"}`,
-    ].filter(Boolean).join("\n"))
+    .setDescription(desc)
     .addFields({ name: "Amount", value: totalStr })
     .setColor(Colors.Green);
+
+  if (sess.targetFlag) embed.setThumbnail(sess.targetFlag);
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("send:confirm").setStyle(ButtonStyle.Success).setLabel("Confirm — Send for Banker Approval"),
@@ -433,7 +456,7 @@ async function handleConfirm(i: ButtonInteraction) {
     return i.reply({ ephemeral: true, content: "Nothing selected to send." });
   }
 
-  // Store destination + note (and resolved name) inside payload._meta
+  // Store destination + note (+ name/flag) inside payload._meta
   const payloadToSave: Record<string, any> = {
     ...clean,
     _meta: {
@@ -441,6 +464,7 @@ async function handleConfirm(i: ButtonInteraction) {
       receiverId: sess.targetId,
       note: sess.note || null,
       name: sess.targetName || null,
+      flag: sess.targetFlag || null,
     }
   };
 
@@ -472,6 +496,8 @@ async function handleConfirm(i: ButtonInteraction) {
     ].join("\n"))
     .addFields({ name: "Requested", value: reqLine || "—" })
     .setColor(Colors.Gold);
+
+  if (sess.targetFlag) embed.setThumbnail(sess.targetFlag);
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId(`send:req:approve:${req.id}`).setLabel("Approve").setEmoji("✅").setStyle(ButtonStyle.Success),
@@ -531,6 +557,8 @@ export async function handleApprovalButton(i: ButtonInteraction) {
     const destType: DestType = meta.destType === "ALLIANCE" ? "ALLIANCE" : "NATION";
     const receiverId: number = Number(meta.receiverId || 0);
     const note: string | null = meta.note || null;
+    const nameMeta: string | null = meta.name || null;
+    const flagMeta: string | null = httpsOrNull(meta.flag || null);
 
     const alliance = await prisma.alliance.findUnique({
       where: { id: req.allianceId },
@@ -549,7 +577,11 @@ export async function handleApprovalButton(i: ButtonInteraction) {
         new ButtonBuilder().setCustomId(`send:req:approve:${id}`).setLabel("Approve").setEmoji("✅").setStyle(ButtonStyle.Success).setDisabled(true),
         new ButtonBuilder().setCustomId(`send:req:deny:${id}`).setLabel("Deny").setEmoji("❌").setStyle(ButtonStyle.Danger).setDisabled(true),
       );
-      const emb = new EmbedBuilder().setTitle("⚠️ Send Approved — Manual Action Needed").setDescription(`Request **${id}**`).setColor(Colors.Yellow);
+      const emb = new EmbedBuilder()
+        .setTitle("⚠️ Send Approved — Manual Action Needed")
+        .setDescription(`Request **${id}**`)
+        .setColor(Colors.Yellow);
+      if (flagMeta) emb.setThumbnail(flagMeta);
       await i.update({ embeds: [emb], components: [rowDisabled] });
       return i.followUp({ ephemeral: true, content: "Approved but **auto-send skipped** (missing keys/member/receiver). Handle manually." });
     }
@@ -572,7 +604,11 @@ export async function handleApprovalButton(i: ButtonInteraction) {
         new ButtonBuilder().setCustomId(`send:req:approve:${id}`).setLabel("Approve").setEmoji("✅").setStyle(ButtonStyle.Success).setDisabled(true),
         new ButtonBuilder().setCustomId(`send:req:deny:${id}`).setLabel("Deny").setEmoji("❌").setStyle(ButtonStyle.Danger).setDisabled(true),
       );
-      const emb = new EmbedBuilder().setTitle("⚠️ Send Approved — Auto-send Failed").setDescription(`Request **${id}**`).setColor(Colors.Yellow);
+      const emb = new EmbedBuilder()
+        .setTitle("⚠️ Send Approved — Auto-send Failed")
+        .setDescription(`Request **${id}**`)
+        .setColor(Colors.Yellow);
+      if (flagMeta) emb.setThumbnail(flagMeta);
       await i.update({ embeds: [emb], components: [rowDisabled] });
       return i.followUp({ ephemeral: true, content: "Auto-send failed. Left as **APPROVED**." });
     }
@@ -586,7 +622,11 @@ export async function handleApprovalButton(i: ButtonInteraction) {
       new ButtonBuilder().setCustomId(`send:req:approve:${id}`).setLabel("Approve").setEmoji("✅").setStyle(ButtonStyle.Success).setDisabled(true),
       new ButtonBuilder().setCustomId(`send:req:deny:${id}`).setLabel("Deny").setEmoji("❌").setStyle(ButtonStyle.Danger).setDisabled(true),
     );
-    const emb = new EmbedBuilder().setTitle("💵 Send Completed").setDescription(`Request **${id}**`).setColor(Colors.Blurple);
+    const emb = new EmbedBuilder()
+      .setTitle("💵 Send Completed")
+      .setDescription(`Request **${id}**${nameMeta ? ` — ${nameMeta}` : ""}`)
+      .setColor(Colors.Blurple);
+    if (flagMeta) emb.setThumbnail(flagMeta);
     await i.update({ embeds: [emb], components: [rowDisabled] });
 
     try {
@@ -596,9 +636,10 @@ export async function handleApprovalButton(i: ButtonInteraction) {
         const paidLine = Object.entries(resPayload).map(([k, v]) => fmtLine(k, Number(v))).join(" · ") || "—";
         const dmEmb = new EmbedBuilder()
           .setTitle("💵 Send Paid")
-          .setDescription(`Your send request **${id}** has been sent in-game.`)
+          .setDescription(`Your send request **${id}** has been sent in-game.${nameMeta ? `\n**Recipient**: ${nameMeta}` : ""}`)
           .addFields({ name: "Amount", value: paidLine })
           .setColor(Colors.Blurple);
+        if (flagMeta) dmEmb.setThumbnail(flagMeta);
         await user.send({ embeds: [dmEmb] });
       }
     } catch { /* ignore */ }
