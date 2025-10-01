@@ -11,7 +11,7 @@ import {
   TextInputBuilder,
   TextInputStyle,
 } from "discord.js";
-import { PrismaClient, WithdrawStatus } from "@prisma/client";
+import { PrismaClient } from "@prisma/client";
 import { ORDER, RES_EMOJI } from "../lib/emojis.js";
 import { open } from "../lib/crypto.js";
 
@@ -28,6 +28,13 @@ function parseNum(s: string): number {
 function fmtLine(k: string, v: number) {
   return `${RES_EMOJI[k as keyof typeof RES_EMOJI] || ""} **${k}**: ${v.toLocaleString()}`;
 }
+function onlyResourceEntries(obj: Record<string, any>) {
+  const out: Record<string, number> = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (ORDER.includes(k as any) && Number(v) > 0) out[k] = Number(v);
+  }
+  return out;
+}
 
 // ---- Session (per user)
 type DestType = "NATION" | "ALLIANCE";
@@ -42,22 +49,26 @@ type SendSession = {
 const sendSessions = new Map<string, SendSession>();
 
 // ---- Paging
-const SEND_PAGE_SIZE = 5;
+const SEND_PAGE_SIZE = 5;           // resource inputs per modal page (pages > 0)
+const SEND_PAGE_SIZE_FIRST = 3;     // resource inputs on page 0 (target+note count toward the 5-component modal cap)
+
 function sendPageCountAll() { return Math.ceil(ORDER.length / SEND_PAGE_SIZE); }
-function sendSliceAll(page: number) { const s = page * SEND_PAGE_SIZE; return ORDER.slice(s, s + SEND_PAGE_SIZE); }
+function sendSliceAll(page: number, firstPage: boolean) {
+  const s = page * SEND_PAGE_SIZE;
+  const arr = ORDER.slice(s, s + SEND_PAGE_SIZE);
+  if (firstPage) return ORDER.slice(0, SEND_PAGE_SIZE_FIRST);
+  return arr;
+}
 
 // ---- Extract ID from "id=12345" style links or raw numbers
 function extractId(input: string): number | null {
   if (!input) return null;
   const trimmed = input.trim();
 
-  // Try to pick the last long-ish number in the string
-  // e.g. https://politicsandwar.com/nation/id=696150 -> 696150
-  const matchIdEq = trimmed.match(/(?:^|[^\d])(\d{2,9})(?!\d)/g);
-  if (matchIdEq) {
-    const last = matchIdEq[matchIdEq.length - 1];
-    const digits = last.replace(/\D/g, "");
-    const id = Number(digits);
+  // Find last multi-digit number anywhere in the string
+  const all = Array.from(trimmed.matchAll(/\d{2,9}/g)).map(m => m[0]);
+  if (all.length) {
+    const id = Number(all[all.length - 1]);
     if (Number.isInteger(id) && id > 0) return id;
   }
 
@@ -189,15 +200,15 @@ export async function handleButton(i: ButtonInteraction) {
 // =====================
 export async function handleModal(i: any) {
   // customId formats:
-  //  - "send:modal:0" (first page with target + note + first resources)
-  //  - "send:modal:1", "send:modal:2", ... (resource-only pages)
+  //  - "send:modal:0" (first page with target + note + first resources (3))
+  //  - "send:modal:1", "send:modal:2", ... (resource-only pages (5))
   if (!String(i.customId).startsWith("send:modal:")) return;
 
   const sess = sendSessions.get(i.user.id);
   if (!sess) return i.reply({ ephemeral: true, content: "Session expired. Start again with **/send**." });
 
   const page = Math.max(0, parseInt(String(i.customId).split(":")[2] || "0", 10));
-  const keys = sendSliceAll(page);
+  const keys = sendSliceAll(page, page === 0);
 
   // First page: target + note
   if (page === 0) {
@@ -236,27 +247,35 @@ export async function handleModal(i: any) {
 
   // After submit, show paging controls + Review/Cancel
   const total = sendPageCountAll();
-  const btns: ButtonBuilder[] = [];
 
+  const btns: ButtonBuilder[] = [];
   for (let p = 0; p < total; p++) {
     btns.push(
       new ButtonBuilder()
         .setCustomId(`send:open:${p}`)
         .setLabel(`Page ${p + 1}/${total}`)
-        .setStyle(p === page ? ButtonStyle.Primary : ButtonStyle.Secondary)
+        .setStyle(ButtonStyle.Secondary)
     );
   }
+  // Highlight current page by replacing that button with Primary
+  if (btns[page]) btns[page].setStyle(ButtonStyle.Primary);
 
-  const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(...btns.slice(0, Math.min(5, btns.length)));
-  const row2 = btns.length > 5 ? new ActionRowBuilder<ButtonBuilder>().addComponents(...btns.slice(5)) : null;
+  const rows: any[] = [];
+  // First 5 page buttons in row 1
+  if (btns.length > 0) rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(...btns.slice(0, 5)));
+  // Next 5 (rare) in row 2
+  if (btns.length > 5) rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(...btns.slice(5, 10)));
 
-  const reviewRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("send:review").setStyle(ButtonStyle.Success).setLabel("Review & Confirm"),
-    new ButtonBuilder().setCustomId("send:cancel").setStyle(ButtonStyle.Danger).setLabel("Cancel")
+  // Review/cancel row
+  rows.push(
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("send:review").setStyle(ButtonStyle.Success).setLabel("Review & Confirm"),
+      new ButtonBuilder().setCustomId("send:cancel").setStyle(ButtonStyle.Danger).setLabel("Cancel")
+    )
   );
 
   const summary = Object.entries(sess.payload)
-    .filter(([, v]) => Number(v) > 0)
+    .filter(([k, v]) => ORDER.includes(k as any) && Number(v) > 0)
     .map(([k, v]) => `${RES_EMOJI[k as any] ?? ""}${k}: ${Number(v).toLocaleString()}`)
     .join("  •  ") || "— none yet —";
 
@@ -275,10 +294,6 @@ export async function handleModal(i: any) {
       summary
     ].join("\n"))
     .setColor(Colors.Gold);
-
-  const rows: any[] = [row1];
-  if (row2) rows.push(row2);
-  rows.push(reviewRow);
 
   await i.reply({ embeds: [embed], components: rows, ephemeral: true });
 }
@@ -318,7 +333,7 @@ async function handleReview(i: ButtonInteraction) {
   }
 
   const totalStr = Object.entries(sess.payload)
-    .filter(([, v]) => Number(v) > 0)
+    .filter(([k, v]) => ORDER.includes(k as any) && Number(v) > 0)
     .map(([k, v]) => fmtLine(k, Number(v)))
     .join(" · ") || "—";
 
@@ -364,29 +379,23 @@ async function handleConfirm(i: ButtonInteraction) {
     return i.reply({ ephemeral: true, content: "No safekeeping found. Run /link_nation first." });
   }
 
-  // Final payload cleanup: keep only > 0
-  const clean: Record<string, number> = {};
-  for (const [k, v] of Object.entries(sess.payload)) {
-    if (!ORDER.includes(k as any)) continue;
-    const num = Number(v);
-    if (Number.isFinite(num) && num > 0) clean[k] = num;
-  }
+  // Final payload cleanup: keep only > 0 resource keys
+  const clean = onlyResourceEntries(sess.payload);
   if (!Object.keys(clean).length) {
     return i.reply({ ephemeral: true, content: "Nothing selected to send." });
   }
 
-  // Create request in DB (re-using WithdrawalRequest table)
-  // IMPORTANT: do NOT include `note` in prisma call (column doesn't exist)
+  // Create request in DB
+  // Store destination and note under payload._meta to avoid schema changes.
+  const payloadToSave: Record<string, any> = { ...clean, _meta: { destType: sess.destType, receiverId: sess.targetId, note: sess.note || null } };
+
   const req = await prisma.withdrawalRequest.create({
     data: {
       allianceId: alliance.id,
       memberId: member.id,
       createdBy: i.user.id,
       status: "PENDING",
-      payload: clean,
-      kind: sess.destType, // Prisma has this column in your schema based on earlier logs
-      recipientNationId: sess.destType === "NATION" ? sess.targetId : null,
-      recipientAllianceId: sess.destType === "ALLIANCE" ? sess.targetId : null,
+      payload: payloadToSave,
     },
   });
 
@@ -425,7 +434,7 @@ async function handleConfirm(i: ButtonInteraction) {
     if (ch && "send" in ch) await (ch as any).send({ embeds: [embed], components: [row] });
   } catch { /* ignore */ }
 
-  // Keep session (note lives only in session; DB has no note field)
+  // Keep session (no need to delete; harmless)
 }
 
 // =====================
@@ -437,111 +446,129 @@ export async function handleApprovalButton(i: ButtonInteraction) {
     return i.reply({ ephemeral: true, content: "You lack permission to approve/deny." });
   }
 
-  const [prefix, action, id] = String(i.customId).split(":"); // send:req:<action>:<id> -> we used send:req:approve:<id>
-  if (prefix !== "send" || !id) return;
+  const cid = String(i.customId);
+  const id = cid.split(":").pop();
+  if (!id) return i.reply({ ephemeral: true, content: "Bad request id." });
+
+  const isApprove = cid.startsWith("send:req:approve:");
+  const isDeny = cid.startsWith("send:req:deny:");
 
   const req = await prisma.withdrawalRequest.findUnique({ where: { id } });
   if (!req) return i.reply({ ephemeral: true, content: "Request not found." });
   if (req.status !== "PENDING") return i.reply({ ephemeral: true, content: `Already ${req.status}.` });
 
-  // Deny path
-  if (action === "req" || action === "deny") {
-    // Some older buttons might be "send:req:deny:<id>"
-    if (String(i.customId).includes(":deny:")) {
-      await prisma.withdrawalRequest.update({ where: { id }, data: { status: "REJECTED", reviewerId: i.user.id } });
+  if (isDeny) {
+    await prisma.withdrawalRequest.update({ where: { id }, data: { status: "REJECTED", reviewerId: i.user.id } });
 
-      // Disable buttons
-      const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder().setCustomId(`send:req:approve:${id}`).setLabel("Approve").setEmoji("✅").setStyle(ButtonStyle.Success).setDisabled(true),
-        new ButtonBuilder().setCustomId(`send:req:deny:${id}`).setLabel("Deny").setEmoji("❌").setStyle(ButtonStyle.Danger).setDisabled(true),
-      );
-      const emb = new EmbedBuilder().setTitle("❌ Send Rejected").setDescription(`Request **${id}**`).setColor(Colors.Red);
-      await i.update({ embeds: [emb], components: [row] });
-
-      // DM requester
-      try {
-        const m = await prisma.member.findUnique({ where: { id: req.memberId } });
-        if (m) {
-          const user = await i.client.users.fetch(m.discordId);
-          await user.send({ embeds: [new EmbedBuilder().setTitle("❌ Send Rejected").setDescription(`Request **${id}** — reviewed by <@${i.user.id}>`).setColor(Colors.Red)] });
-        }
-      } catch { /* ignore */ }
-      return;
-    }
-  }
-
-  // Approve path: perform in-game transfer
-  // Fetch alliance & member for keys and for decrement
-  const alliance = await prisma.alliance.findUnique({
-    where: { id: req.allianceId },
-    include: { keys: { orderBy: { id: "desc" }, take: 1 } }
-  });
-  const member = await prisma.member.findUnique({ where: { id: req.memberId } });
-
-  const apiKeyEnc = alliance?.keys?.[0];
-  const apiKey = apiKeyEnc ? open(apiKeyEnc.encryptedApiKey as any, apiKeyEnc.nonceApi as any) : (process.env.PNW_DEFAULT_API_KEY || "");
-  const botKey = process.env.PNW_BOT_KEY || "";
-
-  if (!member || !apiKey || !botKey) {
-    await prisma.withdrawalRequest.update({ where: { id }, data: { status: "APPROVED", reviewerId: i.user.id } });
-    return i.reply({ ephemeral: true, content: "⚠️ Approved but **auto-send skipped** (missing API key / bot key / member). Handle manually." });
-  }
-
-  // We did not store 'note' in DB, so embed won't have it here.
-  // Use a deterministic note for the in-game record:
-  const note = `GemstoneTools send ${id} • reviewer ${i.user.id}`;
-
-  const destType = (req as any).kind as DestType;
-  const receiverId = destType === "NATION" ? (req as any).recipientNationId : (req as any).recipientAllianceId;
-  const ok = await pnwSend({
-    apiKey, botKey,
-    destType,
-    receiverId: Number(receiverId),
-    payload: req.payload as Record<string, number>,
-    note,
-  });
-
-  if (!ok) {
-    // Mark as approved but not paid; banker can retry manually
-    await prisma.withdrawalRequest.update({ where: { id }, data: { status: "APPROVED", reviewerId: i.user.id } });
-
-    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    // Disable buttons
+    const rowDisabled = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId(`send:req:approve:${id}`).setLabel("Approve").setEmoji("✅").setStyle(ButtonStyle.Success).setDisabled(true),
       new ButtonBuilder().setCustomId(`send:req:deny:${id}`).setLabel("Deny").setEmoji("❌").setStyle(ButtonStyle.Danger).setDisabled(true),
     );
-    const emb = new EmbedBuilder().setTitle("⚠️ Send Approved — Auto-send Failed").setDescription(`Request **${id}**`).setColor(Colors.Yellow);
-    await i.update({ embeds: [emb], components: [row] });
-    return i.followUp({ ephemeral: true, content: "Auto-send failed. Left as **APPROVED**." });
+    const emb = new EmbedBuilder().setTitle("❌ Send Rejected").setDescription(`Request **${id}**`).setColor(Colors.Red);
+    await i.update({ embeds: [emb], components: [rowDisabled] });
+
+    // DM requester
+    try {
+      const m = await prisma.member.findUnique({ where: { id: req.memberId } });
+      if (m) {
+        const user = await i.client.users.fetch(m.discordId);
+        await user.send({ embeds: [new EmbedBuilder().setTitle("❌ Send Rejected").setDescription(`Request **${id}** — reviewed by <@${i.user.id}>`).setColor(Colors.Red)] });
+      }
+    } catch { /* ignore */ }
+    return;
   }
 
-  // Decrement the requester's safekeeping and mark PAID
-  const dec: any = {};
-  for (const [k, v] of Object.entries(req.payload as any)) dec[k] = { decrement: Number(v) || 0 };
-  await prisma.safekeeping.update({ where: { memberId: req.memberId }, data: dec });
-  await prisma.withdrawalRequest.update({ where: { id }, data: { status: "PAID", reviewerId: i.user.id } });
+  if (isApprove) {
+    // Extract meta (dest + note) from payload
+    const meta = (req.payload as any)?._meta || {};
+    const destType: DestType = meta.destType === "ALLIANCE" ? "ALLIANCE" : "NATION";
+    const receiverId: number = Number(meta.receiverId || 0);
+    const note: string | null = meta.note || null;
 
-  // Disable buttons + success msg
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(`send:req:approve:${id}`).setLabel("Approve").setEmoji("✅").setStyle(ButtonStyle.Success).setDisabled(true),
-    new ButtonBuilder().setCustomId(`send:req:deny:${id}`).setLabel("Deny").setEmoji("❌").setStyle(ButtonStyle.Danger).setDisabled(true),
-  );
-  const emb = new EmbedBuilder().setTitle("💵 Send Completed").setDescription(`Request **${id}**`).setColor(Colors.Blurple);
-  await i.update({ embeds: [emb], components: [row] });
+    // Fetch alliance & member for keys and for decrement
+    const alliance = await prisma.alliance.findUnique({
+      where: { id: req.allianceId },
+      include: { keys: { orderBy: { id: "desc" }, take: 1 } }
+    });
+    const member = await prisma.member.findUnique({ where: { id: req.memberId } });
 
-  // DM requester
-  try {
-    const m = await prisma.member.findUnique({ where: { id: req.memberId } });
-    if (m) {
-      const user = await i.client.users.fetch(m.discordId);
-      const paidLine = Object.entries(req.payload as any).map(([k, v]) => fmtLine(k, Number(v))).join(" · ") || "—";
-      const dmEmb = new EmbedBuilder()
-        .setTitle("💵 Send Paid")
-        .setDescription(`Your send request **${id}** has been sent in-game.`)
-        .addFields({ name: "Amount", value: paidLine })
-        .setColor(Colors.Blurple);
-      await user.send({ embeds: [dmEmb] });
+    const apiKeyEnc = alliance?.keys?.[0];
+    const apiKey = apiKeyEnc ? open(apiKeyEnc.encryptedApiKey as any, apiKeyEnc.nonceApi as any) : (process.env.PNW_DEFAULT_API_KEY || "");
+    const botKey = process.env.PNW_BOT_KEY || "";
+
+    if (!member || !apiKey || !botKey || !receiverId) {
+      await prisma.withdrawalRequest.update({ where: { id }, data: { status: "APPROVED", reviewerId: i.user.id } });
+
+      const rowDisabled = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId(`send:req:approve:${id}`).setLabel("Approve").setEmoji("✅").setStyle(ButtonStyle.Success).setDisabled(true),
+        new ButtonBuilder().setCustomId(`send:req:deny:${id}`).setLabel("Deny").setEmoji("❌").setStyle(ButtonStyle.Danger).setDisabled(true),
+      );
+      const emb = new EmbedBuilder().setTitle("⚠️ Send Approved — Manual Action Needed").setDescription(`Request **${id}**`).setColor(Colors.Yellow);
+      await i.update({ embeds: [emb], components: [rowDisabled] });
+      return i.followUp({ ephemeral: true, content: "Approved but **auto-send skipped** (missing keys/member/receiver). Handle manually." });
     }
-  } catch { /* ignore */ }
+
+    // Build resource-only payload for API
+    const resPayload = onlyResourceEntries(req.payload as any);
+
+    // Fallback deterministic note if none saved
+    const apiNote = note && String(note).length ? note : `GemstoneTools send ${id} • reviewer ${i.user.id}`;
+
+    const ok = await pnwSend({
+      apiKey, botKey,
+      destType,
+      receiverId,
+      payload: resPayload,
+      note: apiNote,
+    });
+
+    if (!ok) {
+      // Mark as approved but not paid; banker can retry manually
+      await prisma.withdrawalRequest.update({ where: { id }, data: { status: "APPROVED", reviewerId: i.user.id } });
+
+      const rowDisabled = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId(`send:req:approve:${id}`).setLabel("Approve").setEmoji("✅").setStyle(ButtonStyle.Success).setDisabled(true),
+        new ButtonBuilder().setCustomId(`send:req:deny:${id}`).setLabel("Deny").setEmoji("❌").setStyle(ButtonStyle.Danger).setDisabled(true),
+      );
+      const emb = new EmbedBuilder().setTitle("⚠️ Send Approved — Auto-send Failed").setDescription(`Request **${id}**`).setColor(Colors.Yellow);
+      await i.update({ embeds: [emb], components: [rowDisabled] });
+      return i.followUp({ ephemeral: true, content: "Auto-send failed. Left as **APPROVED**." });
+    }
+
+    // Decrement the requester's safekeeping and mark PAID
+    const dec: any = {};
+    for (const [k, v] of Object.entries(resPayload)) dec[k] = { decrement: Number(v) || 0 };
+    await prisma.safekeeping.update({ where: { memberId: req.memberId }, data: dec });
+    await prisma.withdrawalRequest.update({ where: { id }, data: { status: "PAID", reviewerId: i.user.id } });
+
+    // Disable buttons + success msg
+    const rowDisabled = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(`send:req:approve:${id}`).setLabel("Approve").setEmoji("✅").setStyle(ButtonStyle.Success).setDisabled(true),
+      new ButtonBuilder().setCustomId(`send:req:deny:${id}`).setLabel("Deny").setEmoji("❌").setStyle(ButtonStyle.Danger).setDisabled(true),
+    );
+    const emb = new EmbedBuilder().setTitle("💵 Send Completed").setDescription(`Request **${id}**`).setColor(Colors.Blurple);
+    await i.update({ embeds: [emb], components: [rowDisabled] });
+
+    // DM requester
+    try {
+      const m = await prisma.member.findUnique({ where: { id: req.memberId } });
+      if (m) {
+        const user = await i.client.users.fetch(m.discordId);
+        const paidLine = Object.entries(resPayload).map(([k, v]) => fmtLine(k, Number(v))).join(" · ") || "—";
+        const dmEmb = new EmbedBuilder()
+          .setTitle("💵 Send Paid")
+          .setDescription(`Your send request **${id}** has been sent in-game.`)
+          .addFields({ name: "Amount", value: paidLine })
+          .setColor(Colors.Blurple);
+        await user.send({ embeds: [dmEmb] });
+      }
+    } catch { /* ignore */ }
+    return;
+  }
+
+  // Unknown button
+  return i.reply({ ephemeral: true, content: "Unsupported action." });
 }
 
 // =====================
@@ -560,7 +587,7 @@ async function openModalPage(i: ButtonInteraction, page: number, includeTargetAn
   }
 
   const total = sendPageCountAll();
-  const keys = sendSliceAll(page);
+  const keys = sendSliceAll(page, includeTargetAndNote);
 
   const modal = new ModalBuilder()
     .setCustomId(`send:modal:${page}`)
@@ -587,6 +614,7 @@ async function openModalPage(i: ButtonInteraction, page: number, includeTargetAn
     );
   }
 
+  // Add resource inputs (3 on first page, 5 otherwise)
   for (const k of keys) {
     const input = new TextInputBuilder()
       .setCustomId(k)
@@ -596,6 +624,10 @@ async function openModalPage(i: ButtonInteraction, page: number, includeTargetAn
       .setPlaceholder("0");
     modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
   }
+
+  // Ensure not exceeding Discord modal component cap (5)
+  // includeTargetAndNote (2) + SEND_PAGE_SIZE_FIRST (3) = 5 ✅
+  // resource-only pages: 5 ✅
 
   await i.showModal(modal);
 }
