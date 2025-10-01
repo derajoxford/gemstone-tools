@@ -14,9 +14,10 @@ import * as cryptoMod from "../lib/crypto.js";
 const prisma = new PrismaClient();
 const open = (cryptoMod as any).open as (cipherB64: string, nonceB64: string) => string;
 
-const WHO_VERSION = "who-env-2025-09-30e";
+// bump when shipping changes
+const WHO_VERSION = "who-env-2025-09-30g";
 
-/** Nation model used by the embed */
+/** The nation shape we render */
 type NationCore = {
   id: number;
   name: string;
@@ -45,12 +46,12 @@ export const data = new SlashCommandBuilder()
   .setDescription("Look up a nation by nation name, leader name, Discord user (linked), or nation ID.")
   .addStringOption(o =>
     o.setName("nation")
-      .setDescription("Nation name (partial is ok) OR numeric ID")
+      .setDescription("Nation name (partial ok) OR numeric nation id")
       .setRequired(false),
   )
   .addStringOption(o =>
     o.setName("leader")
-      .setDescription("Leader name (partial is ok)")
+      .setDescription("Leader name (partial ok)")
       .setRequired(false),
   )
   .addUserOption(o =>
@@ -66,7 +67,7 @@ export async function execute(i: ChatInputCommandInteraction) {
     const api = await getApiKey();
     if (!api) {
       await i.editReply(
-        "Admin setup required: no PNW API key. Set `PNW_API` in the service env (or save an alliance API key) and restart.",
+        "No PNW API key available. Set `PNW_API` in the service env (or save an alliance API key via `/setup_alliance`) and restart."
       );
       return;
     }
@@ -75,20 +76,23 @@ export async function execute(i: ChatInputCommandInteraction) {
     const leaderArg = (i.options.getString("leader") || "").trim();
     const user: User | null = i.options.getUser("user");
 
+    console.log("[/who]", WHO_VERSION, "invoked", { nation: nationArg || null, leader: leaderArg || null, userOpt: !!user });
+
     let nation: NationCore | null = null;
     let lookedUp = "";
     let multiNote = "";
 
-    // 0) numeric ID fast-path
+    // A) Numeric ID fast-path
     if (nationArg && /^\d+$/.test(nationArg)) {
       const id = Number(nationArg);
       nation = await fetchNationById(api, id);
+      console.log("[/who] ID lookup", { id, found: !!nation });
       lookedUp = `ID ${id}`;
     }
 
-    // 1) nation name search (robust literal-query + REST fallbacks)
+    // B) Nation name search
     if (!nation && nationArg) {
-      const res = await robustNationSearchLiteral(api, { nationName: nationArg });
+      const res = await robustNationSearch(api, { nationName: nationArg });
       if (res.length) {
         nation = res[0];
         lookedUp = `nation name "${nationArg}"`;
@@ -96,9 +100,9 @@ export async function execute(i: ChatInputCommandInteraction) {
       }
     }
 
-    // 2) leader name search (robust literal-query + REST fallbacks)
+    // C) Leader name search
     if (!nation && leaderArg) {
-      const res = await robustNationSearchLiteral(api, { leaderName: leaderArg });
+      const res = await robustNationSearch(api, { leaderName: leaderArg });
       if (res.length) {
         nation = res[0];
         lookedUp = `leader name "${leaderArg}"`;
@@ -106,26 +110,27 @@ export async function execute(i: ChatInputCommandInteraction) {
       }
     }
 
-    // 3) linked Discord user (or self)
+    // D) Linked Discord user (explicit or self)
     if (!nation && (user || (!nationArg && !leaderArg))) {
-      const targetUser = user ?? i.user;
+      const target = user ?? i.user;
       const member = await prisma.member.findFirst({
-        where: { discordId: targetUser.id },
+        where: { discordId: target.id },
         select: { nationId: true },
       });
+      console.log("[/who] linked member", { hasMember: !!member, nationId: member?.nationId ?? null });
       if (member?.nationId) {
         nation = await fetchNationById(api, member.nationId);
-        lookedUp = `linked nation for <@${targetUser.id}>`;
+        lookedUp = `linked nation for <@${target.id}>`;
       }
     }
 
     if (!nation) {
       await i.editReply(
         "I couldn't find a nation. Try one of:\n" +
-          "• `/who nation:<nation name>`\n" +
-          "• `/who leader:<leader name>`\n" +
-          "• `/who nation:<numeric nation id>`\n" +
-          "• `/who user:@member` (requires nation link)",
+        "• `/who nation:<nation name>`\n" +
+        "• `/who leader:<leader name>`\n" +
+        "• `/who nation:<numeric nation id>`\n" +
+        "• `/who user:@member` (requires nation link)"
       );
       return;
     }
@@ -173,7 +178,7 @@ function hexForBloc(c?: string | null): number {
   return COLOR_HEX[c.toLowerCase()] ?? 0x5865f2;
 }
 
-// Ranges (Locutus-like)
+// score-based ranges (Locutus-like)
 function range(score: number | null | undefined, lo: number, hi: number) {
   if (!score && score !== 0) return "—";
   const a = score * lo, b = score * hi;
@@ -190,11 +195,14 @@ function warRanges(score?: number | null) {
   };
 }
 
-/* ===================== API keys ===================== */
+/* ===================== API key source ===================== */
 
 async function getApiKey(): Promise<string | null> {
   const env = process.env.PNW_API?.trim();
-  if (env) return env;
+  if (env) {
+    console.log("[/who] using PNW_API from environment", { len: env.length });
+    return env;
+  }
 
   try {
     const k = await prisma.allianceKey.findFirst({
@@ -203,7 +211,10 @@ async function getApiKey(): Promise<string | null> {
     });
     if (k?.encryptedApiKey && k?.nonceApi) {
       const api = open(toB64(k.encryptedApiKey as any), toB64(k.nonceApi as any));
-      if (api && api.length > 10) return api;
+      if (api && api.length > 10) {
+        console.log("[/who] using AllianceKey");
+        return api;
+      }
     }
   } catch (e) {
     console.error("[/who] getApiKey DB error:", e);
@@ -211,7 +222,7 @@ async function getApiKey(): Promise<string | null> {
   return null;
 }
 
-/* ===================== GraphQL fetches ===================== */
+/* ===================== GraphQL base ===================== */
 
 const BASE_FIELDS = `
   id
@@ -255,69 +266,70 @@ function mapNationGraphQL(n: any): NationCore {
   };
 }
 
-async function gqlReq<T=any>(api: string, query: string): Promise<{ ok: boolean; data?: T; errors?: any }> {
+async function gqlReq<T=any>(api: string, query: string, tag?: string): Promise<{ ok: boolean; data?: T; errors?: any }> {
   try {
     const r = await fetch("https://api.politicsandwar.com/graphql?api_key=" + api, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ query }),
     });
-    if (!r.ok) return { ok: false, errors: `HTTP ${r.status}` };
+    if (!r.ok) {
+      console.warn("[/who] GQL HTTP", r.status, tag || "");
+      return { ok: false, errors: `HTTP ${r.status}` };
+    }
     const j: any = await r.json().catch(() => ({}));
-    if (j?.errors) return { ok: false, errors: j.errors };
+    if (j?.errors) {
+      console.warn("[/who] GQL ERR", tag || "", JSON.stringify(j.errors));
+      return { ok: false, errors: j.errors };
+    }
     return { ok: true, data: j?.data };
   } catch (e) {
+    console.warn("[/who] GQL EXC", tag || "", String(e));
     return { ok: false, errors: String(e) };
   }
 }
 
-/**
- * IMPORTANT:
- *  - Embed numeric ID literally; variables sometimes return 0 rows on this endpoint.
- *  - Use schema-safe scalars; arrays need sub-selection.
- */
+/** id → single nation */
 async function fetchNationById(api: string, id: number): Promise<NationCore | null> {
   const q = `{ nations(id:[${id}], first:1) { data { ${BASE_FIELDS} } } }`;
-  const { ok, data, errors } = await gqlReq(api, q);
-  if (!ok) {
-    console.warn("[/who] fetchNationById error:", JSON.stringify(errors));
-    return null;
-  }
-  const row = (data as any)?.nations?.data?.[0];
-  return row ? mapNationGraphQL(row) : null;
+  const { ok, data, errors } = await gqlReq(api, q, "id");
+  const arr: any[] = ok ? ((data as any)?.nations?.data ?? []) : [];
+  console.log("[/who] fetchNationById rows", arr.length, ok ? "" : JSON.stringify(errors || ""));
+  return arr.length ? mapNationGraphQL(arr[0]) : null;
 }
 
-/* ===================== Robust literal-search ===================== */
-/** Escape a string for safe literal embedding into GraphQL double-quoted scalars */
+/* ===================== Robust search (name/leader) ===================== */
+
 function gqlStr(s: string): string {
   return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
-async function robustNationSearchLiteral(
+async function robustNationSearch(
   api: string,
   opts: { nationName?: string; leaderName?: string }
 ): Promise<NationCore[]> {
-  const kwRaw = (opts.nationName ?? opts.leaderName ?? "").trim();
-  if (kwRaw.length < 2) return [];
-  const kw = gqlStr(kwRaw);
+  const raw = (opts.nationName ?? opts.leaderName ?? "").trim();
+  if (raw.length < 2) return [];
+  const kw = gqlStr(raw);
   const like = `%${kw}%`;
   const which = opts.nationName ? "nation" : "leader";
 
-  const variants: Array<{ tag: string; q: string }> = [
-    // 1) keyword (server-side partial across name/leader)
-    { tag: "keyword", q: `{ nations(first:5, keyword:"${kw}", orderBy:[{column:SCORE,order:DESC}]) { data { ${BASE_FIELDS} } } }` },
+  const make = (tag: string, q: string) => ({ tag, q });
 
-    // 2) filter like
-    { tag: "like_nation", q: `{ nations(first:5, filter:{ nation_name:{ like:"${like}" } }, orderBy:[{column:SCORE,order:DESC}]) { data { ${BASE_FIELDS} } } }` },
-    { tag: "like_leader", q: `{ nations(first:5, filter:{ leader_name:{ like:"${like}" } }, orderBy:[{column:SCORE,order:DESC}]) { data { ${BASE_FIELDS} } } }` },
+  // Try several schema-friendly variants; log each attempt and stop on first non-empty result
+  const variants = [
+    make("keyword", `{ nations(first:5, keyword:"${kw}", orderBy:[{column:SCORE,order:DESC}]) { data { ${BASE_FIELDS} } } }`),
 
-    // 3) filter contains
-    { tag: "contains_nation", q: `{ nations(first:5, filter:{ nation_name:{ contains:"${kw}" } }, orderBy:[{column:SCORE,order:DESC}]) { data { ${BASE_FIELDS} } } }` },
-    { tag: "contains_leader", q: `{ nations(first:5, filter:{ leader_name:{ contains:"${kw}" } }, orderBy:[{column:SCORE,order:DESC}]) { data { ${BASE_FIELDS} } } }` },
+    // filter variants (common Lighthouse/Laravel style)
+    make("like_nation", `{ nations(first:5, filter:{ nation_name:{ like:"${like}" } }, orderBy:[{column:SCORE,order:DESC}]) { data { ${BASE_FIELDS} } } }`),
+    make("like_leader", `{ nations(first:5, filter:{ leader_name:{ like:"${like}" } }, orderBy:[{column:SCORE,order:DESC}]) { data { ${BASE_FIELDS} } } }`),
 
-    // 4) plain args (some servers support loose match here)
-    { tag: "arg_name", q: `{ nations(first:5, name:"${kw}", orderBy:[{column:SCORE,order:DESC}]) { data { ${BASE_FIELDS} } } }` },
-    { tag: "arg_leader", q: `{ nations(first:5, leader_name:"${kw}", orderBy:[{column:SCORE,order:DESC}]) { data { ${BASE_FIELDS} } } }` },
+    make("contains_nation", `{ nations(first:5, filter:{ nation_name:{ contains:"${kw}" } }, orderBy:[{column:SCORE,order:DESC}]) { data { ${BASE_FIELDS} } } }`),
+    make("contains_leader", `{ nations(first:5, filter:{ leader_name:{ contains:"${kw}" } }, orderBy:[{column:SCORE,order:DESC}]) { data { ${BASE_FIELDS} } } }`),
+
+    // arg aliases some deployments expose
+    make("arg_name", `{ nations(first:5, name:"${kw}", orderBy:[{column:SCORE,order:DESC}]) { data { ${BASE_FIELDS} } } }`),
+    make("arg_leader", `{ nations(first:5, leader_name:"${kw}", orderBy:[{column:SCORE,order:DESC}]) { data { ${BASE_FIELDS} } } }`),
   ];
 
   const order = which === "nation"
@@ -325,82 +337,41 @@ async function robustNationSearchLiteral(
     : ["keyword","like_leader","contains_leader","arg_leader","like_nation","contains_nation","arg_name"];
 
   const seen = new Map<number, NationCore>();
-  for (const key of order) {
-    const v = variants.find(v => v.tag === key)!;
-    const { ok, data } = await gqlReq(api, v.q);
-    if (!ok) continue;
-    const arr: any[] = (data as any)?.nations?.data ?? [];
+  for (const tag of order) {
+    const v = variants.find(v => v.tag === tag)!;
+    const { ok, data } = await gqlReq(api, v.q, tag);
+    const arr: any[] = ok ? ((data as any)?.nations?.data ?? []) : [];
+    console.log(`[/who] variant ${tag} count`, arr.length, `kw="${raw}"`);
     if (arr.length) {
       for (const row of arr) seen.set(Number(row.id), mapNationGraphQL(row));
-      break; // stop on first non-empty result
+      break; // first non-empty wins
     }
   }
 
-  // If still empty, try each significant word with keyword:
+  // As a last-ditch: try first word keyword (helps when names include punctuation/emojis)
   if (seen.size === 0) {
-    const words = kwRaw.split(/\s+/g).map(w => w.trim()).filter(w => w.length >= 3).slice(0, 3);
-    for (const w of words) {
-      const wq = gqlStr(w);
-      const q = `{ nations(first:5, keyword:"${wq}", orderBy:[{column:SCORE,order:DESC}]) { data { ${BASE_FIELDS} } } }`;
-      const { ok, data } = await gqlReq(api, q);
-      if (!ok) continue;
-      const arr: any[] = (data as any)?.nations?.data ?? [];
+    const word = raw.split(/\s+/g).find(w => w.length >= 3);
+    if (word) {
+      const w = gqlStr(word);
+      const q = `{ nations(first:5, keyword:"${w}", orderBy:[{column:SCORE,order:DESC}]) { data { ${BASE_FIELDS} } } }`;
+      const { ok, data } = await gqlReq(api, q, "keyword_1word");
+      const arr: any[] = ok ? ((data as any)?.nations?.data ?? []) : [];
+      console.log("[/who] variant keyword_1word count", arr.length, `kw="${word}"`);
       for (const row of arr) seen.set(Number(row.id), mapNationGraphQL(row));
-      if (seen.size) break;
     }
   }
 
-  // REST fallbacks → hydrate by ID
-  if (seen.size === 0) {
-    const ids = await restMultiSearchIds(api, kwRaw, 5);
-    for (const id of ids) {
-      const n = await fetchNationById(api, id);
-      if (n) seen.set(n.id, n);
-    }
-  }
-
-  return Array.from(seen.values()).sort((a, b) => (b.score ?? -1) - (a.score ?? -1)).slice(0, 5);
+  const out = Array.from(seen.values()).sort((a, b) => (b.score ?? -1) - (a.score ?? -1)).slice(0, 5);
+  console.log("[/who] search final", { count: out.length, which, raw });
+  return out;
 }
 
-/* ===================== REST fallbacks ===================== */
-
-async function restMultiSearchIds(api: string, kw: string, limit = 5): Promise<number[]> {
-  const bases = [
-    `https://api.politicsandwar.com/v3/nations?api_key=${encodeURIComponent(api)}`,
-  ];
-  const params = [
-    `keyword=${encodeURIComponent(kw)}`,
-    `name=${encodeURIComponent(kw)}`,
-    `nation_name=${encodeURIComponent(kw)}`,
-    `leader=${encodeURIComponent(kw)}`,
-    `leader_name=${encodeURIComponent(kw)}`,
-  ];
-  const ids: number[] = [];
-  for (const base of bases) {
-    for (const p of params) {
-      const url = `${base}&${p}&limit=${limit}`;
-      try {
-        const r = await fetch(url);
-        if (!r.ok) continue;
-        const j: any = await r.json().catch(() => ({}));
-        const arr = Array.isArray(j?.data) ? j.data : [];
-        for (const n of arr) {
-          const id = Number(n?.id);
-          if (id && !ids.includes(id)) ids.push(id);
-        }
-        if (ids.length) return ids.slice(0, limit);
-      } catch { /* ignore and try next */ }
-    }
-  }
-  return ids.slice(0, limit);
-}
-
-/* ===================== Card renderer (prettier; separate military fields) ===================== */
+/* ===================== Card renderer ===================== */
 
 function buildWhoCard(n: NationCore, meta: { lookedUp: string; multiNote?: string }) {
-  const urlNation  = `https://politicsandwar.com/nation/id=${n.id}`;
-  const urlWars    = `https://politicsandwar.com/nation/id=${n.id}&display=war`;
-  const urlTrades  = `https://politicsandwar.com/nation/id=${n.id}&display=trade`;
+  const urlNation   = `https://politicsandwar.com/nation/id=${n.id}`;
+  const urlWars     = `https://politicsandwar.com/nation/id=${n.id}&display=war`;
+  const urlTrades   = `https://politicsandwar.com/nation/id=${n.id}&display=trade`;
   const urlAlliance = n.allianceId ? `https://politicsandwar.com/alliance/id=${n.allianceId}` : undefined;
 
   const alliance = n.allianceName && urlAlliance
@@ -426,21 +397,22 @@ function buildWhoCard(n: NationCore, meta: { lookedUp: string; multiNote?: strin
 
       { name: "🏙️ Cities", value: fmtInt(n.citiesCount), inline: true },
       { name: "⏱️ Last Active", value: discordRelative(n.lastActive), inline: true },
-      { name: "\u200b", value: "\u200b", inline: true }, // spacer row to keep grid tidy
+      { name: "\u200b", value: "\u200b", inline: true }, // spacer
 
+      // Separate every military field (per your request)
       { name: "🪖 Soldiers", value: fmtInt(n.soldiers), inline: true },
-      { name: "🛡️ Tanks",    value: fmtInt(n.tanks),    inline: true },
+      { name: "🛡️ Tanks", value: fmtInt(n.tanks), inline: true },
       { name: "✈️ Aircraft", value: fmtInt(n.aircraft), inline: true },
 
-      { name: "🚢 Ships",    value: fmtInt(n.ships),    inline: true },
-      { name: "🕵️ Spies",    value: fmtInt(n.spies),    inline: true },
+      { name: "🚢 Ships", value: fmtInt(n.ships), inline: true },
+      { name: "🕵️ Spies", value: fmtInt(n.spies), inline: true },
       { name: "🚀 Missiles", value: fmtInt(n.missiles), inline: true },
 
-      { name: "☢️ Nukes",    value: fmtInt(n.nukes),    inline: true },
+      { name: "☢️ Nukes", value: fmtInt(n.nukes), inline: true },
       { name: "\u200b", value: "\u200b", inline: true },
       { name: "\u200b", value: "\u200b", inline: true },
 
-      { name: "⚔️ Attack Range (War / Spy)",  value: `${ranges.atkWar}  •  ${ranges.atkSpy}`, inline: false },
+      { name: "⚔️ Attack Range (War / Spy)", value: `${ranges.atkWar}  •  ${ranges.atkSpy}`, inline: false },
       { name: "🛡️ Defense Range (War / Spy)", value: `${ranges.defWar}  •  ${ranges.defSpy}`, inline: false },
     )
     .setTimestamp(new Date());
