@@ -15,7 +15,7 @@ import { PrismaClient } from "@prisma/client";
 const log = pino({ level: process.env.LOG_LEVEL || "info" });
 const prisma = new PrismaClient();
 
-const WHO_VERSION = "who-env-2025-10-01b";
+const WHO_VERSION = "who-env-2025-10-01c"; // fixes duplicate 'lookedUp' and render call
 
 // ---------- Slash command ----------
 export const data = new SlashCommandBuilder()
@@ -73,7 +73,7 @@ export async function execute(i: ChatInputCommandInteraction) {
   log.info({ len: api.length }, "[/who] using PNW_API from environment");
 
   let target: NationCore | null = null;
-  let lookedUp = "";
+  let lookupHow = ""; // <— renamed from 'lookedUp' to avoid collisions
 
   try {
     // A) explicit user link first (if provided)
@@ -82,7 +82,7 @@ export async function execute(i: ChatInputCommandInteraction) {
       log.info({ hasMember: !!linkedId, nationId: linkedId || null }, "[/who] linked member");
       if (linkedId) {
         target = await fetchNationById(api, linkedId);
-        lookedUp = `linked nation for <@${optUser.id}>`;
+        lookupHow = `linked nation for <@${optUser.id}>`;
       }
     }
 
@@ -91,13 +91,13 @@ export async function execute(i: ChatInputCommandInteraction) {
       if (/^\d+$/.test(optNation)) {
         const id = Number(optNation);
         target = await fetchNationById(api, id);
-        lookedUp = `ID ${id}`;
+        lookupHow = `ID ${id}`;
         log.info({ id, found: !!target }, "[/who] ID lookup");
       } else {
         const { match, count, method } = await searchByName(api, optNation, "nation");
         log.info({ which: "nation", count, method, raw: optNation }, "[/who] search final");
         target = match;
-        lookedUp = `nation “${optNation}”`;
+        lookupHow = `nation “${optNation}”`;
       }
     }
 
@@ -106,7 +106,7 @@ export async function execute(i: ChatInputCommandInteraction) {
       const { match, count, method } = await searchByName(api, optLeader, "leader");
       log.info({ which: "leader", count, method, raw: optLeader }, "[/who] search final");
       target = match;
-      lookedUp = `leader “${optLeader}”`;
+      lookupHow = `leader “${optLeader}”`;
     }
 
     // D) if no args, try self link
@@ -114,7 +114,7 @@ export async function execute(i: ChatInputCommandInteraction) {
       const linkedId = await findLinkedNationId(i.guildId, i.user.id);
       if (linkedId) {
         target = await fetchNationById(api, linkedId);
-        lookedUp = `linked nation for <@${i.user.id}>`;
+        lookupHow = `linked nation for <@${i.user.id}>`;
       }
     }
 
@@ -129,16 +129,11 @@ export async function execute(i: ChatInputCommandInteraction) {
       return;
     }
 
-    const { embed, row } = renderCardSeparate(n, lookedUp(target));
+    const { embed, row } = renderCardSeparate(target, lookupHow); // <— fixed call
     await i.editReply({ embeds: [embed], components: [row] });
   } catch (err) {
     log.error({ err }, "[/who] execute error");
     await i.editReply("Something went wrong.");
-  }
-
-  // helper to format the lookedUp string consistently
-  function lookedUp(kind: string) {
-    return kind;
   }
 }
 
@@ -339,7 +334,7 @@ function hexForBloc(c?: string | null): number {
 }
 
 // ---------- Card (separate military fields) ----------
-function renderCardSeparate(n: NationCore, lookedUp: string) {
+function renderCardSeparate(n: NationCore, lookupHow: string) {
   const nationUrl = `https://politicsandwar.com/nation/id=${n.id}`;
   const warsUrl = `https://politicsandwar.com/nation/id=${n.id}&display=war`;
   const aaUrl = n.alliance_id ? `https://politicsandwar.com/alliance/id=${n.alliance_id}` : null;
@@ -351,7 +346,7 @@ function renderCardSeparate(n: NationCore, lookedUp: string) {
     .setColor(hexForBloc(n.color))
     .setTitle(`${n.nation_name} — ${n.leader_name}`)
     .setURL(nationUrl)
-    .setDescription(`🔎 Looked up by ${lookedUp} • 🆔 \`${n.id}\` • ${WHO_VERSION}`)
+    .setDescription(`🔎 Looked up by ${lookupHow} • 🆔 \`${n.id}\` • ${WHO_VERSION}`)
     .addFields(
       { name: "🏛️ Alliance", value: alliance, inline: true },
       { name: "📈 Score", value: fmtScore(n.score), inline: true },
