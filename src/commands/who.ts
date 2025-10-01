@@ -15,20 +15,20 @@ import { PrismaClient } from "@prisma/client";
 const log = pino({ level: process.env.LOG_LEVEL || "info" });
 const prisma = new PrismaClient();
 
-const WHO_VERSION = "who-env-2025-10-01a";
+const WHO_VERSION = "who-env-2025-10-01b";
 
 // ---------- Slash command ----------
 export const data = new SlashCommandBuilder()
   .setName("who")
   .setDescription("Detailed nation card (by nation name, leader name, @user, or nation ID)")
   .addStringOption(o =>
-    o.setName("nation").setDescription("Nation name (partial) OR numeric nation id").setRequired(false)
+    o.setName("nation").setDescription("Nation name (partial) OR numeric nation id").setRequired(false),
   )
   .addStringOption(o =>
-    o.setName("leader").setDescription("Leader name (partial)").setRequired(false)
+    o.setName("leader").setDescription("Leader name (partial)").setRequired(false),
   )
   .addUserOption(o =>
-    o.setName("user").setDescription("@member linked via /link_nation").setRequired(false)
+    o.setName("user").setDescription("@member linked via /link_nation").setRequired(false),
   );
 
 // ---------- Types ----------
@@ -121,19 +121,24 @@ export async function execute(i: ChatInputCommandInteraction) {
     if (!target) {
       await i.editReply(
         "I couldn't find a nation. Try one of:\n" +
-        "• `/who nation:<nation name>`\n" +
-        "• `/who leader:<leader name>`\n" +
-        "• `/who nation:<numeric nation id>`\n" +
-        "• `/who user:@member`"
+          "• `/who nation:<nation name>`\n" +
+          "• `/who leader:<leader name>`\n" +
+          "• `/who nation:<numeric nation id>`\n" +
+          "• `/who user:@member`",
       );
       return;
     }
 
-    const { embed, row } = renderCard(target, lookedUp);
+    const { embed, row } = renderCardSeparate(n, lookedUp(target));
     await i.editReply({ embeds: [embed], components: [row] });
   } catch (err) {
     log.error({ err }, "[/who] execute error");
     await i.editReply("Something went wrong.");
+  }
+
+  // helper to format the lookedUp string consistently
+  function lookedUp(kind: string) {
+    return kind;
   }
 }
 
@@ -242,7 +247,7 @@ async function fetchManyById(api: string, ids: number[]): Promise<NationCore[]> 
 async function searchByName(
   api: string,
   query: string,
-  mode: "nation" | "leader"
+  mode: "nation" | "leader",
 ): Promise<{ match: NationCore | null; count: number; method: string }> {
   const ids = await scrapeNationSearchForIds(query);
   if (!ids.length) return { match: null, count: 0, method: "scrape:none" };
@@ -254,16 +259,17 @@ async function searchByName(
       ? rows.filter(r => r.leader_name.toLowerCase().includes(needle))
       : rows.filter(r => r.nation_name.toLowerCase().includes(needle));
 
-  const pick = (filtered.length ? filtered : rows).sort(
-    (a, b) => (b.score || 0) - (a.score || 0)
-  )[0] || null;
+  const pick =
+    (filtered.length ? filtered : rows).sort((a, b) => (b.score || 0) - (a.score || 0))[0] || null;
 
   return { match: pick, count: rows.length, method: `scrape+gql(${rows.length})` };
 }
 
 /** Scrape public nation search page to get nation IDs from anchors `/nation/id=XXXX` */
 async function scrapeNationSearchForIds(keyword: string): Promise<number[]> {
-  const url = `https://politicsandwar.com/nations/?keyword=${encodeURIComponent(keyword)}&minimum=0&ob=score&od=DESC`;
+  const url = `https://politicsandwar.com/nations/?keyword=${encodeURIComponent(
+    keyword,
+  )}&minimum=0&ob=score&od=DESC`;
   try {
     const r = await fetch(url);
     if (!r.ok) {
@@ -286,7 +292,7 @@ async function scrapeNationSearchForIds(keyword: string): Promise<number[]> {
   }
 }
 
-// ---------- Ranges ----------
+// ---------- Ranges & formatting ----------
 function fmtScore(n: number | null | undefined): string {
   if (n == null) return "—";
   return Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(n);
@@ -296,16 +302,18 @@ function fmtInt(n: number | null | undefined): string {
 }
 function range(score: number | null | undefined, lo: number, hi: number) {
   if (score == null) return "—";
-  const a = score * lo, b = score * hi;
-  const fmt = (x: number) => Intl.NumberFormat(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(x);
+  const a = score * lo,
+    b = score * hi;
+  const fmt = (x: number) =>
+    Intl.NumberFormat(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(x);
   return `${fmt(a)}–${fmt(b)}`;
 }
 function warRanges(score?: number | null) {
   return {
     atkWar: range(score, 0.75, 2.5),
-    atkSpy: range(score, 0.40, 2.5),
-    defWar: range(score, 0.40, 4 / 3),
-    defSpy: range(score, 0.40, 2.5),
+    atkSpy: range(score, 0.4, 2.5),
+    defWar: range(score, 0.4, 4 / 3),
+    defSpy: range(score, 0.4, 2.5),
   };
 }
 function discordRelative(iso?: string | null): string {
@@ -314,20 +322,29 @@ function discordRelative(iso?: string | null): string {
   return `<t:${t}:R>`;
 }
 const COLOR_HEX: Record<string, number> = {
-  turquoise: 0x1abc9c, blue: 0x3498db, red: 0xe74c3c, green: 0x2ecc71, purple: 0x9b59b6,
-  yellow: 0xf1c40f, orange: 0xe67e22, black: 0x2c3e50, white: 0xecf0f1, grey: 0x95a5a6, gray: 0x95a5a6,
+  turquoise: 0x1abc9c,
+  blue: 0x3498db,
+  red: 0xe74c3c,
+  green: 0x2ecc71,
+  purple: 0x9b59b6,
+  yellow: 0xf1c40f,
+  orange: 0xe67e22,
+  black: 0x2c3e50,
+  white: 0xecf0f1,
+  grey: 0x95a5a6,
+  gray: 0x95a5a6,
 };
 function hexForBloc(c?: string | null): number {
   return COLOR_HEX[c?.toLowerCase() || ""] ?? Colors.Blurple;
 }
 
-// ---------- Card (paired layout like earlier screenshot) ----------
-function renderCard(n: NationCore, lookedUp: string) {
-  const nationUrl  = `https://politicsandwar.com/nation/id=${n.id}`;
-  const warsUrl    = `https://politicsandwar.com/nation/id=${n.id}&display=war`;
-  const aaUrl      = n.alliance_id ? `https://politicsandwar.com/alliance/id=${n.alliance_id}` : null;
+// ---------- Card (separate military fields) ----------
+function renderCardSeparate(n: NationCore, lookedUp: string) {
+  const nationUrl = `https://politicsandwar.com/nation/id=${n.id}`;
+  const warsUrl = `https://politicsandwar.com/nation/id=${n.id}&display=war`;
+  const aaUrl = n.alliance_id ? `https://politicsandwar.com/alliance/id=${n.alliance_id}` : null;
 
-  const alliance = n.alliance_name && aaUrl ? `[${n.alliance_name}](${aaUrl})` : (n.alliance_name ?? "None");
+  const alliance = n.alliance_name && aaUrl ? `[${n.alliance_name}](${aaUrl})` : n.alliance_name ?? "None";
   const ranges = warRanges(n.score);
 
   const embed = new EmbedBuilder()
@@ -342,11 +359,19 @@ function renderCard(n: NationCore, lookedUp: string) {
 
       { name: "🏙️ Cities", value: fmtInt(n.citiesCount), inline: true },
       { name: "⏱️ Last Active", value: discordRelative(n.last_active), inline: true },
-      { name: "\u200b", value: "\u200b", inline: true },
+      { name: "\u200b", value: "\u200b", inline: true }, // spacer
 
-      { name: "🪖 Soldiers / 🛡️ Tanks", value: `${fmtInt(n.soldiers)} / ${fmtInt(n.tanks)}`, inline: true },
-      { name: "✈️ Aircraft / 🚢 Ships", value: `${fmtInt(n.aircraft)} / ${fmtInt(n.ships)}`, inline: true },
-      { name: "🕵️ Spies / 🚀 Missiles / ☢️ Nukes", value: `${fmtInt(n.spies)} / ${fmtInt(n.missiles)} / ${fmtInt(n.nukes)}`, inline: true },
+      { name: "🪖 Soldiers", value: fmtInt(n.soldiers), inline: true },
+      { name: "🛡️ Tanks", value: fmtInt(n.tanks), inline: true },
+      { name: "✈️ Aircraft", value: fmtInt(n.aircraft), inline: true },
+
+      { name: "🚢 Ships", value: fmtInt(n.ships), inline: true },
+      { name: "🕵️ Spies", value: fmtInt(n.spies), inline: true },
+      { name: "🚀 Missiles", value: fmtInt(n.missiles), inline: true },
+
+      { name: "☢️ Nukes", value: fmtInt(n.nukes), inline: true },
+      { name: "\u200b", value: "\u200b", inline: true },
+      { name: "\u200b", value: "\u200b", inline: true },
 
       { name: "⚔️ Attack Range (War / Spy)", value: `${ranges.atkWar} • ${ranges.atkSpy}`, inline: false },
       { name: "🛡️ Defense Range (War / Spy)", value: `${ranges.defWar} • ${ranges.defSpy}`, inline: false },
@@ -356,11 +381,11 @@ function renderCard(n: NationCore, lookedUp: string) {
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel("🔎 Nation").setURL(nationUrl),
     new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel("⚔️ Wars").setURL(warsUrl),
-    ...(aaUrl ? [new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel("🏛️ Alliance").setURL(aaUrl)] : [])
+    ...(aaUrl ? [new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel("🏛️ Alliance").setURL(aaUrl)] : []),
   );
 
   return { embed, row };
 }
 
-// ---------- default export (for your registry) ----------
+// ---------- default export (for command registry) ----------
 export default { data, execute };
