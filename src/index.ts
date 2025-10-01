@@ -15,8 +15,9 @@ import { RES_EMOJI, ORDER } from './lib/emojis.js';
 import { extraCommandsJSON, findCommandByName } from './commands/registry';
 import { startAutoApply } from "./jobs/pnw_auto_apply";
 
-// ✅ NEW: import the who command (TS source)
+// ✅ Commands with TS source
 import * as Who from "./commands/who";
+import * as Send from "./commands/send"; // <<< NEW
 
 const log = pino({ level: process.env.LOG_LEVEL || 'info' });
 const prisma = new PrismaClient();
@@ -97,8 +98,9 @@ const baseCommands = [
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 ];
 
-// ✅ NEW: ensure /who is part of the registered commands
+// ✅ Register /who and /send explicitly; the de-duper below prevents duplicates if also in registry
 baseCommands.push(Who.data as any);
+baseCommands.push(Send.data as any);
 
 // Convert to JSON for registration
 const baseCommandsJSON = baseCommands.map(c => c.toJSON());
@@ -173,8 +175,9 @@ client.on('interactionCreate', async (i: Interaction) => {
       if (i.commandName === 'withdraw_set') return handleWithdrawSet(i);
       if (i.commandName === 'safekeeping_edit') return handleSafekeepingStart(i);
 
-      // ✅ NEW: route /who directly to the loaded module
+      // Route /who and /send directly to loaded modules
       if (i.commandName === 'who') return (Who as any).execute(i as any);
+      if (i.commandName === 'send') return (Send as any).execute(i as any);
 
       // Fallback for commands defined in ./commands (registry)
       {
@@ -185,10 +188,10 @@ client.on('interactionCreate', async (i: Interaction) => {
       }
 
     } else if (i.isModalSubmit()) {
-      // ✅ NEW: /send modal handling (Nation or Alliance)
-      if (i.customId === 'send:modal:nation' || i.customId === 'send:modal:alliance') {
+      // ✅ NEW: /send multi-page modal handling
+      if (i.customId.startsWith('send:modal:')) {
         try {
-          const mod = await import('./commands/send'); // <<< FIXED (no .js)
+          const mod = await import('./commands/send');
           if ((mod as any)?.handleModal) return (mod as any).handleModal(i as any);
         } catch (err) {
           console.error('send modal error', err);
@@ -205,7 +208,7 @@ client.on('interactionCreate', async (i: Interaction) => {
       // ✅ NEW: /send banker approval buttons (place BEFORE the generic approval handler)
       if (i.customId.startsWith('send:req:approve:') || i.customId.startsWith('send:req:deny:')) {
         try {
-          const mod = await import('./commands/send'); // <<< FIXED (no .js)
+          const mod = await import('./commands/send');
           if ((mod as any)?.handleApprovalButton) return (mod as any).handleApprovalButton(i as any);
         } catch (err) {
           console.error('send approval button error', err);
@@ -214,10 +217,16 @@ client.on('interactionCreate', async (i: Interaction) => {
         }
       }
 
-      // ✅ NEW: /send picker buttons (Nation vs Alliance)
-      if (i.customId === 'send:pick:nation' || i.customId === 'send:pick:alliance') {
+      // ✅ NEW: /send picker & paging/review/confirm/cancel buttons
+      if (
+        i.customId === 'send:pick:nation' || i.customId === 'send:pick:alliance' ||
+        i.customId.startsWith('send:open:') ||
+        i.customId === 'send:review' ||
+        i.customId === 'send:confirm' ||
+        i.customId === 'send:cancel'
+      ) {
         try {
-          const mod = await import('./commands/send'); // <<< FIXED (no .js)
+          const mod = await import('./commands/send');
           if ((mod as any)?.handleButton) return (mod as any).handleButton(i as any);
         } catch (err) {
           console.error('send button error', err);
