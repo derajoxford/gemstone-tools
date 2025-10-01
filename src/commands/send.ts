@@ -5,28 +5,29 @@ import {
   ButtonInteraction,
   ButtonStyle,
   ChatInputCommandInteraction,
+  Colors,
   EmbedBuilder,
   ModalBuilder,
   ModalSubmitInteraction,
   SlashCommandBuilder,
   TextInputBuilder,
   TextInputStyle,
-  Colors,
+  PermissionFlagsBits,
 } from "discord.js";
 import { PrismaClient } from "@prisma/client";
-import { open } from "../lib/crypto.js";
 
 const prisma = new PrismaClient();
 
+// ------------------ helpers ------------------
 function parseNumericIdFromInput(input: string): number | null {
   const raw = input.trim();
-  const match = raw.match(/id\s*=\s*(\d+)/i);
-  if (match?.[1]) {
-    const n = Number(match[1]);
+  const m = raw.match(/id\s*=\s*(\d+)/i);
+  if (m?.[1]) {
+    const n = Number(m[1]);
     return Number.isFinite(n) && n > 0 ? n : null;
   }
   const digits = raw.replace(/[^\d]/g, "");
-  if (digits.length) {
+  if (digits) {
     const n = Number(digits);
     return Number.isFinite(n) && n > 0 ? n : null;
   }
@@ -35,7 +36,6 @@ function parseNumericIdFromInput(input: string): number | null {
 function nice(n: number) {
   return n.toLocaleString("en-US");
 }
-
 async function getAllianceByGuild(guildId?: string | null) {
   if (!guildId) return null;
   return prisma.alliance.findFirst({
@@ -64,6 +64,37 @@ async function ensureSafekeeping(memberId: number) {
   return sk;
 }
 
+// --- minimal GQL caller for PnW bankWithdraw ---
+async function pnwBankWithdraw(opts: {
+  apiKey: string;
+  botKey: string;
+  receiverId: number;
+  receiverType: 1 | 2; // 1 = Nation, 2 = Alliance
+  money: number;
+  note?: string;
+}): Promise<boolean> {
+  const fields = [`money:${Math.floor(opts.money)}`];
+  if (opts.note) fields.push(`note:${JSON.stringify(opts.note)}`);
+  const query = `mutation{ bankWithdraw(receiver:${opts.receiverId}, receiver_type:${opts.receiverType}, ${fields.join(",")}) { id } }`;
+  const url = "https://api.politicsandwar.com/graphql?api_key=" + encodeURIComponent(opts.apiKey);
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Api-Key": opts.apiKey,
+      "X-Bot-Key": opts.botKey,
+    },
+    body: JSON.stringify({ query }),
+  });
+  const data = await res.json().catch(() => ({} as any));
+  if (!res.ok || (data as any)?.errors) {
+    console.error("SEND_AUTOPAY_ERR", res.status, JSON.stringify(data));
+    return false;
+  }
+  return Boolean((data as any)?.data?.bankWithdraw);
+}
+
+// ------------------ slash command ------------------
 export const data = new SlashCommandBuilder()
   .setName("send")
   .setDescription("Send from your Safekeeping: pick Nation or Alliance, then fill the modal.");
@@ -80,29 +111,22 @@ export async function execute(i: ChatInputCommandInteraction) {
   });
 }
 
+// ------------------ picker buttons → open modals ------------------
 export async function handleButton(i: ButtonInteraction) {
   if (i.customId === "send:pick:nation") {
     const modal = new ModalBuilder().setCustomId("send:modal:nation").setTitle("Send to Nation");
     const amount = new TextInputBuilder()
-      .setCustomId("send:amount")
-      .setLabel("Amount (money)")
-      .setPlaceholder("e.g., 500000 or 2,000,000")
-      .setStyle(TextInputStyle.Short)
-      .setRequired(true)
-      .setMaxLength(20);
+      .setCustomId("send:amount").setLabel("Amount (money)")
+      .setPlaceholder("e.g., 500000 or 2,000,000").setStyle(TextInputStyle.Short)
+      .setRequired(true).setMaxLength(20);
     const nation = new TextInputBuilder()
-      .setCustomId("send:recipient")
-      .setLabel("Nation ID or Nation Link")
+      .setCustomId("send:recipient").setLabel("Nation ID or Nation Link")
       .setPlaceholder("123456 or https://politicsandwar.com/nation/id=123456")
-      .setStyle(TextInputStyle.Short)
-      .setRequired(true)
-      .setMaxLength(200);
+      .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(200);
     const note = new TextInputBuilder()
-      .setCustomId("send:note")
-      .setLabel("Note (optional)")
-      .setStyle(TextInputStyle.Paragraph)
-      .setRequired(false)
-      .setMaxLength(500);
+      .setCustomId("send:note").setLabel("Note (optional)")
+      .setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(500);
+
     modal.addComponents(
       new ActionRowBuilder<TextInputBuilder>().addComponents(amount),
       new ActionRowBuilder<TextInputBuilder>().addComponents(nation),
@@ -115,25 +139,17 @@ export async function handleButton(i: ButtonInteraction) {
   if (i.customId === "send:pick:alliance") {
     const modal = new ModalBuilder().setCustomId("send:modal:alliance").setTitle("Send to Alliance");
     const amount = new TextInputBuilder()
-      .setCustomId("send:amount")
-      .setLabel("Amount (money)")
-      .setPlaceholder("e.g., 500000 or 2,000,000")
-      .setStyle(TextInputStyle.Short)
-      .setRequired(true)
-      .setMaxLength(20);
+      .setCustomId("send:amount").setLabel("Amount (money)")
+      .setPlaceholder("e.g., 500000 or 2,000,000").setStyle(TextInputStyle.Short)
+      .setRequired(true).setMaxLength(20);
     const alliance = new TextInputBuilder()
-      .setCustomId("send:recipient")
-      .setLabel("Alliance ID or Alliance Link")
+      .setCustomId("send:recipient").setLabel("Alliance ID or Alliance Link")
       .setPlaceholder("10304 or https://politicsandwar.com/alliance/id=10304")
-      .setStyle(TextInputStyle.Short)
-      .setRequired(true)
-      .setMaxLength(200);
+      .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(200);
     const note = new TextInputBuilder()
-      .setCustomId("send:note")
-      .setLabel("Note (optional)")
-      .setStyle(TextInputStyle.Paragraph)
-      .setRequired(false)
-      .setMaxLength(500);
+      .setCustomId("send:note").setLabel("Note (optional)")
+      .setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(500);
+
     modal.addComponents(
       new ActionRowBuilder<TextInputBuilder>().addComponents(amount),
       new ActionRowBuilder<TextInputBuilder>().addComponents(alliance),
@@ -144,6 +160,7 @@ export async function handleButton(i: ButtonInteraction) {
   }
 }
 
+// ------------------ modal submit → create request + POST FOR REVIEW ------------------
 export async function handleModal(i: ModalSubmitInteraction) {
   const isNation = i.customId === "send:modal:nation";
   const isAlliance = i.customId === "send:modal:alliance";
@@ -170,214 +187,180 @@ export async function handleModal(i: ModalSubmitInteraction) {
   }
 
   const alliance = await getAllianceByGuild(i.guildId);
-  if (!alliance) return i.reply({ content: "This server is not linked yet. Run /setup_alliance first.", ephemeral: true });
+  if (!alliance) return i.reply({ ephemeral: true, content: "This server is not linked yet. Run /setup_alliance first." });
+
   const member = await getMember(alliance.id, i.user.id);
-  if (!member) return i.reply({ content: "❌ You’re not linked to a Member yet. Use /link_nation first.", ephemeral: true });
+  if (!member) return i.reply({ ephemeral: true, content: "❌ You’re not linked to a Member yet. Use /link_nation first." });
 
   const sk = await ensureSafekeeping(member.id);
   if ((sk.money ?? 0) < amount) {
-    return i.reply({
+    await i.reply({
       ephemeral: true,
       content: `❌ Insufficient Safekeeping balance.\nAvailable: $${nice(sk.money ?? 0)} • Requested: $${nice(amount)}`,
     });
+    return;
   }
 
-  // Create PENDING request with metadata.
+  // Create the pending request; include send-specific metadata if columns exist.
   const data: any = {
     allianceId: alliance.id,
     memberId: member.id,
     createdBy: i.user.id,
     status: "PENDING",
     payload: { money: amount },
-    note: note || null,                 // if present in your schema
-    kind: isNation ? "NATION" : "ALLIANCE", // if enum present
+    note: note || null,                    // if your schema has this column
+    kind: isNation ? "NATION" : "ALLIANCE" // if your schema has this enum
   };
-  if (isNation) data.recipientNationId = recipientId;          // if column exists
-  if (isAlliance) data.recipientAllianceId = recipientId;      // if column exists
+  if (isNation) data.recipientNationId = recipientId;      // if column exists
+  if (isAlliance) data.recipientAllianceId = recipientId;  // if column exists
 
   const wr = await prisma.withdrawalRequest.create({ data });
 
-  // Post to review channel with Approve/Reject buttons **specific to send**
-  const title = isNation ? "💸 Send Request — Nation" : "💸 Send Request — Alliance";
-  const desc = isNation
-    ? `From <@${i.user.id}> → Nation ID **${recipientId}**`
-    : `From <@${i.user.id}> → Alliance ID **${recipientId}**`;
-
-  const embed = new EmbedBuilder()
-    .setTitle(title)
-    .setDescription(desc)
+  // Post to review channel with custom Approve/Reject (send-specific)
+  const e = new EmbedBuilder()
+    .setTitle(isNation ? "💸 Send Request — Nation" : "💸 Send Request — Alliance")
+    .setDescription(`From <@${i.user.id}> — ${member.nationName} (${member.nationId})`)
     .addFields(
-      { name: "Amount (money)", value: `$${nice(amount)}`, inline: true },
+      { name: "Amount", value: `$${nice(amount)}`, inline: true },
+      { name: isNation ? "Nation ID" : "Alliance ID", value: String(recipientId), inline: true },
+      { name: "Note", value: note || "—", inline: false },
       { name: "Request ID", value: String(wr.id), inline: true },
-      { name: "Note", value: note ? note : "—", inline: false },
+      { name: "Kind", value: isNation ? "NATION" : "ALLIANCE", inline: true },
     )
     .setColor(Colors.Gold)
     .setTimestamp(new Date());
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(`s:approve:${wr.id}`).setLabel("Approve Send").setEmoji("✅").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId(`s:deny:${wr.id}`).setLabel("Deny").setEmoji("❌").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`send:req:approve:${wr.id}`).setLabel("Approve").setEmoji("✅").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`send:req:deny:${wr.id}`).setLabel("Reject").setEmoji("❌").setStyle(ButtonStyle.Danger),
   );
 
-  const targetChannelId = alliance.reviewChannelId || i.channelId;
+  // Send confirmation to requester
+  await i.reply({ ephemeral: true, content: "✅ Your send request has been submitted for banker review." });
+
+  const targetChannelId = alliance.reviewChannelId || i.channelId!;
   try {
     const ch = await i.client.channels.fetch(targetChannelId);
-    if (ch?.isTextBased()) await (ch as any).send({ embeds: [embed], components: [row] });
+    if (ch?.isTextBased()) await (ch as any).send({ embeds: [e], components: [row] });
   } catch (err) {
-    console.error("[send] failed to post review", err);
+    console.error("send post error", err);
   }
-
-  // Ephemeral confirmation
-  const conf = new EmbedBuilder()
-    .setTitle("Send Request Submitted")
-    .setDescription("Your request is pending banker review.")
-    .addFields(
-      { name: "Amount", value: `$${nice(amount)}`, inline: true },
-      { name: isNation ? "Nation ID" : "Alliance ID", value: String(recipientId), inline: true },
-      { name: "Request ID", value: String(wr.id), inline: true },
-    )
-    .setColor(Colors.Blurple);
-  await i.reply({ embeds: [conf], ephemeral: true });
 }
 
-// --- Banker Approve/Reject buttons for SEND requests ---
+// ------------------ banker Approve/Reject buttons (execute payment) ------------------
 export async function handleApprovalButton(i: ButtonInteraction) {
-  // IDs look like: s:approve:<id> or s:deny:<id>
-  const [prefix, action, id] = i.customId.split(":");
-  if (prefix !== "s" || !id) return;
+  if (!i.guildId) return i.reply({ content: "Guild only.", ephemeral: true });
 
-  if (!i.memberPermissions?.has("ManageGuild" as any)) {
+  // Permission gate
+  if (!i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
     return i.reply({ content: "You lack permission to approve/deny.", ephemeral: true });
   }
+
+  const mApprove = i.customId.match(/^send:req:approve:(.+)$/);
+  const mDeny = i.customId.match(/^send:req:deny:(.+)$/);
+  if (!mApprove && !mDeny) return;
+
+  const id = String((mApprove || mDeny)![1]);
+  const approve = Boolean(mApprove);
 
   const req = await prisma.withdrawalRequest.findUnique({ where: { id } });
   if (!req) return i.reply({ content: "Request not found.", ephemeral: true });
   if (req.status !== "PENDING") return i.reply({ content: `Already ${req.status}.`, ephemeral: true });
 
-  if (action === "deny") {
-    await prisma.withdrawalRequest.update({
-      where: { id },
-      data: { status: "REJECTED", reviewerId: i.user.id },
-    });
+  const alliance = await getAllianceByGuild(i.guildId);
+  if (!alliance) return i.reply({ content: "Alliance not linked in this server.", ephemeral: true });
 
+  const member = await prisma.member.findUnique({ where: { id: req.memberId }, include: { balance: true } });
+  if (!member) return i.reply({ content: "Member not found.", ephemeral: true });
+
+  if (!approve) {
+    await prisma.withdrawalRequest.update({ where: { id }, data: { status: "REJECTED", reviewerId: i.user.id } });
+    try {
+      const user = await i.client.users.fetch(member.discordId);
+      await user.send({ embeds: [new EmbedBuilder()
+        .setTitle("❌ Send Request Rejected")
+        .setDescription(`Request **${id}** was rejected by <@${i.user.id}>`)
+        .setColor(Colors.Red)] });
+    } catch {}
     // disable buttons
     const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId(`s:approve:${id}`).setLabel("Approve Send").setEmoji("✅").setStyle(ButtonStyle.Success).setDisabled(true),
-      new ButtonBuilder().setCustomId(`s:deny:${id}`).setLabel("Deny").setEmoji("❌").setStyle(ButtonStyle.Danger).setDisabled(true),
+      new ButtonBuilder().setCustomId(`send:req:approve:${id}`).setLabel("Approve").setEmoji("✅").setStyle(ButtonStyle.Success).setDisabled(true),
+      new ButtonBuilder().setCustomId(`send:req:deny:${id}`).setLabel("Reject").setEmoji("❌").setStyle(ButtonStyle.Danger).setDisabled(true),
     );
-    const embed = new EmbedBuilder().setTitle("❌ Send Request Rejected").setDescription(`Request **${id}**`).setColor(Colors.Red);
-    await i.update({ embeds: [embed], components: [row] });
-
-    // attempt DM
-    try {
-      const member = await prisma.member.findUnique({ where: { id: req.memberId } });
-      if (member) {
-        const user = await i.client.users.fetch(member.discordId);
-        await user.send({ embeds: [new EmbedBuilder().setTitle("❌ Send Request Rejected").setDescription(`Request **${id}**`).setColor(Colors.Red)] });
-      }
-    } catch {}
+    await i.update({ components: [row] });
     return;
   }
 
-  // APPROVE → attempt to pay in-game
-  const alliance = await prisma.alliance.findUnique({
-    where: { id: req.allianceId },
-    include: { keys: { orderBy: { id: "desc" }, take: 1 } },
-  });
-  const member = await prisma.member.findUnique({ where: { id: req.memberId } });
+  // APPROVE path → attempt autopay to correct recipient
+  const money = Number((req.payload as any)?.money || 0);
+  if (!Number.isFinite(money) || money <= 0) {
+    return i.reply({ content: "Invalid amount in payload.", ephemeral: true });
+  }
 
-  // resolve keys
-  const apiKeyEnc = alliance?.keys?.[0];
-  const apiKey = apiKeyEnc ? open(apiKeyEnc.encryptedApiKey as any, apiKeyEnc.nonceApi as any) : (process.env.PNW_DEFAULT_API_KEY || "");
+  // keys
+  const apiKeyEnc = alliance.keys?.[0];
+  const apiKey = apiKeyEnc ? (await import("../lib/crypto.js")).open(apiKeyEnc.encryptedApiKey as any, apiKeyEnc.nonceApi as any) : (process.env.PNW_DEFAULT_API_KEY || "");
   const botKey = process.env.PNW_BOT_KEY || "";
-
-  if (!member || !apiKey || !botKey) {
-    await prisma.withdrawalRequest.update({
-      where: { id },
-      data: { status: "APPROVED", reviewerId: i.user.id },
-    });
-    return i.reply({ content: "⚠️ Approved, but missing API/Bot key; manual pay required.", ephemeral: true });
+  if (!apiKey || !botKey) {
+    await prisma.withdrawalRequest.update({ where: { id }, data: { status: "APPROVED", reviewerId: i.user.id } });
+    return i.reply({ content: "⚠️ Missing API/Bot key. Marked APPROVED; pay manually.", ephemeral: true });
   }
 
-  const payload = (req.payload as any) || {};
-  const money = Number(payload.money || 0);
-  if (!(money > 0)) {
-    return i.reply({ content: "Invalid payload: no money amount.", ephemeral: true });
-  }
-
-  // determine recipient (Nation vs Alliance)
+  // Determine receiver
+  let receiverType: 1 | 2;
+  let receiverId: number;
   const kind: string = (req as any).kind || "NATION";
-  const nationId = (req as any).recipientNationId as number | null;
-  const allianceId = (req as any).recipientAllianceId as number | null;
-
-  const isNation = kind === "NATION" && Number(nationId) > 0;
-  const isAlliance = kind === "ALLIANCE" && Number(allianceId) > 0;
-  if (!isNation && !isAlliance) {
-    return i.reply({ content: "Missing or invalid recipient.", ephemeral: true });
+  if (kind === "ALLIANCE") {
+    const aid = Number((req as any).recipientAllianceId || 0);
+    if (!aid) return i.reply({ content: "Missing recipientAllianceId.", ephemeral: true });
+    receiverType = 2; receiverId = aid;
+  } else {
+    const nid = Number((req as any).recipientNationId || 0);
+    if (!nid) return i.reply({ content: "Missing recipientNationId.", ephemeral: true });
+    receiverType = 1; receiverId = nid;
   }
 
-  // Build GraphQL mutation
-  const fields: string[] = [`money:${money}`];
-  const note = (req as any).note ? String((req as any).note) : `GemstoneTools SEND ${req.id} • reviewer ${i.user.id}`;
-  fields.push(`note:${JSON.stringify(note)}`);
-
-  const receiver = isNation ? nationId! : allianceId!;
-  const receiver_type = isNation ? 1 : 2; // 1=nation, 2=alliance
-
-  const q = `mutation{
-    bankWithdraw(receiver:${receiver}, receiver_type:${receiver_type}, ${fields.join(",")}) { id }
-  }`;
-
-  const url = "https://api.politicsandwar.com/graphql?api_key=" + encodeURIComponent(apiKey);
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Api-Key": apiKey,
-      "X-Bot-Key": botKey,
-    },
-    body: JSON.stringify({ query: q }),
+  const note = `GemstoneTools SEND ${id} • reviewer ${i.user.id}`;
+  const ok = await pnwBankWithdraw({
+    apiKey, botKey, receiverId, receiverType, money, note,
   });
-  const data = await res.json().catch(() => ({} as any));
-  const ok = res.ok && !(data as any).errors && (data as any)?.data?.bankWithdraw;
 
   if (!ok) {
-    console.error("SEND_AUTOPAY_ERR", res.status, JSON.stringify(data));
-    await prisma.withdrawalRequest.update({
-      where: { id },
-      data: { status: "APPROVED", reviewerId: i.user.id },
-    });
-    return i.reply({ content: "⚠️ Approved, but in-game send failed. Please pay manually.", ephemeral: true });
+    await prisma.withdrawalRequest.update({ where: { id }, data: { status: "APPROVED", reviewerId: i.user.id } });
+    return i.reply({ content: "⚠️ PnW transfer failed. Left as APPROVED; retry manually.", ephemeral: true });
   }
 
-  // Deduct from Safekeeping and mark PAID
+  // Deduct from safekeeping, mark PAID
   const dec: any = { money: { decrement: money } };
-  await prisma.safekeeping.update({ where: { memberId: member.id }, data: dec });
+  try {
+    await prisma.safekeeping.update({ where: { memberId: member.id }, data: dec });
+  } catch (e) {
+    console.error("safekeeping decrement failed", e);
+  }
   await prisma.withdrawalRequest.update({ where: { id }, data: { status: "PAID", reviewerId: i.user.id } });
 
-  // disable buttons + update message
+  // Disable buttons + success embed
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(`s:approve:${id}`).setLabel("Approve Send").setEmoji("✅").setStyle(ButtonStyle.Success).setDisabled(true),
-    new ButtonBuilder().setCustomId(`s:deny:${id}`).setLabel("Deny").setEmoji("❌").setStyle(ButtonStyle.Danger).setDisabled(true),
+    new ButtonBuilder().setCustomId(`send:req:approve:${id}`).setLabel("Approve").setEmoji("✅").setStyle(ButtonStyle.Success).setDisabled(true),
+    new ButtonBuilder().setCustomId(`send:req:deny:${id}`).setLabel("Reject").setEmoji("❌").setStyle(ButtonStyle.Danger).setDisabled(true),
   );
-  const embed = new EmbedBuilder()
+  const emb = new EmbedBuilder()
     .setTitle("✅ Send Approved & Paid")
-    .setDescription(`Request **${id}** — sent ${isNation ? `to Nation ${nationId}` : `to Alliance ${allianceId}`}`)
-    .addFields({ name: "Amount", value: `$${nice(money)}` })
+    .setDescription(`Request **${id}** sent in-game.`)
+    .addFields(
+      { name: "Amount", value: `$${nice(money)}`, inline: true },
+      { name: "Recipient", value: kind === "ALLIANCE" ? `Alliance ${String((req as any).recipientAllianceId)}` : `Nation ${String((req as any).recipientNationId)}`, inline: true },
+    )
     .setColor(Colors.Green);
-  await i.update({ embeds: [embed], components: [row] });
+  await i.update({ embeds: [emb], components: [row] });
 
   // DM requester
   try {
-    const u = await i.client.users.fetch(member.discordId);
-    const dm = new EmbedBuilder()
-      .setTitle("💵 Send Completed")
-      .setDescription(`Your request **${id}** has been sent in-game.`)
-      .addFields(
-        { name: "Recipient", value: isNation ? `Nation ${nationId}` : `Alliance ${allianceId}`, inline: true },
-        { name: "Amount", value: `$${nice(money)}`, inline: true },
-      )
-      .setColor(Colors.Blurple);
-    await u.send({ embeds: [dm] });
+    const user = await i.client.users.fetch(member.discordId);
+    await user.send({ embeds: [new EmbedBuilder()
+      .setTitle("💵 Send Paid")
+      .setDescription(`Your send request **${id}** has been executed.`)
+      .addFields({ name: "Amount", value: `$${nice(money)}` })
+      .setColor(Colors.Blurple)] });
   } catch {}
 }
