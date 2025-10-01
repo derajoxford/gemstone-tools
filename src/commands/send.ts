@@ -42,6 +42,7 @@ type SendSession = {
   destType: DestType | null;
   targetId: number | null;
   targetLink?: string | null;
+  targetName?: string | null; // NEW: resolved name (best-effort)
   note?: string | null;
   payload: Record<string, number>;
   createdAt: number;
@@ -54,10 +55,9 @@ const SEND_PAGE_SIZE_FIRST = 3;     // resource inputs on page 0 (target+note co
 
 function sendPageCountAll() { return Math.ceil(ORDER.length / SEND_PAGE_SIZE); }
 function sendSliceAll(page: number, firstPage: boolean) {
-  const s = page * SEND_PAGE_SIZE;
-  const arr = ORDER.slice(s, s + SEND_PAGE_SIZE);
   if (firstPage) return ORDER.slice(0, SEND_PAGE_SIZE_FIRST);
-  return arr;
+  const s = page * SEND_PAGE_SIZE;
+  return ORDER.slice(s, s + SEND_PAGE_SIZE);
 }
 
 // ---- Extract ID from "id=12345" style links or raw numbers
@@ -65,18 +65,66 @@ function extractId(input: string): number | null {
   if (!input) return null;
   const trimmed = input.trim();
 
-  // Find last multi-digit number anywhere in the string
   const all = Array.from(trimmed.matchAll(/\d{2,9}/g)).map(m => m[0]);
   if (all.length) {
     const id = Number(all[all.length - 1]);
     if (Number.isInteger(id) && id > 0) return id;
   }
 
-  // Or just a plain number
   const num = Number(trimmed);
   if (Number.isInteger(num) && num > 0) return num;
 
   return null;
+}
+
+// ---- PnW GraphQL name lookup (best-effort)
+// Requires an API key (alliance key or PNW_DEFAULT_API_KEY). If lookup fails, return null.
+async function lookupRecipientName(destType: DestType, id: number, guildId?: string | null): Promise<string | null> {
+  try {
+    // pull a usable key: alliance API key for this guild, else env default
+    let apiKey = process.env.PNW_DEFAULT_API_KEY || "";
+
+    if (guildId) {
+      const alliance = await prisma.alliance.findFirst({
+        where: { guildId: guildId || "" },
+        include: { keys: { orderBy: { id: "desc" }, take: 1 } }
+      });
+      const apiKeyEnc = alliance?.keys?.[0];
+      if (apiKeyEnc) apiKey = open(apiKeyEnc.encryptedApiKey as any, apiKeyEnc.nonceApi as any) || apiKey;
+    }
+    if (!apiKey) return null;
+
+    const url = "https://api.politicsandwar.com/graphql?api_key=" + encodeURIComponent(apiKey);
+    let q = "";
+    if (destType === "NATION") {
+      // nation(id: ...) shape may vary; this is best-effort
+      q = `query{ nation(id:${id}){ nation_name name } }`;
+    } else {
+      q = `query{ alliance(id:${id}){ name } }`;
+    }
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Api-Key": apiKey,
+      },
+      body: JSON.stringify({ query: q })
+    });
+
+    const data = await res.json().catch(() => ({} as any));
+    if (!res.ok || (data as any)?.errors) return null;
+
+    if (destType === "NATION") {
+      const n = (data as any)?.data?.nation;
+      return n?.nation_name || n?.name || null;
+    } else {
+      const a = (data as any)?.data?.alliance;
+      return a?.name || null;
+    }
+  } catch {
+    return null;
+  }
 }
 
 // ---- PnW bankWithdraw for both Nation and Alliance
@@ -95,10 +143,7 @@ async function pnwSend(opts: {
     fields.push(`note:${JSON.stringify(String(opts.note))}`);
   }
 
-  // PnW GraphQL:
-  // bankWithdraw(receiver:<id>, receiver_type:<1|2>, <res fields>, note:"<str>")
   const rtype = opts.destType === "NATION" ? 1 : 2;
-
   const q = `mutation{
     bankWithdraw(receiver:${opts.receiverId}, receiver_type:${rtype}, ${fields.join(",")}) { id }
   }`;
@@ -134,6 +179,7 @@ export async function execute(i: ChatInputCommandInteraction) {
     destType: null,
     targetId: null,
     targetLink: null,
+    targetName: null,
     note: null,
     payload: {},
     createdAt: Date.now(),
@@ -141,7 +187,7 @@ export async function execute(i: ChatInputCommandInteraction) {
 
   const embed = new EmbedBuilder()
     .setTitle("💎 Send from Safekeeping")
-    .setDescription("Pick a recipient type to start. You’ll enter the Nation/Alliance **ID or link**, select resources on pages, add a note, then **Review & Confirm** to send for banker approval.")
+    .setDescription("Pick a recipient type to start. You’ll enter the Nation/Alliance **ID or link**, select resources on pages (inputs show your available amounts), add a note, then **Review & Confirm** to send for banker approval.")
     .setColor(Colors.Blurple);
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -160,7 +206,7 @@ export async function handleButton(i: ButtonInteraction) {
 
   // Ensure session
   const sess = sendSessions.get(i.user.id) || {
-    destType: null, targetId: null, targetLink: null, payload: {}, note: null, createdAt: Date.now()
+    destType: null, targetId: null, targetLink: null, targetName: null, payload: {}, note: null, createdAt: Date.now()
   };
   sendSessions.set(i.user.id, sess);
 
@@ -169,13 +215,13 @@ export async function handleButton(i: ButtonInteraction) {
     const dest: DestType = i.customId.endsWith("nation") ? "NATION" : "ALLIANCE";
     sess.destType = dest;
     sendSessions.set(i.user.id, sess);
-    return openModalPage(i, 0, true); // page 0, include target + note
+    return openModalPage(i, 0, true); // page 0, include target + note + avail labels
   }
 
   // Open resource page N
   if (i.customId.startsWith("send:open:")) {
     const page = Math.max(0, parseInt(i.customId.split(":")[2] || "0", 10));
-    return openModalPage(i, page, false); // pages >0, no target field, no note
+    return openModalPage(i, page, false); // pages >0, no target field, avail labels
   }
 
   if (i.customId === "send:review") {
@@ -191,7 +237,6 @@ export async function handleButton(i: ButtonInteraction) {
     return i.reply({ ephemeral: true, content: "❎ Send canceled." });
   }
 
-  // Fallback
   return i.reply({ ephemeral: true, content: "Something went wrong. Try again." });
 }
 
@@ -199,9 +244,6 @@ export async function handleButton(i: ButtonInteraction) {
 // Modal router
 // =====================
 export async function handleModal(i: any) {
-  // customId formats:
-  //  - "send:modal:0" (first page with target + note + first resources (3))
-  //  - "send:modal:1", "send:modal:2", ... (resource-only pages (5))
   if (!String(i.customId).startsWith("send:modal:")) return;
 
   const sess = sendSessions.get(i.user.id);
@@ -210,27 +252,27 @@ export async function handleModal(i: any) {
   const page = Math.max(0, parseInt(String(i.customId).split(":")[2] || "0", 10));
   const keys = sendSliceAll(page, page === 0);
 
-  // First page: target + note
+  // First page: target + note + resolve name (best-effort)
   if (page === 0) {
     const targetRaw = (i.fields.getTextInputValue("target") || "").trim();
     const noteRaw = (i.fields.getTextInputValue("note") || "").trim();
     const id = extractId(targetRaw);
 
     if (!sess.destType) {
-      return i.reply({
-        ephemeral: true,
-        content: "Select a recipient type first (Send to Nation or Send to Alliance)."
-      });
+      return i.reply({ ephemeral: true, content: "Select a recipient type first (Send to Nation or Send to Alliance)." });
     }
     if (!id) {
-      return i.reply({
-        ephemeral: true,
-        content: "Please enter a valid **ID** or a proper **link** that contains an ID."
-      });
+      return i.reply({ ephemeral: true, content: "Please enter a valid **ID** or a proper **link** that contains an ID." });
     }
     sess.targetId = id;
     sess.targetLink = targetRaw || null;
     sess.note = noteRaw || null;
+
+    // attempt name lookup (non-blocking; if fails, we still proceed)
+    try {
+      const name = await lookupRecipientName(sess.destType, id, i.guildId);
+      if (name) sess.targetName = name;
+    } catch { /* ignore */ }
   }
 
   // Parse resource inputs for this page
@@ -245,7 +287,7 @@ export async function handleModal(i: any) {
   }
   sendSessions.set(i.user.id, sess);
 
-  // After submit, show paging controls + Review/Cancel
+  // Build progress view with summary and resolved name/link
   const total = sendPageCountAll();
 
   const btns: ButtonBuilder[] = [];
@@ -257,16 +299,12 @@ export async function handleModal(i: any) {
         .setStyle(ButtonStyle.Secondary)
     );
   }
-  // Highlight current page by replacing that button with Primary
   if (btns[page]) btns[page].setStyle(ButtonStyle.Primary);
 
   const rows: any[] = [];
-  // First 5 page buttons in row 1
   if (btns.length > 0) rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(...btns.slice(0, 5)));
-  // Next 5 (rare) in row 2
   if (btns.length > 5) rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(...btns.slice(5, 10)));
 
-  // Review/cancel row
   rows.push(
     new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId("send:review").setStyle(ButtonStyle.Success).setLabel("Review & Confirm"),
@@ -284,10 +322,16 @@ export async function handleModal(i: any) {
     ? (sess.targetId ? `https://politicsandwar.com/nation/id=${sess.targetId}` : null)
     : (sess.targetId ? `https://politicsandwar.com/alliance/id=${sess.targetId}` : null);
 
+  const prettyTarget = [
+    `**Recipient**: ${destStr}${sess.targetId ? ` #${sess.targetId}` : ""}`,
+    sess.targetName ? `**Name**: ${sess.targetName}` : null,
+    targetUrl ? `[Open link](${targetUrl})` : null
+  ].filter(Boolean).join(" — ");
+
   const embed = new EmbedBuilder()
     .setTitle("🧾 Send — In Progress")
     .setDescription([
-      `**Recipient**: ${destStr}${sess.targetId ? ` #${sess.targetId}` : ""}${targetUrl ? ` — [link](${targetUrl})` : ""}`,
+      prettyTarget || "**Recipient**: —",
       `**Note**: ${sess.note && sess.note.length ? sess.note : "—"}`,
       "",
       `**Selected so far**:`,
@@ -304,10 +348,7 @@ export async function handleModal(i: any) {
 async function handleReview(i: ButtonInteraction) {
   const sess = sendSessions.get(i.user.id);
   if (!sess || !sess.destType || !sess.targetId) {
-    return i.reply({
-      ephemeral: true,
-      content: "Please finish the form first (recipient + amounts)."
-    });
+    return i.reply({ ephemeral: true, content: "Please finish the form first (recipient + amounts)." });
   }
 
   // Validate available balance
@@ -337,6 +378,14 @@ async function handleReview(i: ButtonInteraction) {
     .map(([k, v]) => fmtLine(k, Number(v)))
     .join(" · ") || "—";
 
+  // Ensure we have a name if possible
+  if (!sess.targetName) {
+    try {
+      const name = await lookupRecipientName(sess.destType, sess.targetId, i.guildId);
+      if (name) { sess.targetName = name; sendSessions.set(i.user.id, sess); }
+    } catch { /* ignore */ }
+  }
+
   const destStr = sess.destType === "NATION" ? "Nation" : "Alliance";
   const targetUrl = sess.destType === "NATION"
     ? `https://politicsandwar.com/nation/id=${sess.targetId}`
@@ -346,10 +395,11 @@ async function handleReview(i: ButtonInteraction) {
     .setTitle("✅ Review Send")
     .setDescription([
       `You are about to send **from your safekeeping** to **${destStr} #${sess.targetId}**.`,
+      sess.targetName ? `**Name**: ${sess.targetName}` : "",
       `${targetUrl ? `[Open target link](${targetUrl})` : ""}`,
       "",
       `**Note**: ${sess.note && sess.note.length ? sess.note : "—"}`,
-    ].join("\n"))
+    ].filter(Boolean).join("\n"))
     .addFields({ name: "Amount", value: totalStr })
     .setColor(Colors.Green);
 
@@ -367,7 +417,6 @@ async function handleConfirm(i: ButtonInteraction) {
     return i.reply({ ephemeral: true, content: "Session not ready. Start again with **/send**." });
   }
 
-  // Validate has alliance + member + balance again
   const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? "" } });
   if (!alliance) return i.reply({ ephemeral: true, content: "No alliance linked here." });
 
@@ -379,15 +428,21 @@ async function handleConfirm(i: ButtonInteraction) {
     return i.reply({ ephemeral: true, content: "No safekeeping found. Run /link_nation first." });
   }
 
-  // Final payload cleanup: keep only > 0 resource keys
   const clean = onlyResourceEntries(sess.payload);
   if (!Object.keys(clean).length) {
     return i.reply({ ephemeral: true, content: "Nothing selected to send." });
   }
 
-  // Create request in DB
-  // Store destination and note under payload._meta to avoid schema changes.
-  const payloadToSave: Record<string, any> = { ...clean, _meta: { destType: sess.destType, receiverId: sess.targetId, note: sess.note || null } };
+  // Store destination + note (and resolved name) inside payload._meta
+  const payloadToSave: Record<string, any> = {
+    ...clean,
+    _meta: {
+      destType: sess.destType,
+      receiverId: sess.targetId,
+      note: sess.note || null,
+      name: sess.targetName || null,
+    }
+  };
 
   const req = await prisma.withdrawalRequest.create({
     data: {
@@ -399,7 +454,6 @@ async function handleConfirm(i: ButtonInteraction) {
     },
   });
 
-  // Build banker review card
   const reqLine = Object.entries(clean).map(([k, v]) => fmtLine(k, v)).join(" · ");
   const targetUrl = sess.destType === "NATION"
     ? `https://politicsandwar.com/nation/id=${sess.targetId}`
@@ -413,7 +467,7 @@ async function handleConfirm(i: ButtonInteraction) {
     .setTitle("📤 Send Request (Safekeeping)")
     .setDescription([
       `From <@${i.user.id}> — [${member.nationName}](https://politicsandwar.com/nation/id=${member.nationId})`,
-      `**Destination**: ${header}${targetUrl ? ` — [link](${targetUrl})` : ""}`,
+      `**Destination**: ${header}${sess.targetName ? ` (${sess.targetName})` : ""}${targetUrl ? ` — [link](${targetUrl})` : ""}`,
       `**Note**: ${sess.note && sess.note.length ? sess.note : "—"}`,
     ].join("\n"))
     .addFields({ name: "Requested", value: reqLine || "—" })
@@ -424,24 +478,19 @@ async function handleConfirm(i: ButtonInteraction) {
     new ButtonBuilder().setCustomId(`send:req:deny:${req.id}`).setLabel("Deny").setEmoji("❌").setStyle(ButtonStyle.Danger),
   );
 
-  // Ack to requester
   await i.reply({ ephemeral: true, content: "✅ Request submitted for banker review." });
 
-  // Post to review channel (or here as fallback)
   const targetChannelId = alliance.reviewChannelId || i.channelId;
   try {
     const ch = await i.client.channels.fetch(targetChannelId);
     if (ch && "send" in ch) await (ch as any).send({ embeds: [embed], components: [row] });
   } catch { /* ignore */ }
-
-  // Keep session (no need to delete; harmless)
 }
 
 // =====================
 // Banker Approval Buttons
 // =====================
 export async function handleApprovalButton(i: ButtonInteraction) {
-  // Permissions
   if (!i.memberPermissions?.has("ManageGuild" as any)) {
     return i.reply({ ephemeral: true, content: "You lack permission to approve/deny." });
   }
@@ -460,7 +509,6 @@ export async function handleApprovalButton(i: ButtonInteraction) {
   if (isDeny) {
     await prisma.withdrawalRequest.update({ where: { id }, data: { status: "REJECTED", reviewerId: i.user.id } });
 
-    // Disable buttons
     const rowDisabled = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId(`send:req:approve:${id}`).setLabel("Approve").setEmoji("✅").setStyle(ButtonStyle.Success).setDisabled(true),
       new ButtonBuilder().setCustomId(`send:req:deny:${id}`).setLabel("Deny").setEmoji("❌").setStyle(ButtonStyle.Danger).setDisabled(true),
@@ -468,7 +516,6 @@ export async function handleApprovalButton(i: ButtonInteraction) {
     const emb = new EmbedBuilder().setTitle("❌ Send Rejected").setDescription(`Request **${id}**`).setColor(Colors.Red);
     await i.update({ embeds: [emb], components: [rowDisabled] });
 
-    // DM requester
     try {
       const m = await prisma.member.findUnique({ where: { id: req.memberId } });
       if (m) {
@@ -480,13 +527,11 @@ export async function handleApprovalButton(i: ButtonInteraction) {
   }
 
   if (isApprove) {
-    // Extract meta (dest + note) from payload
     const meta = (req.payload as any)?._meta || {};
     const destType: DestType = meta.destType === "ALLIANCE" ? "ALLIANCE" : "NATION";
     const receiverId: number = Number(meta.receiverId || 0);
     const note: string | null = meta.note || null;
 
-    // Fetch alliance & member for keys and for decrement
     const alliance = await prisma.alliance.findUnique({
       where: { id: req.allianceId },
       include: { keys: { orderBy: { id: "desc" }, take: 1 } }
@@ -509,10 +554,7 @@ export async function handleApprovalButton(i: ButtonInteraction) {
       return i.followUp({ ephemeral: true, content: "Approved but **auto-send skipped** (missing keys/member/receiver). Handle manually." });
     }
 
-    // Build resource-only payload for API
     const resPayload = onlyResourceEntries(req.payload as any);
-
-    // Fallback deterministic note if none saved
     const apiNote = note && String(note).length ? note : `GemstoneTools send ${id} • reviewer ${i.user.id}`;
 
     const ok = await pnwSend({
@@ -524,7 +566,6 @@ export async function handleApprovalButton(i: ButtonInteraction) {
     });
 
     if (!ok) {
-      // Mark as approved but not paid; banker can retry manually
       await prisma.withdrawalRequest.update({ where: { id }, data: { status: "APPROVED", reviewerId: i.user.id } });
 
       const rowDisabled = new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -536,13 +577,11 @@ export async function handleApprovalButton(i: ButtonInteraction) {
       return i.followUp({ ephemeral: true, content: "Auto-send failed. Left as **APPROVED**." });
     }
 
-    // Decrement the requester's safekeeping and mark PAID
     const dec: any = {};
     for (const [k, v] of Object.entries(resPayload)) dec[k] = { decrement: Number(v) || 0 };
     await prisma.safekeeping.update({ where: { memberId: req.memberId }, data: dec });
     await prisma.withdrawalRequest.update({ where: { id }, data: { status: "PAID", reviewerId: i.user.id } });
 
-    // Disable buttons + success msg
     const rowDisabled = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId(`send:req:approve:${id}`).setLabel("Approve").setEmoji("✅").setStyle(ButtonStyle.Success).setDisabled(true),
       new ButtonBuilder().setCustomId(`send:req:deny:${id}`).setLabel("Deny").setEmoji("❌").setStyle(ButtonStyle.Danger).setDisabled(true),
@@ -550,7 +589,6 @@ export async function handleApprovalButton(i: ButtonInteraction) {
     const emb = new EmbedBuilder().setTitle("💵 Send Completed").setDescription(`Request **${id}**`).setColor(Colors.Blurple);
     await i.update({ embeds: [emb], components: [rowDisabled] });
 
-    // DM requester
     try {
       const m = await prisma.member.findUnique({ where: { id: req.memberId } });
       if (m) {
@@ -567,7 +605,6 @@ export async function handleApprovalButton(i: ButtonInteraction) {
     return;
   }
 
-  // Unknown button
   return i.reply({ ephemeral: true, content: "Unsupported action." });
 }
 
@@ -580,11 +617,22 @@ async function openModalPage(i: ButtonInteraction, page: number, includeTargetAn
     return i.reply({ ephemeral: true, content: "Session expired. Start again with **/send**." });
   }
   if (!sess.destType) {
-    return i.reply({
-      ephemeral: true,
-      content: "Select a recipient type first (Send to Nation or Send to Alliance)."
-    });
+    return i.reply({ ephemeral: true, content: "Select a recipient type first (Send to Nation or Send to Alliance)." });
   }
+
+  // Pull available balance so we can show (avail: X) in field labels
+  let avail: Record<string, number> = {};
+  try {
+    const alliance = await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? "" } });
+    if (alliance) {
+      const member = await prisma.member.findFirst({
+        where: { allianceId: alliance.id, discordId: i.user.id },
+        include: { balance: true }
+      });
+      const bal: any = member?.balance || {};
+      for (const k of ORDER) avail[k] = Number(bal[k] || 0);
+    }
+  } catch { /* ignore; just omit labels if fail */ }
 
   const total = sendPageCountAll();
   const keys = sendSliceAll(page, includeTargetAndNote);
@@ -614,20 +662,17 @@ async function openModalPage(i: ButtonInteraction, page: number, includeTargetAn
     );
   }
 
-  // Add resource inputs (3 on first page, 5 otherwise)
   for (const k of keys) {
+    const labelAvail = typeof avail[k] === "number" ? ` (avail: ${avail[k].toLocaleString()})` : "";
     const input = new TextInputBuilder()
       .setCustomId(k)
-      .setLabel(`${RES_EMOJI[k as any] ?? ""} ${k} (amount)`)
+      .setLabel(`${RES_EMOJI[k as any] ?? ""} ${k}${labelAvail}`)
       .setStyle(TextInputStyle.Short)
       .setRequired(false)
       .setPlaceholder("0");
     modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
   }
 
-  // Ensure not exceeding Discord modal component cap (5)
-  // includeTargetAndNote (2) + SEND_PAGE_SIZE_FIRST (3) = 5 ✅
-  // resource-only pages: 5 ✅
-
+  // Cap check: includeTargetAndNote (2) + 3 fields = 5, other pages = 5
   await i.showModal(modal);
 }
