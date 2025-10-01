@@ -29,6 +29,9 @@ model Alliance {
   members         Member[]
   bankrecs        Bankrec[]
   treasury        AllianceTreasury?
+
+  // NEW: back-relation so Alliance ↔ AllianceGuild is valid
+  allianceGuilds  AllianceGuild[]
 }
 
 model AllianceKey {
@@ -125,14 +128,16 @@ model AllianceTreasury {
   alliance   Alliance  @relation(fields: [allianceId], references: [id])
 }
 
+// --- Key/Value settings (used for offshore config, etc.) ---
+model Setting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+}
+
 //
 // Legacy ignored tables
 //
-model Setting {
-  id Int @id @default(autoincrement())
-  @@ignore
-}
-
 model AllianceConfig {
   id Int @id @default(autoincrement())
   @@ignore
@@ -209,6 +214,7 @@ model SafeTxn {
 
   @@index([memberId, createdAt])
 }
+
 model AllianceGuild {
   id         Int      @id @default(autoincrement())
   allianceId Int
@@ -219,4 +225,3 @@ model AllianceGuild {
 
   @@index([allianceId])
 }
-
