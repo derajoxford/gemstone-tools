@@ -188,7 +188,7 @@ client.on('interactionCreate', async (i: Interaction) => {
       // ✅ NEW: /send modal handling (Nation or Alliance)
       if (i.customId === 'send:modal:nation' || i.customId === 'send:modal:alliance') {
         try {
-          const mod = await import('./commands/send.js');
+          const mod = await import('./commands/send'); // <<< FIXED (no .js)
           if ((mod as any)?.handleModal) return (mod as any).handleModal(i as any);
         } catch (err) {
           console.error('send modal error', err);
@@ -205,7 +205,7 @@ client.on('interactionCreate', async (i: Interaction) => {
       // ✅ NEW: /send banker approval buttons (place BEFORE the generic approval handler)
       if (i.customId.startsWith('send:req:approve:') || i.customId.startsWith('send:req:deny:')) {
         try {
-          const mod = await import('./commands/send.js');
+          const mod = await import('./commands/send'); // <<< FIXED (no .js)
           if ((mod as any)?.handleApprovalButton) return (mod as any).handleApprovalButton(i as any);
         } catch (err) {
           console.error('send approval button error', err);
@@ -217,7 +217,7 @@ client.on('interactionCreate', async (i: Interaction) => {
       // ✅ NEW: /send picker buttons (Nation vs Alliance)
       if (i.customId === 'send:pick:nation' || i.customId === 'send:pick:alliance') {
         try {
-          const mod = await import('./commands/send.js');
+          const mod = await import('./commands/send'); // <<< FIXED (no .js)
           if ((mod as any)?.handleButton) return (mod as any).handleButton(i as any);
         } catch (err) {
           console.error('send button error', err);
