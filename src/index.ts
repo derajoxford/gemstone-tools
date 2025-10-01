@@ -185,11 +185,35 @@ client.on('interactionCreate', async (i: Interaction) => {
       }
 
     } else if (i.isModalSubmit()) {
+      // ✅ NEW: /send modal handling (Nation or Alliance)
+      if (i.customId === 'send:modal:nation' || i.customId === 'send:modal:alliance') {
+        try {
+          const mod = await import('./commands/send.js');
+          if ((mod as any)?.handleModal) return (mod as any).handleModal(i as any);
+        } catch (err) {
+          console.error('send modal error', err);
+          try { await (i as any).reply({ content: 'Something went wrong.', ephemeral: true }); } catch {}
+          return;
+        }
+      }
+
       if (i.customId.startsWith('wd:modal:')) return handleWithdrawPagedModal(i as any);
       if (i.customId.startsWith('alliancekeys:')) return handleAllianceModal(i as any);
       if (i.customId.startsWith('sk:modal:')) return handleSafekeepingModalSubmit(i as any);
 
     } else if (i.isButton()) {
+      // ✅ NEW: /send button handling (picker)
+      if (i.customId === 'send:pick:nation' || i.customId === 'send:pick:alliance') {
+        try {
+          const mod = await import('./commands/send.js');
+          if ((mod as any)?.handleButton) return (mod as any).handleButton(i as any);
+        } catch (err) {
+          console.error('send button error', err);
+          try { await (i as any).reply({ content: 'Something went wrong.', ephemeral: true }); } catch {}
+          return;
+        }
+      }
+
       if (i.customId.startsWith('wd:open:')) return handleWithdrawOpenButtonPaged(i as any);
       if (i.customId === 'wd:done') return handleWithdrawDone(i as any);
 
@@ -744,7 +768,7 @@ async function handleSafekeepingModalSubmit(i: any) {
   btns.push(new ButtonBuilder().setCustomId('sk:done').setStyle(ButtonStyle.Success).setLabel('Done ✅'));
 
   const summary = Object.entries(sess.data)
-    .map(([k, v]) => `${k}:${Number(v).toLocaleString()}`)
+    .map(([k, v]) => `${RES_EMOJI[k as any] ?? ''}${k}: ${Number(v).toLocaleString()}`)
     .join(' · ') || '— none yet —';
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(...btns);
