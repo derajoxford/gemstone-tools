@@ -1,7 +1,10 @@
 // src/jobs/pnw_auto_apply.ts
 
 import { Client, EmbedBuilder } from "discord.js";
-import { PrismaClient, Prisma, SafeTxnType } from "@prisma/client";
+import { PrismaClient, Prisma } from "@prisma/client";
+
+const SafeTxnType = Prisma.$Enums.SafeTxnType;
+type SafeTxnTypeT = Prisma.SafeTxnType;
 
 const prisma = new PrismaClient();
 
