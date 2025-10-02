@@ -16,6 +16,12 @@ enum WithdrawStatus {
   CANCELED
 }
 
+enum SafeTxnType {
+  MANUAL_ADJUST
+  AUTO_CREDIT
+  WITHDRAWAL
+}
+
 model Alliance {
   id              Int        @id
   guildId         String?
@@ -25,13 +31,20 @@ model Alliance {
   updatedAt       DateTime   @updatedAt
   lastBankrecId   Int?
 
+  // --- Offshore override (self-relation) ---
+  // If set, this alliance will offshore to the specified Alliance id.
+  offshoreOverrideAllianceId Int?
+  offshoreOverride           Alliance?   @relation("AllianceOffshore", fields: [offshoreOverrideAllianceId], references: [id])
+  offshoreFor                Alliance[]  @relation("AllianceOffshore")
+
+  // --- Existing relations ---
   keys            AllianceKey[]
   members         Member[]
   bankrecs        Bankrec[]
   treasury        AllianceTreasury?
+  allianceGuilds  AllianceGuild[]  // back-reference so Alliance ↔ AllianceGuild is valid
 
-  // NEW: back-relation so Alliance ↔ AllianceGuild is valid
-  allianceGuilds  AllianceGuild[]
+  @@index([offshoreOverrideAllianceId])
 }
 
 model AllianceKey {
@@ -43,6 +56,7 @@ model AllianceKey {
   nonceBot         Bytes?
   addedBy          String
   createdAt        DateTime @default(now())
+
   alliance         Alliance @relation(fields: [allianceId], references: [id])
 }
 
@@ -57,7 +71,7 @@ model Member {
 
   balance     Safekeeping?
   alliance    Alliance @relation(fields: [allianceId], references: [id])
-  safeTxns    SafeTxn[]        // <— back-reference for SafeTxn.member
+  safeTxns    SafeTxn[]        // back-reference for SafeTxn.member
 
   @@unique([allianceId, discordId])
 }
@@ -78,6 +92,7 @@ model Safekeeping {
   steel      Decimal  @default(0)
   aluminum   Decimal  @default(0)
   updatedAt  DateTime @updatedAt
+
   member     Member   @relation(fields: [memberId], references: [id])
 }
 
@@ -128,7 +143,23 @@ model AllianceTreasury {
   alliance   Alliance  @relation(fields: [allianceId], references: [id])
 }
 
-// --- Key/Value settings (used for offshore config, etc.) ---
+// --- Offshore transfer audit (recommended) ---
+model OffshoreTransfer {
+  id        String   @id @default(uuid())
+  sourceAid Int
+  targetAid Int
+  payload   Json
+  note      String?
+  actorId   String   // discord user id who initiated the transfer
+  result    String   // "OK" or error message
+  createdAt DateTime @default(now())
+
+  @@index([sourceAid, createdAt])
+  @@index([targetAid, createdAt])
+}
+
+// --- Key/Value settings (used for default offshore, etc.) ---
+// Store default offshore under key = "default_offshore_aid", value = {"aid": 12345}
 model Setting {
   key       String   @id
   value     Json
@@ -192,12 +223,6 @@ model AllianceTaxCursor {
 }
 
 // --- Safekeeping transaction audit trail ---
-enum SafeTxnType {
-  MANUAL_ADJUST
-  AUTO_CREDIT
-  WITHDRAWAL
-}
-
 model SafeTxn {
   id             Int         @id @default(autoincrement())
   memberId       Int
