@@ -3,10 +3,10 @@
 import { Client, EmbedBuilder } from "discord.js";
 import { PrismaClient, Prisma } from "@prisma/client";
 
-const SafeTxnType = Prisma.$Enums.SafeTxnType;
-type SafeTxnTypeT = Prisma.SafeTxnType;
-
 const prisma = new PrismaClient();
+
+// --- local enum types (no runtime dependency on Prisma.$Enums) ---
+type SafeTxnTypeT = "MANUAL_ADJUST" | "AUTO_CREDIT" | "WITHDRAWAL";
 
 // --- tunables ---
 const POLL_MS = Number(process.env.AUTO_APPLY_POLL_MS ?? 5 * 60 * 1000); // 5m
@@ -67,14 +67,31 @@ function fmt(n: number): string {
   return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
 }
 
+function envApiKeyForAlliance(allianceId: number): string | undefined {
+  return (
+    process.env[`PNW_API_KEY_${allianceId}`]?.trim() ||
+    process.env.PNW_API_KEY?.trim()
+  );
+}
+
 // ---------- LIVE (GraphQL) FETCH ----------
 async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) {
   try {
+    // Try DB first…
     const keyrec = await prisma.allianceApiKey.findUnique({ where: { allianceId } });
-    const apiKey = keyrec?.apiKey?.trim();
+    const apiKeyDb = keyrec?.apiKey?.trim();
+
+    // …then ENV fallbacks (same behavior as bankpeek)
+    const apiKeyEnv = envApiKeyForAlliance(allianceId);
+
+    const apiKey = apiKeyDb || apiKeyEnv;
     if (!apiKey) {
-      console.warn(`[auto-credit] no API key saved for alliance ${allianceId}`);
+      console.warn(`[auto-credit] no API key for alliance ${allianceId} (DB empty, ENV empty)`);
       return [];
+    } else {
+      console.log(
+        `[auto-credit] using API key for alliance ${allianceId} from ${apiKeyDb ? "DB" : "ENV"}`
+      );
     }
 
     const base = process.env.PNW_GRAPHQL_URL || "https://api.politicsandwar.com/graphql";
@@ -159,10 +176,10 @@ async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) 
       )
       .sort((a, b) => (a.created_at as Date).getTime() - (b.created_at as Date).getTime());
 
-    console.log(`[auto-credit] PnW API fallback fetched ${mapped.length} rows for alliance ${allianceId}`);
+    console.log(`[auto-credit] PnW API fetched ${mapped.length} rows for alliance ${allianceId}`);
     return mapped;
   } catch (e) {
-    console.warn("[auto-credit] PnW API fallback error:", e);
+    console.warn("[auto-credit] PnW API fetch error:", e);
     return [];
   }
 }
@@ -298,7 +315,8 @@ async function creditOneResource(
       memberId,
       resource,
       amount: new Prisma.Decimal(amount),
-      type: SafeTxnType.AUTO_CREDIT,
+      // pass enum as a plain string literal to avoid Prisma.$Enums at runtime
+      type: "AUTO_CREDIT" as SafeTxnTypeT,
       actorDiscordId: "system",
       reason,
     },
@@ -446,7 +464,6 @@ export function startAutoApply(discordClient?: Client) {
     _running = true;
     try {
       const alliances = await prisma.alliance.findMany({ select: { id: true } });
-      console.log(`[auto-credit] alliances in DB: ${alliances.map((a) => a.id).join(", ")}`);
       console.log(`[auto-credit] alliances in DB: ${alliances.map((a) => a.id).join(", ")}`);
 
       for (const a of alliances) {
