@@ -10,54 +10,72 @@ const prisma = new PrismaClient();
 
 export const data = new SlashCommandBuilder()
   .setName("guild_link_alliance")
-  .setDescription("Link THIS Discord server to a PnW alliance (banking/safekeeping scope)")
-  .addIntegerOption(o =>
-    o.setName("alliance_id")
-      .setDescription("PnW Alliance ID (e.g. 14364)")
+  .setDescription("Link THIS Discord server to a PnW Alliance ID")
+  .addIntegerOption((o) =>
+    o
+      .setName("alliance_id")
+      .setDescription("PnW Alliance ID")
       .setRequired(true)
   )
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
 
 export async function execute(i: ChatInputCommandInteraction) {
-  // Always answer quickly so Discord doesn’t sit in “thinking”
+  if (!i.guildId) {
+    return i.reply({ content: "This can only be used in a server.", ephemeral: true });
+  }
+
+  const hasPerm =
+    i.memberPermissions?.has(PermissionFlagsBits.ManageGuild) ?? false;
+  if (!hasPerm) {
+    return i.reply({
+      content: "You need **Manage Server** to run this.",
+      ephemeral: true,
+    });
+  }
+
+  const allianceId = i.options.getInteger("alliance_id", true);
+
   await i.deferReply({ ephemeral: true });
+  console.log(
+    `[guild_link_alliance] invoked by ${i.user.id} in guild ${i.guildId} -> alliance ${allianceId}`
+  );
 
   try {
-    if (!i.guildId) {
-      return i.editReply("This command can only be used inside a server.");
-    }
-
-    const allianceId = i.options.getInteger("alliance_id", true);
-
-    // Ensure the Alliance exists (or create a minimal row)
+    // 1) Ensure the Alliance row exists
     await prisma.alliance.upsert({
       where: { id: allianceId },
-      update: { updatedAt: new Date() },
-      create: { id: allianceId },
+      update: { updatedAt: new Date(), guildId: i.guildId },
+      create: {
+        id: allianceId,
+        guildId: i.guildId,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
     });
 
-    // Create/Update the Guild→Alliance link (unique per guild)
+    // 2) Upsert the guild link using the UNIQUE guildId key
     await prisma.allianceGuild.upsert({
-      where: { guildId: i.guildId },
-      update: { allianceId },
-      create: { guildId: i.guildId, allianceId },
+      where: { guildId: i.guildId }, // <-- UNIQUE in schema
+      update: { allianceId, createdAt: undefined },
+      create: { allianceId, guildId: i.guildId },
     });
 
-    // Also store the allianceId on the Alliance row for convenience (optional)
-    await prisma.alliance.update({
-      where: { id: allianceId },
-      data: { guildId: i.guildId },
-    });
-
+    console.log(
+      `[guild_link_alliance] linked guild ${i.guildId} -> alliance ${allianceId}`
+    );
     await i.editReply(
-      `✅ Linked this server to PnW alliance **${allianceId}**.\n` +
-      `Members here can now use **/link_nation** and safekeeping will scope to this alliance.\n\n` +
-      `If you want a review channel for approvals, set it with **/set_review_channel**.`
+      `✅ Linked this server to alliance **${allianceId}**.`
     );
   } catch (err: any) {
     console.error("[guild_link_alliance] error:", err);
-    try {
-      await i.editReply("❌ Something went wrong linking this guild. Check bot logs for details.");
-    } catch {}
+    const msg =
+      err?.code === "P2002"
+        ? "Database unique constraint error (duplicate)."
+        : err?.code === "P2021"
+        ? "DB table missing—did you run the migrations?"
+        : err?.code === "P2022"
+        ? "DB column mismatch—schema vs. DB out of sync."
+        : "Unexpected error. Check bot logs.";
+    await i.editReply(`❌ Failed to link: ${msg}`);
   }
 }
