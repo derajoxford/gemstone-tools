@@ -230,3 +230,64 @@ export async function fetchBankrecsSince(
   const rows = await fetchBankrecs(allianceId, { limit: windowSize });
   return rows.filter((r) => Number(r.id) > Number(afterId));
 }
+// -----------------------------
+// Alliance → Alliance bankWithdraw helper
+// -----------------------------
+
+export type PnwResourcePayload = Partial<Record<
+  | 'money' | 'food' | 'coal' | 'oil' | 'uranium'
+  | 'lead' | 'iron' | 'bauxite' | 'gasoline'
+  | 'munitions' | 'steel' | 'aluminum',
+  number
+>>;
+
+function buildWithdrawFields(payload: PnwResourcePayload, note?: string) {
+  const parts: string[] = [];
+  for (const [k, v] of Object.entries(payload || {})) {
+    const n = Number(v);
+    if (Number.isFinite(n) && n > 0) parts.push(`${k}:${n}`);
+  }
+  if (note) parts.push(`note:${JSON.stringify(note)}`);
+  return parts;
+}
+
+/**
+ * Performs bankWithdraw to an **alliance** (receiver_type: 2).
+ * Expects valid `apiKey` and `botKey`. Returns `{ ok, data?, error? }`.
+ */
+export async function bankWithdrawAlliance(
+  apiKey: string,
+  botKey: string,
+  targetAllianceId: number,
+  payload: PnwResourcePayload,
+  note?: string
+): Promise<{ ok: boolean; data?: any; error?: string }> {
+  if (!apiKey || !botKey) return { ok: false, error: 'missing-keys' };
+  if (!targetAllianceId || targetAllianceId <= 0) return { ok: false, error: 'bad-target' };
+
+  const fields = buildWithdrawFields(payload, note);
+  if (!fields.length) return { ok: false, error: 'empty-payload' };
+
+  const query = `mutation{
+    bankWithdraw(receiver:${targetAllianceId}, receiver_type:2, ${fields.join(',')}) { id }
+  }`;
+
+  const url = 'https://api.politicsandwar.com/graphql?api_key=' + encodeURIComponent(apiKey);
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Api-Key': apiKey,
+      'X-Bot-Key': botKey,
+    },
+    body: JSON.stringify({ query })
+  });
+
+  let json: any = {};
+  try { json = await res.json(); } catch {}
+
+  if (!res.ok || (json && json.errors)) {
+    return { ok: false, error: JSON.stringify(json?.errors ?? { status: res.status }) };
+  }
+  return { ok: true, data: json?.data?.bankWithdraw };
+}
