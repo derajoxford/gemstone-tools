@@ -2,13 +2,13 @@
 //
 // Offshore controller: show / set default / set override / holdings / send (modal).
 // Modal opens immediately to avoid Discord 3s timeouts.
-// Validation relaxed: only checks alliances(id:[aid]) to avoid over-strict bankrecs filters.
-// Added diagnostics: OFFSH_KEY_SCAN to show keys discovered and which passed.
+// GraphQL calls now include ?api_key=... in the URL (required by PnW), plus headers.
+// Diagnostic logs: OFFSH_KEY_SCAN / OFFSH_KEY_TRY / OFFSH_SEND_ERR.
 //
 // Requirements:
 //   BOT_ADMIN_DISCORD_ID
-//   PNW_BOT_KEY
-//   PNW_GRAPHQL_URL (optional)
+//   PNW_BOT_KEY (X-Bot-Key required for money movement)
+//   PNW_GRAPHQL_URL (optional; defaults to official)
 
 import {
   SlashCommandBuilder,
@@ -92,10 +92,13 @@ async function estimateAllianceAvailableFromRecent(aid: number, limit = 100) {
 
 // ---------- key selection & validation ----------
 async function validateApiKeyForAlliance(apiKey: string, aid: number): Promise<boolean> {
-  // Keep it minimal to avoid false negatives.
+  // Minimal safe check; MUST include ?api_key=...
   try {
     const body = { query: `query { alliances(id:[${aid}], first:1){ data{ id } } }` };
-    const resp = await fetch(GQL_URL, {
+    const url = new URL(GQL_URL);
+    url.searchParams.set("api_key", apiKey);
+
+    const resp = await fetch(url.toString(), {
       method: "POST",
       headers: { "content-type": "application/json", "X-Api-Key": apiKey },
       body: JSON.stringify(body),
@@ -129,7 +132,6 @@ async function getAllianceApiKeyFor(aid: number): Promise<string | null> {
         if (ok) return apiKey;
       } catch (e) {
         console.warn("OFFSH_KEY_DECRYPT_FAIL", JSON.stringify({ keyId: k.id, err: String((e as any)?.message || e) }));
-        // keep trying older keys
       }
     }
     return null;
@@ -162,12 +164,15 @@ async function bankWithdrawAllianceToAlliance(opts: {
   }`;
 
   try {
-    const resp = await fetch(GQL_URL, {
+    const url = new URL(GQL_URL);
+    url.searchParams.set("api_key", opts.apiKey);
+
+    const resp = await fetch(url.toString(), {
       method: "POST",
       headers: {
         "content-type": "application/json",
         "X-Api-Key": opts.apiKey,
-        "X-Bot-Key": opts.botKey,
+        "X-Bot-Key": opts.botKey, // required for mutations
       },
       body: JSON.stringify({ query: q }),
     });
