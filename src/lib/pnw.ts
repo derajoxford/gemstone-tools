@@ -72,10 +72,30 @@ export type BankrecRow = {
   receiver_type: number;
   sender_id: string;
   receiver_id: string;
+
+  // amounts (nullable in API)
+  money?: number | string | null;
+  food?: number | string | null;
+  coal?: number | string | null;
+  oil?: number | string | null;
+  uranium?: number | string | null;
+  lead?: number | string | null;
+  iron?: number | string | null;
+  bauxite?: number | string | null;
+  gasoline?: number | string | null;
+  munitions?: number | string | null;
+  steel?: number | string | null;
+  aluminum?: number | string | null;
 };
 
+export function asNum(v: unknown): number {
+  if (v == null) return 0;
+  const n = typeof v === "string" ? Number(v) : (v as number);
+  return Number.isFinite(n) ? n : 0;
+}
+
 function isAllianceRow(aid: number, r: BankrecRow): boolean {
-  // type 2 = alliance (based on observed data)
+  // type 2 = alliance
   return (
     (r.sender_type === 2 && String(r.sender_id) === String(aid)) ||
     (r.receiver_type === 2 && String(r.receiver_id) === String(aid))
@@ -86,18 +106,14 @@ function isAllianceRow(aid: number, r: BankrecRow): boolean {
 // Fallback via top-level bankrecs with pagination
 // -----------------------------
 
-/**
- * Walks pages of the global bankrecs feed and filters for rows that involve the alliance.
- * This is a workaround while alliances(ids:){ bankrecs(...) } intermittently returns 500.
- */
 export async function fetchAllianceBankrecsViaTopLevel(
   apiKey: string,
   allianceId: number,
   limit: number
 ): Promise<BankrecRow[]> {
   const collected: BankrecRow[] = [];
-  const first = Math.min(Math.max(limit, 25), 100); // items per page
-  const maxPages = 12; // safety cap to avoid hammering the API
+  const first = Math.min(Math.max(limit, 25), 100);
+  const maxPages = 12;
 
   const q = `
     query($first:Int!, $page:Int!) {
@@ -111,6 +127,18 @@ export async function fetchAllianceBankrecsViaTopLevel(
           receiver_type
           sender_id
           receiver_id
+          money
+          food
+          coal
+          oil
+          uranium
+          lead
+          iron
+          bauxite
+          gasoline
+          munitions
+          steel
+          aluminum
         }
         paginatorInfo {
           currentPage
@@ -144,7 +172,7 @@ export async function fetchAllianceBankrecsViaTopLevel(
     }
 
     const info = parsed?.data?.bankrecs?.paginatorInfo;
-    if (!info || !info.hasMorePages) break; // no more pages
+    if (!info || !info.hasMorePages) break;
   }
 
   return collected.slice(0, limit);
@@ -176,6 +204,18 @@ export async function fetchAllianceBankrecsViaGQL(
               receiver_type
               sender_id
               receiver_id
+              money
+              food
+              coal
+              oil
+              uranium
+              lead
+              iron
+              bauxite
+              gasoline
+              munitions
+              steel
+              aluminum
             }
           }
         }
@@ -199,16 +239,14 @@ export async function fetchAllianceBankrecsViaGQL(
     const data: BankrecRow[] =
       parsed?.data?.alliances?.data?.[0]?.bankrecs?.data ?? [];
 
-    // guard against any mixed rows
     return data.filter((r) => isAllianceRow(allianceId, r));
   } catch {
-    // When alliances(...) 500s, fall back to top-level paginated scan
     return await fetchAllianceBankrecsViaTopLevel(apiKey, allianceId, limit);
   }
 }
 
 // -----------------------------
-// Public wrappers (for existing imports)
+// Public wrappers
 // -----------------------------
 
 export async function fetchBankrecs(
@@ -216,7 +254,7 @@ export async function fetchBankrecs(
   opts?: { limit?: number }
 ): Promise<BankrecRow[]> {
   const apiKey = getAllianceApiKey(allianceId);
-  const limit = Math.max(1, Math.min(opts?.limit ?? 50, 200));
+  const limit = Math.max(1, Math.min(opts?.limit ?? 200, 500));
   return fetchAllianceBankrecsViaGQL(apiKey, allianceId, { limit });
 }
 
@@ -225,69 +263,7 @@ export async function fetchBankrecsSince(
   afterId: number,
   opts?: { limit?: number }
 ): Promise<BankrecRow[]> {
-  // grab a wider window then filter client-side
-  const windowSize = Math.max(50, Math.min(opts?.limit ?? 100, 200));
+  const windowSize = Math.max(50, Math.min(opts?.limit ?? 200, 500));
   const rows = await fetchBankrecs(allianceId, { limit: windowSize });
   return rows.filter((r) => Number(r.id) > Number(afterId));
-}
-// -----------------------------
-// Alliance → Alliance bankWithdraw helper
-// -----------------------------
-
-export type PnwResourcePayload = Partial<Record<
-  | 'money' | 'food' | 'coal' | 'oil' | 'uranium'
-  | 'lead' | 'iron' | 'bauxite' | 'gasoline'
-  | 'munitions' | 'steel' | 'aluminum',
-  number
->>;
-
-function buildWithdrawFields(payload: PnwResourcePayload, note?: string) {
-  const parts: string[] = [];
-  for (const [k, v] of Object.entries(payload || {})) {
-    const n = Number(v);
-    if (Number.isFinite(n) && n > 0) parts.push(`${k}:${n}`);
-  }
-  if (note) parts.push(`note:${JSON.stringify(note)}`);
-  return parts;
-}
-
-/**
- * Performs bankWithdraw to an **alliance** (receiver_type: 2).
- * Expects valid `apiKey` and `botKey`. Returns `{ ok, data?, error? }`.
- */
-export async function bankWithdrawAlliance(
-  apiKey: string,
-  botKey: string,
-  targetAllianceId: number,
-  payload: PnwResourcePayload,
-  note?: string
-): Promise<{ ok: boolean; data?: any; error?: string }> {
-  if (!apiKey || !botKey) return { ok: false, error: 'missing-keys' };
-  if (!targetAllianceId || targetAllianceId <= 0) return { ok: false, error: 'bad-target' };
-
-  const fields = buildWithdrawFields(payload, note);
-  if (!fields.length) return { ok: false, error: 'empty-payload' };
-
-  const query = `mutation{
-    bankWithdraw(receiver:${targetAllianceId}, receiver_type:2, ${fields.join(',')}) { id }
-  }`;
-
-  const url = 'https://api.politicsandwar.com/graphql?api_key=' + encodeURIComponent(apiKey);
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Api-Key': apiKey,
-      'X-Bot-Key': botKey,
-    },
-    body: JSON.stringify({ query })
-  });
-
-  let json: any = {};
-  try { json = await res.json(); } catch {}
-
-  if (!res.ok || (json && json.errors)) {
-    return { ok: false, error: JSON.stringify(json?.errors ?? { status: res.status }) };
-  }
-  return { ok: true, data: json?.data?.bankWithdraw };
 }
