@@ -14,9 +14,9 @@ import { seal, open } from './lib/crypto.js';
 import { RES_EMOJI, ORDER } from './lib/emojis.js';
 import { extraCommandsJSON, findCommandByName } from './commands/registry';
 import { startAutoApply } from "./jobs/pnw_auto_apply";
+import * as Offshore from "./commands/offshore"; // <-- offshore module
 
-// ✅ Prisma enum runtime alias (ESM-safe)
-const WithdrawStatus = Prisma.$Enums.WithdrawStatus;
+// (Removed runtime const using Prisma.$Enums to avoid crashes on some envs)
 // type WithdrawStatusT = Prisma.WithdrawStatus;
 
 import * as Who from "./commands/who";
@@ -194,6 +194,19 @@ client.on('interactionCreate', async (i: Interaction) => {
       }
 
     } else if (i.isModalSubmit()) {
+
+      // ---- OFFSHORE modal routing (must be first in modal section)
+      if (i.customId.startsWith('offsh:')) {
+        try {
+          if ((Offshore as any)?.handleModal) return (Offshore as any).handleModal(i as any);
+        } catch (err) {
+          console.error('offshore modal error', err);
+          try { await (i as any).reply({ content: 'Something went wrong.', ephemeral: true }); } catch {}
+          return;
+        }
+      }
+
+      // ✅ NEW: /send multi-page modal handling
       if (i.customId.startsWith('send:modal:')) {
         try {
           const mod = await import('./commands/send');
@@ -210,6 +223,18 @@ client.on('interactionCreate', async (i: Interaction) => {
       if (i.customId.startsWith('sk:modal:')) return handleSafekeepingModalSubmit(i as any);
 
     } else if (i.isButton()) {
+
+      // ---- OFFSHORE button routing (must be first in button section)
+      if (i.customId.startsWith('offsh:')) {
+        try {
+          if ((Offshore as any)?.handleButton) return (Offshore as any).handleButton(i as any);
+        } catch (err) {
+          console.error('offshore button error', err);
+          try { await (i as any).reply({ content: 'Something went wrong.', ephemeral: true }); } catch {}
+          return;
+        }
+      }
+
       if (i.customId.startsWith('send:req:approve:') || i.customId.startsWith('send:req:deny:')) {
         try {
           const mod = await import('./commands/send');
