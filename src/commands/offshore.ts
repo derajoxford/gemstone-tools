@@ -1,16 +1,15 @@
 // src/commands/offshore.ts
 import {
   SlashCommandBuilder, ChatInputCommandInteraction, PermissionFlagsBits,
-  EmbedBuilder, Colors
+  EmbedBuilder, Colors, ButtonBuilder, ActionRowBuilder, ButtonStyle
 } from "discord.js";
 import { PrismaClient } from "@prisma/client";
 import { fetchBankrecs, RESOURCE_KEYS, asNum } from "../lib/pnw";
-import { getOffshoreAllianceFor, getGlobalDefaultOffshoreAid, setGlobalDefaultOffshoreAid } from "../lib/offshore";
+import { getDefaultOffshore, setDefaultOffshore } from "../lib/offshore";
 import { open } from "../lib/crypto";
 
 const prisma = new PrismaClient();
 
-// utils
 function fmt(n: number) {
   return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
 }
@@ -22,6 +21,12 @@ function resLines(obj: Record<string, number>) {
     })
     .filter(Boolean)
     .join("\n") || "— none —";
+}
+
+async function resolveOffshoreAid(allianceId: number): Promise<number | null> {
+  const a = await prisma.alliance.findUnique({ where: { id: allianceId } });
+  if (a?.offshoreOverrideAllianceId) return a.offshoreOverrideAllianceId;
+  return await getDefaultOffshore();
 }
 
 export const data = new SlashCommandBuilder()
@@ -60,7 +65,7 @@ export async function execute(i: ChatInputCommandInteraction) {
       return i.reply({ content: "only the bot admin can set the global default offshore", ephemeral: true });
     }
     const aid = i.options.getInteger("aid", true);
-    await setGlobalDefaultOffshoreAid(aid);
+    await setDefaultOffshore(aid, i.user.id);
     return i.reply({ content: `✅ Set global default offshore to alliance ${aid}.`, ephemeral: true });
   }
 
@@ -75,8 +80,8 @@ export async function execute(i: ChatInputCommandInteraction) {
   }
 
   if (sub === "show") {
-    const globalAid = await getGlobalDefaultOffshoreAid();
-    const eff = await getOffshoreAllianceFor(alliance.id);
+    const globalAid = await getDefaultOffshore();
+    const eff = await resolveOffshoreAid(alliance.id);
     const lines = [
       `Alliance: **${alliance.name || alliance.id}** (id ${alliance.id})`,
       `Per-alliance override: ${alliance.offshoreOverrideAllianceId ? `**${alliance.offshoreOverrideAllianceId}**` : "_none_"} `,
@@ -96,16 +101,14 @@ export async function execute(i: ChatInputCommandInteraction) {
   }
 
   if (sub === "holdings") {
-    // compute net deposits from source A to offshore O minus returns O->A
-    const offshoreAid = await getOffshoreAllianceFor(alliance.id);
+    const offshoreAid = await resolveOffshoreAid(alliance.id);
     if (!offshoreAid) {
       return i.reply({ content: "No offshore set. Use /offshore set_override or ask the bot admin to set a global default.", ephemeral: true });
     }
-
     await i.deferReply({ ephemeral: true });
 
     // Pull a big window and dedupe by id
-    const take = 400; // recent history
+    const take = 400; // recent history window on the OFFSHORE alliance
     const rows = await fetchBankrecs(offshoreAid, { limit: take });
 
     const net: Record<string, number> = {};
@@ -119,8 +122,8 @@ export async function execute(i: ChatInputCommandInteraction) {
       if (seen.has(String(r.id))) continue;
       seen.add(String(r.id));
 
-      const fromAtoO = r.sender_type === 2 && r.sender_id === A && r.receiver_type === 2 && r.receiver_id === O;
-      const fromOtoA = r.sender_type === 2 && r.sender_id === O && r.receiver_type === 2 && r.receiver_id === A;
+      const fromAtoO = r.sender_type === 2 && String(r.sender_id) === A && r.receiver_type === 2 && String(r.receiver_id) === O;
+      const fromOtoA = r.sender_type === 2 && String(r.sender_id) === O && r.receiver_type === 2 && String(r.receiver_id) === A;
       if (!fromAtoO && !fromOtoA) continue;
 
       const sign = fromAtoO ? +1 : -1;
@@ -139,8 +142,7 @@ export async function execute(i: ChatInputCommandInteraction) {
   }
 
   if (sub === "send") {
-    // Prepare/send an alliance-bank → offshore transfer
-    const offshoreAid = await getOffshoreAllianceFor(alliance.id);
+    const offshoreAid = await resolveOffshoreAid(alliance.id);
     if (!offshoreAid) {
       return i.reply({ content: "No offshore set. Use /offshore set_override or ask the bot admin to set a global default.", ephemeral: true });
     }
@@ -157,26 +159,18 @@ export async function execute(i: ChatInputCommandInteraction) {
       return i.reply({ content: `Invalid JSON: ${e?.message || e}`, ephemeral: true });
     }
 
-    // choose mode
     const tryAuto = process.env.AUTOOFFSHORE_ENABLED === "1";
-
     if (tryAuto) {
-      // We need alliance API + bot key to move alliance bank
       const krec = await prisma.allianceKey.findFirst({
         where: { allianceId: alliance.id },
         orderBy: { id: "desc" }
       });
-      const apiKey = krec ? open(krec.encryptedApiKey as any, krec.nonceApi as any) : (process.env[`PNW_API_KEY_${alliance.id}`] || process.env.PNW_API_KEY || "");
+      const apiKey = krec ? open(krec.encryptedApiKey as any, krec.nonceApi as any)
+        : (process.env[`PNW_API_KEY_${alliance.id}`] || process.env.PNW_API_KEY || "");
       const botKey = process.env.PNW_BOT_KEY || "";
 
-      if (!apiKey || !botKey) {
-        // fall back to manual
-        await i.reply({ content: "⚠️ No API/Bot key found for this alliance. Use the manual method below.", ephemeral: true });
-      } else {
-        // Attempt an auto bankWithdraw to the offshore **alliance** treasury (receiver_type=2)
-        const fields: string[] = Object.entries(payload)
-          .map(([k, v]) => `${k}:${Number(v)}`);
-
+      if (apiKey && botKey) {
+        const fields: string[] = Object.entries(payload).map(([k, v]) => `${k}:${Number(v)}`);
         const note = `Gemstone Offsh • src ${alliance.id} -> off ${offshoreAid} • by ${i.user.id}`;
         fields.push(`note:${JSON.stringify(note)}`);
 
@@ -197,17 +191,18 @@ export async function execute(i: ChatInputCommandInteraction) {
 
         if (success) {
           return i.reply({
-            content: `✅ Sent to offshore **${offshoreAid}**.\nNote: \`${note}\`\nYou can verify with **/offshore holdings** in a couple minutes.`,
+            content: `✅ Sent to offshore **${offshoreAid}**.\nNote: \`${note}\`\nVerify with **/offshore holdings** shortly.`,
             ephemeral: true
           });
         }
-
         // fall through to manual if auto failed
-        await i.reply({ content: "⚠️ Auto-send failed. Use the manual instructions below.", ephemeral: true });
+        await i.reply({ content: "⚠️ Auto-send failed. See manual instructions below.", ephemeral: true });
+      } else {
+        await i.reply({ content: "⚠️ No API/Bot key found for this alliance. Using manual method below.", ephemeral: true });
       }
     }
 
-    // Manual instructions: give them a note to paste, and exactly what to send
+    // Manual instructions
     const note = `Gemstone Offsh • src ${alliance.id} -> off ${offshoreAid} • by ${i.user.id}`;
     const list = RESOURCE_KEYS
       .map(k => payload[k] ? `• ${k}: ${fmt(Number(payload[k]))}` : null)
@@ -223,7 +218,12 @@ export async function execute(i: ChatInputCommandInteraction) {
       )
       .setColor(Colors.Gold);
 
-    return i.reply({ embeds: [embed], ephemeral: true });
+    // add a tiny helper button to re-check holdings after a bit
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("offshore:check").setStyle(ButtonStyle.Secondary).setLabel("Re-check holdings (run /offshore holdings)")
+    );
+
+    return i.reply({ embeds: [embed], components: [row], ephemeral: true });
   }
 
   return i.reply({ content: "Unknown subcommand.", ephemeral: true });
