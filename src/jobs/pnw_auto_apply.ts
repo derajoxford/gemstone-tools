@@ -5,8 +5,9 @@ import { PrismaClient, Prisma } from "@prisma/client";
 
 const prisma = new PrismaClient();
 
-// --- local enum types (no runtime dependency on Prisma.$Enums) ---
-type SafeTxnTypeT = "MANUAL_ADJUST" | "AUTO_CREDIT" | "WITHDRAWAL";
+// --- local enum alias to avoid runtime Prisma.$Enums issues ---
+type SafeTxnTypeT = 'MANUAL_ADJUST' | 'AUTO_CREDIT' | 'WITHDRAWAL';
+const SAFE_AUTOCREDIT: SafeTxnTypeT = 'AUTO_CREDIT';
 
 // --- tunables ---
 const POLL_MS = Number(process.env.AUTO_APPLY_POLL_MS ?? 5 * 60 * 1000); // 5m
@@ -67,31 +68,14 @@ function fmt(n: number): string {
   return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
 }
 
-function envApiKeyForAlliance(allianceId: number): string | undefined {
-  return (
-    process.env[`PNW_API_KEY_${allianceId}`]?.trim() ||
-    process.env.PNW_API_KEY?.trim()
-  );
-}
-
 // ---------- LIVE (GraphQL) FETCH ----------
 async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) {
   try {
-    // Try DB first…
     const keyrec = await prisma.allianceApiKey.findUnique({ where: { allianceId } });
-    const apiKeyDb = keyrec?.apiKey?.trim();
-
-    // …then ENV fallbacks (same behavior as bankpeek)
-    const apiKeyEnv = envApiKeyForAlliance(allianceId);
-
-    const apiKey = apiKeyDb || apiKeyEnv;
+    const apiKey = keyrec?.apiKey?.trim();
     if (!apiKey) {
-      console.warn(`[auto-credit] no API key for alliance ${allianceId} (DB empty, ENV empty)`);
+      console.warn(`[auto-credit] no API key saved for alliance ${allianceId}`);
       return [];
-    } else {
-      console.log(
-        `[auto-credit] using API key for alliance ${allianceId} from ${apiKeyDb ? "DB" : "ENV"}`
-      );
     }
 
     const base = process.env.PNW_GRAPHQL_URL || "https://api.politicsandwar.com/graphql";
@@ -176,10 +160,10 @@ async function fetchAllianceDepositsFromPnWAPI(allianceId: number, since: Date) 
       )
       .sort((a, b) => (a.created_at as Date).getTime() - (b.created_at as Date).getTime());
 
-    console.log(`[auto-credit] PnW API fetched ${mapped.length} rows for alliance ${allianceId}`);
+    console.log(`[auto-credit] PnW API fallback fetched ${mapped.length} rows for alliance ${allianceId}`);
     return mapped;
   } catch (e) {
-    console.warn("[auto-credit] PnW API fetch error:", e);
+    console.warn("[auto-credit] PnW API fallback error:", e);
     return [];
   }
 }
@@ -315,8 +299,7 @@ async function creditOneResource(
       memberId,
       resource,
       amount: new Prisma.Decimal(amount),
-      // pass enum as a plain string literal to avoid Prisma.$Enums at runtime
-      type: "AUTO_CREDIT" as SafeTxnTypeT,
+      type: SAFE_AUTOCREDIT as any, // satisfies Prisma enum at runtime
       actorDiscordId: "system",
       reason,
     },
@@ -376,17 +359,11 @@ async function processAlliance(p: PrismaClient, discord: Client | undefined, all
     const senderNationId = Number(r.sender_id);
     if (!Number.isFinite(senderNationId)) continue;
 
-    // Resolve member by nationId (and prefer same alliance)
-    const member =
-      (await p.member.findFirst({
-        where: { nationId: senderNationId, allianceId },
-        select: { id: true, discordId: true },
-      })) ||
-      (await p.member.findFirst({
-        where: { nationId: senderNationId },
-        select: { id: true, discordId: true },
-      }));
-
+    // 🔒 STRICT: only credit if the nation is linked IN THIS ALLIANCE
+    const member = await p.member.findFirst({
+      where: { nationId: senderNationId, allianceId },
+      select: { id: true, discordId: true },
+    });
     if (!member) continue;
 
     // For each resource with positive amount, credit
@@ -464,6 +441,7 @@ export function startAutoApply(discordClient?: Client) {
     _running = true;
     try {
       const alliances = await prisma.alliance.findMany({ select: { id: true } });
+      console.log(`[auto-credit] alliances in DB: ${alliances.map((a) => a.id).join(", ")}`);
       console.log(`[auto-credit] alliances in DB: ${alliances.map((a) => a.id).join(", ")}`);
 
       for (const a of alliances) {
