@@ -1,16 +1,14 @@
 // src/commands/offshore.ts
 //
 // Offshore controller: show / set default / set override / holdings / send (modal).
-// - Key selection: tries AllianceKey newest→oldest, validates per-alliance.
-// - Button + modal flow uses customIds "offsh:*".
-// - Modal opens IMMEDIATELY (no prefetch) to avoid Discord 3s timeout.
-// - Holdings/estimates still use recent AA bankrecs.
-// - All network errors are logged with OFFSH_* markers for quick grepping.
+// Modal opens immediately to avoid Discord 3s timeouts.
+// Validation relaxed: only checks alliances(id:[aid]) to avoid over-strict bankrecs filters.
+// Added diagnostics: OFFSH_KEY_SCAN to show keys discovered and which passed.
 //
 // Requirements:
-//   BOT_ADMIN_DISCORD_ID (string Discord user ID)
-//   PNW_BOT_KEY (bot key for bankWithdraw)
-//   PNW_GRAPHQL_URL (optional; defaults to official GraphQL endpoint)
+//   BOT_ADMIN_DISCORD_ID
+//   PNW_BOT_KEY
+//   PNW_GRAPHQL_URL (optional)
 
 import {
   SlashCommandBuilder,
@@ -39,15 +37,8 @@ const ALLOWED_WITHDRAW_KEYS = [
 ] as const;
 type AllowedKey = (typeof ALLOWED_WITHDRAW_KEYS)[number];
 
-function fmt(n: number) {
-  return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
-}
-function parseNum(s: string): number {
-  if (!s) return 0;
-  const cleaned = s.replace(/[, _]/g, "");
-  const n = Number(cleaned);
-  return Number.isFinite(n) && n >= 0 ? n : NaN;
-}
+function fmt(n: number) { return n.toLocaleString(undefined, { maximumFractionDigits: 2 }); }
+function parseNum(s: string): number { if (!s) return 0; const n = Number(s.replace(/[, _]/g,"")); return Number.isFinite(n) && n >= 0 ? n : NaN; }
 function nowIso() { return new Date().toISOString(); }
 function round2(n: number) { return Math.round(n * 100) / 100; }
 
@@ -60,13 +51,10 @@ function pickAllowedPositive(payload: Record<string, number>) {
   return out as Record<string, number>;
 }
 function firstGqlError(e: any): string | null {
-  try {
-    if (Array.isArray(e?.errors) && e.errors.length) return String(e.errors[0]?.message ?? "");
-    return null;
-  } catch { return null; }
+  try { if (Array.isArray(e?.errors) && e.errors.length) return String(e.errors[0]?.message ?? ""); return null; } catch { return null; }
 }
 
-// ---------- effective offshore (global default + per-alliance override) ----------
+// ---------- effective offshore ----------
 async function resolveOffshoreAid(allianceId: number): Promise<{ global: number | null; override: number | null; effective: number | null }> {
   const global = await getDefaultOffshore();
   const a = await prisma.alliance.findUnique({ where: { id: allianceId } });
@@ -74,7 +62,7 @@ async function resolveOffshoreAid(allianceId: number): Promise<{ global: number 
   return { global, override, effective: override ?? global ?? null };
 }
 
-// ---------- fast-estimate: AA "available" from recent bankrecs (used only in holdings paths) ----------
+// ---------- quick estimate (used only for holdings UIs) ----------
 async function estimateAllianceAvailableFromRecent(aid: number, limit = 100) {
   try {
     const rows = await fetchBankrecs(aid, { limit });
@@ -98,21 +86,15 @@ async function estimateAllianceAvailableFromRecent(aid: number, limit = 100) {
     return totals;
   } catch (e) {
     console.warn("[OFFSH_ESTIMATE_ERR]", e);
-    const zeros: Record<string, number> = {};
-    for (const k of RESOURCE_KEYS) zeros[k] = 0;
-    return zeros;
+    const zeros: Record<string, number> = {}; for (const k of RESOURCE_KEYS) zeros[k] = 0; return zeros;
   }
 }
 
 // ---------- key selection & validation ----------
 async function validateApiKeyForAlliance(apiKey: string, aid: number): Promise<boolean> {
+  // Keep it minimal to avoid false negatives.
   try {
-    const body = {
-      query: `query {
-        alliances(id:[${aid}], first:1){ data{ id } }
-        bankrecs(first:1, alliance_id:${aid}){ data{ id } }
-      }`,
-    };
+    const body = { query: `query { alliances(id:[${aid}], first:1){ data{ id } } }` };
     const resp = await fetch(GQL_URL, {
       method: "POST",
       headers: { "content-type": "application/json", "X-Api-Key": apiKey },
@@ -137,12 +119,18 @@ async function getAllianceApiKeyFor(aid: number): Promise<string | null> {
       include: { keys: { orderBy: { id: "desc" } } },
     });
     const keys = alliance?.keys || [];
+    console.log("OFFSH_KEY_SCAN", JSON.stringify({ aid, totalKeys: keys.length, keyIds: keys.map(k => k.id) }));
+
     for (const k of keys) {
       try {
         const apiKey = open(k.encryptedApiKey as any, k.nonceApi as any);
         const ok = await validateApiKeyForAlliance(apiKey, aid);
+        console.log("OFFSH_KEY_TRY", JSON.stringify({ keyId: k.id, ok }));
         if (ok) return apiKey;
-      } catch { /* keep trying */ }
+      } catch (e) {
+        console.warn("OFFSH_KEY_DECRYPT_FAIL", JSON.stringify({ keyId: k.id, err: String((e as any)?.message || e) }));
+        // keep trying older keys
+      }
     }
     return null;
   } catch (e) {
@@ -151,7 +139,7 @@ async function getAllianceApiKeyFor(aid: number): Promise<string | null> {
   }
 }
 
-// ---------- GraphQL: bankWithdraw (Alliance→Alliance for offshore) ----------
+// ---------- GraphQL: bankWithdraw ----------
 async function bankWithdrawAllianceToAlliance(opts: {
   srcAllianceId: number;
   dstAllianceId: number;
@@ -325,7 +313,6 @@ export async function execute(i: ChatInputCommandInteraction) {
   }
 
   if (sub === "send") {
-    // OPEN MODAL IMMEDIATELY — no network calls before this point.
     return openSendModal(i, alliance.id, 0);
   }
 
@@ -344,7 +331,6 @@ async function openSendModal(i: Interaction, allianceId: number, page: number) {
     const keys = pageSlice(page);
     const total = pageCountAll();
 
-    // NOTE: no fetch/await here — keep it instant.
     const modal = new ModalBuilder()
       .setCustomId(`offsh:modal:${page}`)
       .setTitle(`📤 Offshore Send (${page + 1}/${total})`);
@@ -359,18 +345,14 @@ async function openSendModal(i: Interaction, allianceId: number, page: number) {
       modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
     }
 
-    // showModal is a valid response and satisfies the 3s window.
-    // @ts-ignore (discord.js types vary by interaction kind)
+    // @ts-ignore
     await i.showModal(modal);
 
     const sess = sendSessions.get((i as any).user.id) || { allianceId, data: {}, createdAt: Date.now() };
     sendSessions.set((i as any).user.id, sess);
   } catch (e) {
     console.error("[OFFSH_MODAL_OPEN_ERR]", e);
-    try {
-      // @ts-ignore
-      await i.reply({ content: "Couldn’t open the modal. Try again.", ephemeral: true });
-    } catch {}
+    try { /* @ts-ignore */ await i.reply({ content: "Couldn’t open the modal. Try again.", ephemeral: true }); } catch {}
   }
 }
 
@@ -549,7 +531,4 @@ export async function handleButton(i: Interaction) {
   }
 }
 
-// NOTE: routing
-// - /offshore slash command → execute()
-// - Buttons with customId starting "offsh:" → handleButton()
-// - Modals with customId starting "offsh:modal:" → handleModal()
+// NOTE: routing: /offshore (execute), buttons → handleButton, modals → handleModal
