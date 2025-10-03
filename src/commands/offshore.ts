@@ -1,198 +1,230 @@
 // src/commands/offshore.ts
 import {
-  SlashCommandBuilder,
-  ChatInputCommandInteraction,
-  PermissionFlagsBits,
-  EmbedBuilder,
-  Colors,
+  SlashCommandBuilder, ChatInputCommandInteraction, PermissionFlagsBits,
+  EmbedBuilder, Colors
 } from "discord.js";
 import { PrismaClient } from "@prisma/client";
+import { fetchBankrecs, RESOURCE_KEYS, asNum } from "../lib/pnw";
+import { getOffshoreAllianceFor, getGlobalDefaultOffshoreAid, setGlobalDefaultOffshoreAid } from "../lib/offshore";
+import { open } from "../lib/crypto";
 
 const prisma = new PrismaClient();
 
-// ---------- Bot-admins (for set_default) ----------
-function botAdminIds(): string[] {
-  const raw = process.env.BOT_ADMIN_IDS || "";
-  return raw
-    .split(/[,\s]+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
+// utils
+function fmt(n: number) {
+  return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
 }
-function isBotAdmin(discordId: string | null | undefined): boolean {
-  if (!discordId) return false;
-  return botAdminIds().includes(discordId);
-}
-
-// ---------- Helpers ----------
-async function getAllianceForGuild(i: ChatInputCommandInteraction) {
-  if (!i.guildId) return null;
-  return prisma.alliance.findFirst({ where: { guildId: i.guildId } });
+function resLines(obj: Record<string, number>) {
+  return RESOURCE_KEYS
+    .map(k => {
+      const v = Number(obj[k] || 0);
+      return v ? `• **${k}**: ${fmt(v)}` : null;
+    })
+    .filter(Boolean)
+    .join("\n") || "— none —";
 }
 
-async function getDefaultOffshore(): Promise<number | null> {
-  const row = await prisma.setting.findUnique({ where: { key: "offshore.default" } });
-  const v = (row?.value as any)?.allianceId ?? null;
-  return typeof v === "number" && v > 0 ? v : null;
-}
-
-async function setDefaultOffshore(aid: number | null) {
-  if (aid && aid > 0) {
-    await prisma.setting.upsert({
-      where: { key: "offshore.default" },
-      update: { value: { allianceId: aid } as any },
-      create: { key: "offshore.default", value: { allianceId: aid } as any },
-    });
-  } else {
-    // clear
-    await prisma.setting.delete({ where: { key: "offshore.default" } }).catch(() => {});
-  }
-}
-
-function fmtAid(aid: number | null | undefined): string {
-  return aid && aid > 0 ? `ID ${aid}` : "— none —";
-}
-
-function effectiveOffshore(defaultAid: number | null, overrideAid: number | null) {
-  return overrideAid && overrideAid > 0 ? overrideAid : defaultAid ?? null;
-}
-
-// ---------- Slash command builder ----------
 export const data = new SlashCommandBuilder()
   .setName("offshore")
-  .setDescription("Offshore controls (show, set default, set override, send)")
-  .addSubcommand((sc) =>
-    sc.setName("show").setDescription("Show effective offshore (override and default)")
-  )
-  .addSubcommand((sc) =>
-    sc
-      .setName("set_default")
-      .setDescription("Set global default offshore alliance id (0 to clear)")
-      .addIntegerOption((o) =>
-        o
-          .setName("alliance_id")
-          .setDescription("Alliance ID for global default (0 to clear)")
-          .setRequired(true)
-      )
-  )
-  .addSubcommand((sc) =>
-    sc
-      .setName("set_override")
-      .setDescription("Set per-alliance offshore override (0 to clear)")
-      .addIntegerOption((o) =>
-        o
-          .setName("alliance_id")
-          .setDescription("Alliance ID for override (0 to clear)")
-          .setRequired(true)
-      )
-  )
-  .addSubcommand((sc) =>
-    sc
-      .setName("send")
-      .setDescription("Send this alliance treasury to its effective offshore")
-  );
+  .setDescription("Offshore settings and tools")
+  .addSubcommand(sc => sc
+    .setName("show")
+    .setDescription("Show which offshore is in effect for this alliance"))
+  .addSubcommand(sc => sc
+    .setName("set_default")
+    .setDescription("BOT ADMIN: set the global default offshore alliance id")
+    .addIntegerOption(o => o.setName("aid").setDescription("Alliance ID").setRequired(true)))
+  .addSubcommand(sc => sc
+    .setName("set_override")
+    .setDescription("Set or clear this alliance’s offshore override")
+    .addIntegerOption(o => o.setName("aid").setDescription("Alliance ID (omit or 0 to clear)").setRequired(false)))
+  .addSubcommand(sc => sc
+    .setName("holdings")
+    .setDescription("Show your alliance’s net holdings in your offshore (live, deduped by bankrec id)"))
+  .addSubcommand(sc => sc
+    .setName("send")
+    .setDescription("Prepare an alliance-bank → offshore transfer (manual by default)")
+    .addStringOption(o => o
+      .setName("payload_json")
+      .setDescription('e.g. {"money":1000000,"steel":500}')
+      .setRequired(true)))
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
 
-// ---------- Execute ----------
 export async function execute(i: ChatInputCommandInteraction) {
-  try {
-    const sub = i.options.getSubcommand();
-    if (sub === "show") return handleShow(i);
-    if (sub === "set_default") return handleSetDefault(i);
-    if (sub === "set_override") return handleSetOverride(i);
-    if (sub === "send") return handleSend(i);
-    return i.reply({ content: "Unknown subcommand.", ephemeral: true });
-  } catch (err) {
-    console.error("[offshore] handler error:", err);
-    return i.reply({ content: "Something went wrong in /offshore. Check logs for details.", ephemeral: true });
-  }
-}
+  const sub = i.options.getSubcommand(true);
 
-// ---------- Subhandlers ----------
-async function handleShow(i: ChatInputCommandInteraction) {
-  const alliance = await getAllianceForGuild(i);
+  if (sub === "set_default") {
+    // bot-admin only
+    const adminId = process.env.BOT_ADMIN_DISCORD_ID?.trim();
+    if (!adminId || i.user.id !== adminId) {
+      return i.reply({ content: "only the bot admin can set the global default offshore", ephemeral: true });
+    }
+    const aid = i.options.getInteger("aid", true);
+    await setGlobalDefaultOffshoreAid(aid);
+    return i.reply({ content: `✅ Set global default offshore to alliance ${aid}.`, ephemeral: true });
+  }
+
+  // resolve calling alliance
+  const ag = await prisma.allianceGuild.findUnique({ where: { guildId: i.guildId! } });
+  const alliance = ag
+    ? await prisma.alliance.findUnique({ where: { id: ag.allianceId } })
+    : await prisma.alliance.findFirst({ where: { guildId: i.guildId ?? "" } });
+
   if (!alliance) {
-    return i.reply({ content: "This Discord server isn’t linked to an alliance. Use /guild_link_alliance first.", ephemeral: true });
+    return i.reply({ content: "This server is not linked to an alliance. Use /guild_link_alliance or /setup_alliance.", ephemeral: true });
   }
 
-  const def = await getDefaultOffshore();
-  const ov = alliance.offshoreOverrideAllianceId ?? null;
-  const eff = effectiveOffshore(def, ov);
+  if (sub === "show") {
+    const globalAid = await getGlobalDefaultOffshoreAid();
+    const eff = await getOffshoreAllianceFor(alliance.id);
+    const lines = [
+      `Alliance: **${alliance.name || alliance.id}** (id ${alliance.id})`,
+      `Per-alliance override: ${alliance.offshoreOverrideAllianceId ? `**${alliance.offshoreOverrideAllianceId}**` : "_none_"} `,
+      `Global default: ${globalAid ? `**${globalAid}**` : "_none set_"} `,
+      `Effective offshore: **${eff ?? "—"}**`,
+    ].join("\n");
+    return i.reply({ content: lines, ephemeral: true });
+  }
 
-  const embed = new EmbedBuilder()
-    .setTitle("🏝️ Offshore — Current Settings")
-    .addFields(
-      { name: "Alliance", value: `ID ${alliance.id}`, inline: true },
-      { name: "Default", value: def ? `ID ${def}` : "— not set —", inline: true },
-      { name: "Override", value: fmtAid(ov), inline: true },
-      { name: "Effective", value: fmtAid(eff), inline: false }
-    )
-    .setColor(Colors.Blurple);
+  if (sub === "set_override") {
+    const aid = i.options.getInteger("aid", false) ?? 0;
+    await prisma.alliance.update({
+      where: { id: alliance.id },
+      data: { offshoreOverrideAllianceId: aid || null },
+    });
+    return i.reply({ content: aid ? `✅ Offshore override set → ${aid}` : "✅ Offshore override cleared.", ephemeral: true });
+  }
 
-  await i.reply({ embeds: [embed], ephemeral: true });
+  if (sub === "holdings") {
+    // compute net deposits from source A to offshore O minus returns O->A
+    const offshoreAid = await getOffshoreAllianceFor(alliance.id);
+    if (!offshoreAid) {
+      return i.reply({ content: "No offshore set. Use /offshore set_override or ask the bot admin to set a global default.", ephemeral: true });
+    }
+
+    await i.deferReply({ ephemeral: true });
+
+    // Pull a big window and dedupe by id
+    const take = 400; // recent history
+    const rows = await fetchBankrecs(offshoreAid, { limit: take });
+
+    const net: Record<string, number> = {};
+    for (const k of RESOURCE_KEYS) net[k] = 0;
+
+    // count A -> O as positive; O -> A as negative
+    const A = String(alliance.id), O = String(offshoreAid);
+    const seen = new Set<string>();
+
+    for (const r of rows) {
+      if (seen.has(String(r.id))) continue;
+      seen.add(String(r.id));
+
+      const fromAtoO = r.sender_type === 2 && r.sender_id === A && r.receiver_type === 2 && r.receiver_id === O;
+      const fromOtoA = r.sender_type === 2 && r.sender_id === O && r.receiver_type === 2 && r.receiver_id === A;
+      if (!fromAtoO && !fromOtoA) continue;
+
+      const sign = fromAtoO ? +1 : -1;
+      for (const k of RESOURCE_KEYS) {
+        net[k] = (net[k] || 0) + sign * asNum((r as any)[k]);
+      }
+    }
+
+    const embed = new EmbedBuilder()
+      .setTitle("🏦 Offshore Holdings (derived from bankrecs)")
+      .setDescription(`Source **${alliance.name || alliance.id}** → Offshore **${offshoreAid}**\nWindow: last ${take} bankrecs on offshore.`)
+      .addFields({ name: "Net amounts", value: resLines(net) })
+      .setColor(Colors.Blurple);
+
+    return i.editReply({ embeds: [embed] });
+  }
+
+  if (sub === "send") {
+    // Prepare/send an alliance-bank → offshore transfer
+    const offshoreAid = await getOffshoreAllianceFor(alliance.id);
+    if (!offshoreAid) {
+      return i.reply({ content: "No offshore set. Use /offshore set_override or ask the bot admin to set a global default.", ephemeral: true });
+    }
+
+    // parse payload
+    let payload: Record<string, number>;
+    try {
+      payload = JSON.parse(i.options.getString("payload_json", true));
+      for (const [k, v] of Object.entries(payload)) {
+        if (!RESOURCE_KEYS.includes(k as any)) throw new Error(`bad key ${k}`);
+        if (!Number.isFinite(Number(v)) || Number(v) <= 0) throw new Error(`bad amount for ${k}`);
+      }
+    } catch (e: any) {
+      return i.reply({ content: `Invalid JSON: ${e?.message || e}`, ephemeral: true });
+    }
+
+    // choose mode
+    const tryAuto = process.env.AUTOOFFSHORE_ENABLED === "1";
+
+    if (tryAuto) {
+      // We need alliance API + bot key to move alliance bank
+      const krec = await prisma.allianceKey.findFirst({
+        where: { allianceId: alliance.id },
+        orderBy: { id: "desc" }
+      });
+      const apiKey = krec ? open(krec.encryptedApiKey as any, krec.nonceApi as any) : (process.env[`PNW_API_KEY_${alliance.id}`] || process.env.PNW_API_KEY || "");
+      const botKey = process.env.PNW_BOT_KEY || "";
+
+      if (!apiKey || !botKey) {
+        // fall back to manual
+        await i.reply({ content: "⚠️ No API/Bot key found for this alliance. Use the manual method below.", ephemeral: true });
+      } else {
+        // Attempt an auto bankWithdraw to the offshore **alliance** treasury (receiver_type=2)
+        const fields: string[] = Object.entries(payload)
+          .map(([k, v]) => `${k}:${Number(v)}`);
+
+        const note = `Gemstone Offsh • src ${alliance.id} -> off ${offshoreAid} • by ${i.user.id}`;
+        fields.push(`note:${JSON.stringify(note)}`);
+
+        const q = `mutation{
+          bankWithdraw(receiver:${offshoreAid}, receiver_type:2, ${fields.join(",")}) { id }
+        }`;
+
+        const url = "https://api.politicsandwar.com/graphql?api_key=" + encodeURIComponent(apiKey);
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Api-Key": apiKey, "X-Bot-Key": botKey },
+          body: JSON.stringify({ query: q })
+        }).catch(() => null);
+
+        const ok = !!res && res.ok;
+        const json = ok ? await res!.json().catch(() => ({} as any)) : null;
+        const success = ok && (json as any)?.data?.bankWithdraw;
+
+        if (success) {
+          return i.reply({
+            content: `✅ Sent to offshore **${offshoreAid}**.\nNote: \`${note}\`\nYou can verify with **/offshore holdings** in a couple minutes.`,
+            ephemeral: true
+          });
+        }
+
+        // fall through to manual if auto failed
+        await i.reply({ content: "⚠️ Auto-send failed. Use the manual instructions below.", ephemeral: true });
+      }
+    }
+
+    // Manual instructions: give them a note to paste, and exactly what to send
+    const note = `Gemstone Offsh • src ${alliance.id} -> off ${offshoreAid} • by ${i.user.id}`;
+    const list = RESOURCE_KEYS
+      .map(k => payload[k] ? `• ${k}: ${fmt(Number(payload[k]))}` : null)
+      .filter(Boolean)
+      .join("\n") || "— none —";
+
+    const embed = new EmbedBuilder()
+      .setTitle("📤 Manual offshore transfer")
+      .setDescription(`Use your alliance banker UI to send to **Alliance ${offshoreAid}** (receiver type **Alliance**). Paste the note below.`)
+      .addFields(
+        { name: "Send these amounts", value: list },
+        { name: "Note", value: "```" + note + "```" }
+      )
+      .setColor(Colors.Gold);
+
+    return i.reply({ embeds: [embed], ephemeral: true });
+  }
+
+  return i.reply({ content: "Unknown subcommand.", ephemeral: true });
 }
-
-async function handleSetDefault(i: ChatInputCommandInteraction) {
-  if (!isBotAdmin(i.user?.id)) {
-    return i.reply({ content: "Only the **bot admin** can set the global default offshore.", ephemeral: true });
-  }
-  const aid = i.options.getInteger("alliance_id", true);
-  await setDefaultOffshore(aid && aid > 0 ? aid : null);
-  if (aid && aid > 0) {
-    await i.reply({ content: `✅ Set global default offshore to alliance **${aid}**.`, ephemeral: true });
-  } else {
-    await i.reply({ content: "✅ Cleared global default offshore.", ephemeral: true });
-  }
-}
-
-async function handleSetOverride(i: ChatInputCommandInteraction) {
-  const alliance = await getAllianceForGuild(i);
-  if (!alliance) {
-    return i.reply({ content: "This Discord server isn’t linked to an alliance. Use /guild_link_alliance first.", ephemeral: true });
-  }
-  if (!i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
-    return i.reply({ content: "You need **Manage Server** to set or clear the override.", ephemeral: true });
-  }
-
-  const aid = i.options.getInteger("alliance_id", true);
-  await prisma.alliance.update({
-    where: { id: alliance.id },
-    data: { offshoreOverrideAllianceId: aid && aid > 0 ? aid : null },
-  });
-
-  if (aid && aid > 0) {
-    await i.reply({ content: `✅ Set offshore override for alliance **${alliance.id}** → **${aid}**.`, ephemeral: true });
-  } else {
-    await i.reply({ content: `✅ Cleared offshore override for alliance **${alliance.id}**.`, ephemeral: true });
-  }
-}
-
-async function handleSend(i: ChatInputCommandInteraction) {
-  const alliance = await getAllianceForGuild(i);
-  if (!alliance) {
-    return i.reply({ content: "This Discord server isn’t linked to an alliance. Use /guild_link_alliance first.", ephemeral: true });
-  }
-  if (!i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
-    return i.reply({ content: "You need **Manage Server** to send treasury to offshore.", ephemeral: true });
-  }
-
-  const def = await getDefaultOffshore();
-  const ov = alliance.offshoreOverrideAllianceId ?? null;
-  const eff = effectiveOffshore(def, ov);
-  if (!eff) {
-    return i.reply({ content: "No effective offshore is set (neither default nor override).", ephemeral: true });
-  }
-
-  // TODO: integrate the actual transfer logic (PnW API bulk withdrawal to target alliance).
-  // For now, just acknowledge the target.
-  const embed = new EmbedBuilder()
-    .setTitle("⏩ Offshore Send (Preview)")
-    .setDescription(
-      `Would send alliance **${alliance.id}** treasury to offshore alliance **${eff}**.\n` +
-      `• Default: ${def ? `ID ${def}` : "— not set —"}\n` +
-      `• Override: ${fmtAid(ov)}\n` +
-      `• Effective: ${fmtAid(eff)}`
-    )
-    .setColor(Colors.Gold);
-
-  await i.reply({ embeds: [embed], ephemeral: true });
-}
-
