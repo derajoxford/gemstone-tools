@@ -3,7 +3,8 @@
 // Offshore controller: show / set default / set override / holdings / send (modal).
 // - Key selection: tries AllianceKey newest→oldest, validates per-alliance.
 // - Button + modal flow uses customIds "offsh:*".
-// - Modal shows best-effort "available" from recent AA bankrecs (PnW doesn’t expose live bank totals).
+// - Modal opens IMMEDIATELY (no prefetch) to avoid Discord 3s timeout.
+// - Holdings/estimates still use recent AA bankrecs.
 // - All network errors are logged with OFFSH_* markers for quick grepping.
 //
 // Requirements:
@@ -31,24 +32,10 @@ import { getDefaultOffshore, setDefaultOffshore } from "../lib/offshore";
 import { open } from "../lib/crypto";
 
 const prisma = new PrismaClient();
-
-// --- Constants / helpers ---
 const GQL_URL = process.env.PNW_GRAPHQL_URL || "https://api.politicsandwar.com/graphql";
 
-// PnW GraphQL accepts ONLY these resource fields for bankWithdraw.
 const ALLOWED_WITHDRAW_KEYS = [
-  "money",
-  "food",
-  "coal",
-  "oil",
-  "uranium",
-  "lead",
-  "iron",
-  "bauxite",
-  "gasoline",
-  "munitions",
-  "steel",
-  "aluminum",
+  "money","food","coal","oil","uranium","lead","iron","bauxite","gasoline","munitions","steel","aluminum",
 ] as const;
 type AllowedKey = (typeof ALLOWED_WITHDRAW_KEYS)[number];
 
@@ -61,13 +48,8 @@ function parseNum(s: string): number {
   const n = Number(cleaned);
   return Number.isFinite(n) && n >= 0 ? n : NaN;
 }
-function nowIso() {
-  return new Date().toISOString();
-}
-
-function round2(n: number) {
-  return Math.round(n * 100) / 100;
-}
+function nowIso() { return new Date().toISOString(); }
+function round2(n: number) { return Math.round(n * 100) / 100; }
 
 function pickAllowedPositive(payload: Record<string, number>) {
   const out: Record<AllowedKey, number> = {} as any;
@@ -77,17 +59,11 @@ function pickAllowedPositive(payload: Record<string, number>) {
   }
   return out as Record<string, number>;
 }
-
 function firstGqlError(e: any): string | null {
   try {
-    if (Array.isArray(e?.errors) && e.errors.length) {
-      const msg = e.errors[0]?.message ?? null;
-      return msg ? String(msg) : null;
-    }
+    if (Array.isArray(e?.errors) && e.errors.length) return String(e.errors[0]?.message ?? "");
     return null;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
 // ---------- effective offshore (global default + per-alliance override) ----------
@@ -98,7 +74,7 @@ async function resolveOffshoreAid(allianceId: number): Promise<{ global: number 
   return { global, override, effective: override ?? global ?? null };
 }
 
-// ---------- fast-estimate: AA "available" from recent bankrecs ----------
+// ---------- fast-estimate: AA "available" from recent bankrecs (used only in holdings paths) ----------
 async function estimateAllianceAvailableFromRecent(aid: number, limit = 100) {
   try {
     const rows = await fetchBankrecs(aid, { limit });
@@ -111,7 +87,7 @@ async function estimateAllianceAvailableFromRecent(aid: number, limit = 100) {
       const sId = String((r as any).sender_id || "");
       const rId = String((r as any).receiver_id || "");
       const isOut = (sType === 2 || sType === 3) && sId === String(aid);
-      const isIn = (rType === 2 || rType === 3) && rId === String(aid);
+      const isIn  = (rType === 2 || rType === 3) && rId === String(aid);
       for (const k of RESOURCE_KEYS) {
         const v = Number((r as any)[k] || 0);
         if (!Number.isFinite(v) || v === 0) continue;
@@ -129,8 +105,6 @@ async function estimateAllianceAvailableFromRecent(aid: number, limit = 100) {
 }
 
 // ---------- key selection & validation ----------
-
-// Quick validation that this key can read alliance + bankrecs for the given AID.
 async function validateApiKeyForAlliance(apiKey: string, aid: number): Promise<boolean> {
   try {
     const body = {
@@ -139,7 +113,6 @@ async function validateApiKeyForAlliance(apiKey: string, aid: number): Promise<b
         bankrecs(first:1, alliance_id:${aid}){ data{ id } }
       }`,
     };
-
     const resp = await fetch(GQL_URL, {
       method: "POST",
       headers: { "content-type": "application/json", "X-Api-Key": apiKey },
@@ -150,31 +123,26 @@ async function validateApiKeyForAlliance(apiKey: string, aid: number): Promise<b
       console.warn("OFFSH_KEY_VALIDATE_ERR", resp.status, JSON.stringify(json));
       return false;
     }
-    const ok = Boolean(json?.data?.alliances?.data?.length);
-    return ok;
+    return Boolean(json?.data?.alliances?.data?.length);
   } catch (e) {
     console.warn("OFFSH_KEY_VALIDATE_EXC", e);
     return false;
   }
 }
 
-// Try newest→oldest AllianceKey; return first valid apiKey (decrypted).
 async function getAllianceApiKeyFor(aid: number): Promise<string | null> {
   try {
     const alliance = await prisma.alliance.findUnique({
       where: { id: aid },
       include: { keys: { orderBy: { id: "desc" } } },
     });
-
     const keys = alliance?.keys || [];
     for (const k of keys) {
       try {
         const apiKey = open(k.encryptedApiKey as any, k.nonceApi as any);
         const ok = await validateApiKeyForAlliance(apiKey, aid);
         if (ok) return apiKey;
-      } catch {
-        // ignore decryption errors and keep trying older keys
-      }
+      } catch { /* keep trying */ }
     }
     return null;
   } catch (e) {
@@ -187,7 +155,7 @@ async function getAllianceApiKeyFor(aid: number): Promise<string | null> {
 async function bankWithdrawAllianceToAlliance(opts: {
   srcAllianceId: number;
   dstAllianceId: number;
-  payload: Record<string, number>; // resources with positive amounts
+  payload: Record<string, number>;
   apiKey: string;
   botKey: string;
   note?: string;
@@ -216,20 +184,11 @@ async function bankWithdrawAllianceToAlliance(opts: {
       body: JSON.stringify({ query: q }),
     });
     const data: any = await resp.json().catch(() => ({} as any));
-
     if (!resp.ok || data?.errors) {
       const errMsg = firstGqlError(data) || `HTTP ${resp.status}`;
-      console.error(
-        "OFFSH_SEND_ERR",
-        resp.status,
-        errMsg,
-        JSON.stringify({
-          dst: opts.dstAllianceId,
-          src: opts.srcAllianceId,
-          fields: clean,
-          hasBotKey: Boolean(opts.botKey),
-        })
-      );
+      console.error("OFFSH_SEND_ERR", resp.status, errMsg, JSON.stringify({
+        dst: opts.dstAllianceId, src: opts.srcAllianceId, fields: clean, hasBotKey: Boolean(opts.botKey),
+      }));
       return { ok: false, err: errMsg };
     }
     const ok = Boolean(data?.data?.bankWithdraw?.id);
@@ -244,56 +203,25 @@ async function bankWithdrawAllianceToAlliance(opts: {
 export const data = new SlashCommandBuilder()
   .setName("offshore")
   .setDescription("Offshore banking controls")
+  .addSubcommand((sc) => sc.setName("show").setDescription("Show the effective offshore configuration and controls"))
   .addSubcommand((sc) =>
-    sc
-      .setName("show")
-      .setDescription("Show the effective offshore configuration and controls"),
+    sc.setName("set_default").setDescription("BOT ADMIN: set the global default offshore alliance id")
+      .addIntegerOption((o) => o.setName("alliance_id").setDescription("Alliance ID for global default (blank to clear)").setRequired(false)),
   )
   .addSubcommand((sc) =>
-    sc
-      .setName("set_default")
-      .setDescription("BOT ADMIN: set the global default offshore alliance id")
-      .addIntegerOption((o) =>
-        o
-          .setName("alliance_id")
-          .setDescription("Alliance ID for global default (blank to clear)")
-          .setRequired(false),
-      ),
+    sc.setName("set_override").setDescription("Set or clear this alliance’s offshore override")
+      .addIntegerOption((o) => o.setName("alliance_id").setDescription("Alliance ID for override (blank to clear)").setRequired(false)),
   )
-  .addSubcommand((sc) =>
-    sc
-      .setName("set_override")
-      .setDescription("Set or clear this alliance’s offshore override")
-      .addIntegerOption((o) =>
-        o
-          .setName("alliance_id")
-          .setDescription("Alliance ID for override (blank to clear)")
-          .setRequired(false),
-      ),
-  )
-  .addSubcommand((sc) =>
-    sc
-      .setName("holdings")
-      .setDescription("Show your alliance’s net holdings in your offshore (recent window, deduped)"),
-  )
-  .addSubcommand((sc) =>
-    sc
-      .setName("send")
-      .setDescription("Send from your alliance bank to the configured offshore (guided modal)"),
-  );
+  .addSubcommand((sc) => sc.setName("holdings").setDescription("Show your alliance’s net holdings in your offshore (recent window, deduped)"))
+  .addSubcommand((sc) => sc.setName("send").setDescription("Send from your alliance bank to the configured offshore (guided modal)"));
 
 // ---------- Slash Command: execute ----------
 export async function execute(i: ChatInputCommandInteraction) {
   const sub = i.options.getSubcommand(true);
-  // Resolve alliance by guild mapping (new table first, legacy fallback)
   const map = i.guildId ? await prisma.allianceGuild.findUnique({ where: { guildId: i.guildId } }) : null;
   const legacy = i.guildId ? await prisma.alliance.findFirst({ where: { guildId: i.guildId } }) : null;
-  const alliance = map
-    ? await prisma.alliance.findUnique({ where: { id: map.allianceId } })
-    : legacy;
-  if (!alliance) {
-    return i.reply({ content: "This server is not linked yet. Run /setup_alliance first.", ephemeral: true });
-  }
+  const alliance = map ? await prisma.alliance.findUnique({ where: { id: map.allianceId } }) : legacy;
+  if (!alliance) return i.reply({ content: "This server is not linked yet. Run /setup_alliance first.", ephemeral: true });
 
   if (sub === "show") {
     await i.deferReply({ ephemeral: true });
@@ -335,10 +263,7 @@ export async function execute(i: ChatInputCommandInteraction) {
     }
     const raw = i.options.getInteger("alliance_id", false);
     const aid = raw && raw > 0 ? raw : null;
-    await prisma.alliance.update({
-      where: { id: alliance.id },
-      data: { offshoreOverrideAllianceId: aid },
-    });
+    await prisma.alliance.update({ where: { id: alliance.id }, data: { offshoreOverrideAllianceId: aid } });
     return i.reply({ content: `✅ Override set → **${aid ?? "—"}**.`, ephemeral: true });
   }
 
@@ -347,12 +272,9 @@ export async function execute(i: ChatInputCommandInteraction) {
 
     const { effective: offshoreAid } = await resolveOffshoreAid(alliance.id);
     if (!offshoreAid) {
-      return i.editReply({
-        content: "No offshore set. Use **/offshore set_override** or ask the bot admin to set a global default.",
-      });
+      return i.editReply({ content: "No offshore set. Use **/offshore set_override** or ask the bot admin to set a global default." });
     }
 
-    // Strategy: look at the offshore’s last N bankrecs and net what belongs to this alliance pair.
     const take = 300;
     try {
       const rows = await fetchBankrecs(offshoreAid, { limit: take });
@@ -379,10 +301,7 @@ export async function execute(i: ChatInputCommandInteraction) {
       }
 
       const lines = RESOURCE_KEYS
-        .map((k) => {
-          const v = net[k];
-          return v ? `• **${k}**: ${fmt(v)}` : null;
-        })
+        .map((k) => (net[k] ? `• **${k}**: ${fmt(net[k])}` : null))
         .filter(Boolean)
         .join("\n") || "— none in window —";
 
@@ -406,66 +325,44 @@ export async function execute(i: ChatInputCommandInteraction) {
   }
 
   if (sub === "send") {
-    // Show the first page of the modal immediately (no defer).
+    // OPEN MODAL IMMEDIATELY — no network calls before this point.
     return openSendModal(i, alliance.id, 0);
   }
 
-  // Fallback
   return i.reply({ content: "Unknown offshore subcommand.", ephemeral: true });
 }
 
 // ---------- Send: Paged modal flow ----------
 const PAGE_SIZE = 5;
-function pageCountAll() {
-  return Math.ceil(RESOURCE_KEYS.length / PAGE_SIZE);
-}
-function pageSlice(page: number) {
-  const s = page * PAGE_SIZE;
-  return RESOURCE_KEYS.slice(s, s + PAGE_SIZE);
-}
+function pageCountAll() { return Math.ceil(RESOURCE_KEYS.length / PAGE_SIZE); }
+function pageSlice(page: number) { const s = page * PAGE_SIZE; return RESOURCE_KEYS.slice(s, s + PAGE_SIZE); }
 
-// Keep per-user session across modal pages
-const sendSessions: Map<
-  string,
-  { allianceId: number; data: Record<string, number>; createdAt: number }
-> = new Map();
+const sendSessions: Map<string, { allianceId: number; data: Record<string, number>; createdAt: number }> = new Map();
 
 async function openSendModal(i: Interaction, allianceId: number, page: number) {
   try {
-    // Compute *fast* availability estimate to use as placeholders.
-    const approxAvail = await estimateAllianceAvailableFromRecent(allianceId, 100);
-
     const keys = pageSlice(page);
     const total = pageCountAll();
+
+    // NOTE: no fetch/await here — keep it instant.
     const modal = new ModalBuilder()
       .setCustomId(`offsh:modal:${page}`)
       .setTitle(`📤 Offshore Send (${page + 1}/${total})`);
 
     for (const k of keys) {
-      const avail = Number(approxAvail[k] || 0);
       const input = new TextInputBuilder()
         .setCustomId(k)
-        .setLabel(`${k} (≈ avail: ${fmt(avail)})`)
+        .setLabel(`${k} (enter amount)`)
         .setStyle(TextInputStyle.Short)
         .setRequired(false)
         .setPlaceholder("0");
       modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
     }
 
-    // If this was a button, call showModal on the button interaction.
-    if (i.isButton()) {
-      await i.showModal(modal);
-    } else if ("showModal" in i) {
-      // From the slash command → show modal via command interaction (discord.js types nuance)
-      // @ts-ignore
-      await i.showModal(modal);
-    } else {
-      // Fallback
-      // @ts-ignore
-      await i.showModal(modal);
-    }
+    // showModal is a valid response and satisfies the 3s window.
+    // @ts-ignore (discord.js types vary by interaction kind)
+    await i.showModal(modal);
 
-    // Initialize session if not present
     const sess = sendSessions.get((i as any).user.id) || { allianceId, data: {}, createdAt: Date.now() };
     sendSessions.set((i as any).user.id, sess);
   } catch (e) {
@@ -488,22 +385,15 @@ export async function handleModal(i: Interaction) {
 
     const map = (i as any).guildId ? await prisma.allianceGuild.findUnique({ where: { guildId: (i as any).guildId } }) : null;
     const legacy = (i as any).guildId ? await prisma.alliance.findFirst({ where: { guildId: (i as any).guildId } }) : null;
-    const alliance = map
-      ? await prisma.alliance.findUnique({ where: { id: map.allianceId } })
-      : legacy;
-    if (!alliance) {
-      return (i as any).reply({ content: "This server is not linked yet. Run /setup_alliance first.", ephemeral: true });
-    }
+    const alliance = map ? await prisma.alliance.findUnique({ where: { id: map.allianceId } }) : legacy;
+    if (!alliance) return (i as any).reply({ content: "This server is not linked yet. Run /setup_alliance first.", ephemeral: true });
 
     const sess = sendSessions.get((i as any).user.id) || { allianceId: alliance.id, data: {}, createdAt: Date.now() };
 
     const keys = pageSlice(page);
     for (const k of keys) {
       const raw = ((i as any).fields.getTextInputValue(k) || "").trim();
-      if (!raw) {
-        delete sess.data[k];
-        continue;
-      }
+      if (!raw) { delete sess.data[k]; continue; }
       const num = parseNum(raw);
       if (!Number.isFinite(num) || num < 0) {
         return (i as any).reply({ content: `Invalid number for ${k}.`, ephemeral: true });
@@ -513,12 +403,9 @@ export async function handleModal(i: Interaction) {
     }
     sendSessions.set((i as any).user.id, sess);
 
-    // After modal submit, show paging controls as an ephemeral reply.
     const total = pageCountAll();
     const parts: string[] = [];
-    for (const [k, v] of Object.entries(sess.data)) {
-      if (Number(v) > 0) parts.push(`• **${k}**: ${fmt(Number(v))}`);
-    }
+    for (const [k, v] of Object.entries(sess.data)) if (Number(v) > 0) parts.push(`• **${k}**: ${fmt(Number(v))}`);
     const summary = parts.join("\n") || "— none yet —";
 
     const btns: ButtonBuilder[] = [];
@@ -537,24 +424,18 @@ export async function handleModal(i: Interaction) {
 export async function handleButton(i: Interaction) {
   if (!("isButton" in i) || !(i as any).isButton()) return;
 
-  // Paging open
   if ((i as any).customId?.startsWith?.("offsh:open:")) {
     const m = (i as any).customId.match(/^offsh:open:(\d+)$/);
     const page = m ? Math.max(0, parseInt(m[1]!, 10)) : 0;
 
     const map = (i as any).guildId ? await prisma.allianceGuild.findUnique({ where: { guildId: (i as any).guildId } }) : null;
     const legacy = (i as any).guildId ? await prisma.alliance.findFirst({ where: { guildId: (i as any).guildId } }) : null;
-    const alliance = map
-      ? await prisma.alliance.findUnique({ where: { id: map.allianceId } })
-      : legacy;
-    if (!alliance) {
-      return (i as any).reply({ content: "This server is not linked yet. Run /setup_alliance first.", ephemeral: true });
-    }
+    const alliance = map ? await prisma.alliance.findUnique({ where: { id: map.allianceId } }) : legacy;
+    if (!alliance) return (i as any).reply({ content: "This server is not linked yet. Run /setup_alliance first.", ephemeral: true });
 
     return openSendModal(i, alliance.id, page);
   }
 
-  // Finalize send
   if ((i as any).customId === "offsh:done") {
     const sess = sendSessions.get((i as any).user.id);
     if (!sess || !Object.keys(sess.data).length) {
@@ -574,7 +455,6 @@ export async function handleButton(i: Interaction) {
       return (i as any).reply({ content: "Bot is missing PNW_BOT_KEY on the host. Ask the admin.", ephemeral: true });
     }
 
-    // Pick a working alliance api key (newest→oldest)
     const apiKey = await getAllianceApiKeyFor(alliance.id);
     if (!apiKey) {
       return (i as any).reply({
@@ -583,16 +463,10 @@ export async function handleButton(i: Interaction) {
       });
     }
 
-    // Attempt send
     try {
       const note = `Gemstone Offsh • src ${alliance.id} -> off ${offshoreAid} • by ${(i as any).user.id}`;
       const res = await bankWithdrawAllianceToAlliance({
-        srcAllianceId: alliance.id,
-        dstAllianceId: offshoreAid,
-        payload: sess.data,
-        apiKey,
-        botKey,
-        note,
+        srcAllianceId: alliance.id, dstAllianceId: offshoreAid, payload: sess.data, apiKey, botKey, note,
       });
 
       if (res.ok) {
@@ -602,21 +476,12 @@ export async function handleButton(i: Interaction) {
           ephemeral: true,
         });
       } else {
-        const lines = Object.entries(pickAllowedPositive(sess.data))
-          .map(([k, v]) => `• ${k}: ${fmt(Number(v))}`)
-          .join("\n");
-
+        const lines = Object.entries(pickAllowedPositive(sess.data)).map(([k, v]) => `• ${k}: ${fmt(Number(v))}`).join("\n");
         const errBlurb = res.err ? `\n\n⚠️ **API said:** ${res.err}` : "";
-
         const embed = new EmbedBuilder()
           .setTitle("📤 Manual offshore transfer")
-          .setDescription(
-            `Use your **Alliance → Alliance** banker UI to send to **Alliance ${offshoreAid}**.\nPaste the note below.${errBlurb}`,
-          )
-          .addFields(
-            { name: "Amounts", value: lines || "—" },
-            { name: "Note", value: `\`${note}\`` },
-          )
+          .setDescription(`Use your **Alliance → Alliance** banker UI to send to **Alliance ${offshoreAid}**.\nPaste the note below.${errBlurb}`)
+          .addFields({ name: "Amounts", value: lines || "—" }, { name: "Note", value: `\`${note}\`` })
           .setColor(Colors.Yellow);
 
         sendSessions.delete((i as any).user.id);
@@ -628,24 +493,17 @@ export async function handleButton(i: Interaction) {
     }
   }
 
-  // Show holdings button
   if ((i as any).customId === "offsh:check") {
     await (i as any).deferReply({ ephemeral: true });
 
     const map = (i as any).guildId ? await prisma.allianceGuild.findUnique({ where: { guildId: (i as any).guildId } }) : null;
     const legacy = (i as any).guildId ? await prisma.alliance.findFirst({ where: { guildId: (i as any).guildId } }) : null;
-    const alliance = map
-      ? await prisma.alliance.findUnique({ where: { id: map.allianceId } })
-      : legacy;
-    if (!alliance) {
-      return (i as any).editReply({ content: "This server is not linked yet. Run /setup_alliance first." });
-    }
+    const alliance = map ? await prisma.alliance.findUnique({ where: { id: map.allianceId } }) : legacy;
+    if (!alliance) return (i as any).editReply({ content: "This server is not linked yet. Run /setup_alliance first." });
 
     const { effective: offshoreAid } = await resolveOffshoreAid(alliance.id);
     if (!offshoreAid) {
-      return (i as any).editReply({
-        content: "No offshore set. Use **/offshore set_override** or ask the bot admin to set a global default.",
-      });
+      return (i as any).editReply({ content: "No offshore set. Use **/offshore set_override** or ask the bot admin to set a global default." });
     }
 
     const take = 300;
@@ -673,13 +531,7 @@ export async function handleButton(i: Interaction) {
         }
       }
 
-      const lines = RESOURCE_KEYS
-        .map((k) => {
-          const v = net[k];
-          return v ? `• **${k}**: ${fmt(v)}` : null;
-        })
-        .filter(Boolean)
-        .join("\n") || "— none in window —";
+      const lines = RESOURCE_KEYS.map((k) => (net[k] ? `• **${k}**: ${fmt(net[k])}` : null)).filter(Boolean).join("\n") || "— none in window —";
 
       const embed = new EmbedBuilder()
         .setTitle("📊 Offshore Holdings (net)")
