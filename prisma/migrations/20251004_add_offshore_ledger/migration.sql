@@ -22,3 +22,7 @@ CREATE TABLE IF NOT EXISTS "OffshoreLedger" (
 -- Composite unique so we can upsert/find on (allianceId, offshoreId)
 CREATE UNIQUE INDEX IF NOT EXISTS "OffshoreLedger_allianceId_offshoreId_key"
   ON "OffshoreLedger" ("allianceId","offshoreId");
+
+-- speeds scanning new records for a given offshore alliance
+CREATE INDEX IF NOT EXISTS idx_alliance_bankrec_aid_id
+ON alliance_bankrec (alliance_id_derived, id);
