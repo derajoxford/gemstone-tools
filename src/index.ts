@@ -11,15 +11,12 @@ import {
 import pino from 'pino';
 // @ts-ignore - types may not be installed; not needed for runtime
 import cron from 'node-cron';
-import { PrismaClient, Prisma } from '@prisma/client';
+import { PrismaClient } from '@prisma/client';
 import { seal, open } from './lib/crypto.js';
 import { RES_EMOJI, ORDER } from './lib/emojis.js';
 import { extraCommandsJSON, findCommandByName } from './commands/registry';
 import { startAutoApply } from "./jobs/pnw_auto_apply";
-import * as Offshore from "./commands/offshore"; // <-- offshore module
-
-// (Removed runtime const using Prisma.$Enums to avoid crashes on some envs)
-// type WithdrawStatusT = Prisma.WithdrawStatus;
+import * as Offshore from "./commands/offshore.js"; // ensure .js for ESM runtime
 
 import * as Who from "./commands/who";
 import * as Send from "./commands/send";
@@ -197,8 +194,9 @@ client.on('interactionCreate', async (i: Interaction) => {
 
     } else if (i.isModalSubmit()) {
 
-      // ---- OFFSHORE modal routing (must be first in modal section)
-      if (i.customId.startsWith('offsh:')) {
+      // ---- OFFSHORE modal routing (support both old/new IDs)
+      if (i.customId.startsWith('offsh:') || i.customId.startsWith('offsh_')) {
+        console.log('[OFFSH_MODAL]', i.customId);
         try {
           if ((Offshore as any)?.handleModal) return (Offshore as any).handleModal(i as any);
         } catch (err) {
@@ -210,8 +208,9 @@ client.on('interactionCreate', async (i: Interaction) => {
 
       // ✅ NEW: /send multi-page modal handling
       if (i.customId.startsWith('send:modal:')) {
+        console.log('[SEND_MODAL]', i.customId);
         try {
-          const mod = await import('./commands/send');
+          const mod = await import('./commands/send.js');
           if ((mod as any)?.handleModal) return (mod as any).handleModal(i as any);
         } catch (err) {
           console.error('send modal error', err);
@@ -226,8 +225,9 @@ client.on('interactionCreate', async (i: Interaction) => {
 
     } else if (i.isButton()) {
 
-      // ---- OFFSHORE button routing (must be first in button section)
-      if (i.customId.startsWith('offsh:')) {
+      // ---- OFFSHORE button routing (support both old/new IDs)
+      if (i.customId.startsWith('offsh:') || i.customId.startsWith('offsh_')) {
+        console.log('[OFFSH_BTN]', i.customId);
         try {
           if ((Offshore as any)?.handleButton) return (Offshore as any).handleButton(i as any);
         } catch (err) {
@@ -238,8 +238,9 @@ client.on('interactionCreate', async (i: Interaction) => {
       }
 
       if (i.customId.startsWith('send:req:approve:') || i.customId.startsWith('send:req:deny:')) {
+        console.log('[SEND_APPROVAL_BTN]', i.customId);
         try {
-          const mod = await import('./commands/send');
+          const mod = await import('./commands/send.js');
           if ((mod as any)?.handleApprovalButton) return (mod as any).handleApprovalButton(i as any);
         } catch (err) {
           console.error('send approval button error', err);
@@ -255,8 +256,9 @@ client.on('interactionCreate', async (i: Interaction) => {
         i.customId === 'send:confirm' ||
         i.customId === 'send:cancel'
       ) {
+        console.log('[SEND_BTN]', i.customId);
         try {
-          const mod = await import('./commands/send');
+          const mod = await import('./commands/send.js');
           if ((mod as any)?.handleButton) return (mod as any).handleButton(i as any);
         } catch (err) {
           console.error('send button error', err);
@@ -559,8 +561,8 @@ async function handleWithdrawList(i: ChatInputCommandInteraction) {
   const alliance = await findAllianceForGuild(i.guildId ?? undefined);
   if (!alliance) return i.reply({ content: 'No alliance linked here.', ephemeral: true });
 
-  const statusStr = i.options.getString('status') as Prisma.WithdrawStatus | null;
-  const status = statusStr ?? 'PENDING';
+  const statusStr = i.options.getString('status') as WithdrawStatusT | null;
+  const status = (statusStr ?? 'PENDING') as WithdrawStatusT;
 
   const rows = await prisma.withdrawalRequest.findMany({
     where: { allianceId: alliance.id, status },
@@ -596,7 +598,7 @@ async function handleWithdrawSet(i: ChatInputCommandInteraction) {
   if (!alliance) return i.reply({ content: 'No alliance linked here.', ephemeral: true });
 
   const id = i.options.getString('id', true);
-  const status = i.options.getString('status', true) as Prisma.WithdrawStatus;
+  const status = i.options.getString('status', true) as WithdrawStatusT;
 
   try {
     const updated = await prisma.withdrawalRequest.update({
@@ -628,7 +630,7 @@ async function handleApprovalButton(i: ButtonInteraction) {
     }
   const [prefix, action, id] = i.customId.split(':');
   if (prefix !== 'w' || !id) return;
-  const status: Prisma.WithdrawStatus = action === 'approve' ? 'APPROVED' : 'REJECTED';
+  const status: WithdrawStatusT = action === 'approve' ? 'APPROVED' : 'REJECTED';
   const req = await prisma.withdrawalRequest.findUnique({ where: { id } });
   if (!req) return i.reply({ content: 'Request not found.', ephemeral: true });
   if (req.status !== 'PENDING') return i.reply({ content: `Already ${req.status}.`, ephemeral: true });
