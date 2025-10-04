@@ -1,4 +1,6 @@
 // src/index.ts
+// Local union so we do not depend on Prisma's exported enum typing
+type WithdrawStatusT = 'PENDING' | 'APPROVED' | 'REJECTED' | 'PAID' | 'CANCELED';
 import 'dotenv/config';
 import {
   Client, GatewayIntentBits, Partials, REST, Routes, SlashCommandBuilder,
