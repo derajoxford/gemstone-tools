@@ -44,9 +44,6 @@ import { RESOURCE_KEYS, fetchBankrecs } from "../lib/pnw";
 import { getDefaultOffshore, setDefaultOffshore } from "../lib/offshore";
 import { open } from "../lib/crypto";
 
-// ⬇️ LEDGER HELPERS (added)
-import { catchUpLedgerForPair, readHeldBalances } from "../lib/offshore_ledger";
-
 // pricing (same as /market_value)
 import {
   fetchAveragePrices,
@@ -202,10 +199,25 @@ async function getAveragePricesCached(): Promise<{ prices: PriceMap; source: str
   if (priceCache && (now - priceCache.at < PRICE_CACHE_MS)) {
     return { prices: priceCache.prices, source: priceCache.source, asOf: priceCache.asOf };
   }
+
   const pricing = await fetchAveragePrices();
   if (!pricing) return null;
-  priceCache = { at: now, prices: pricing.prices, source: pricing.source, asOf: pricing.asOf };
-  return { prices: pricing.prices, source: pricing.source, asOf: pricing.asOf };
+
+  // Normalize asOf → number (ms epoch)
+  const asOfNum =
+    typeof (pricing as any).asOf === "number"
+      ? (pricing as any).asOf
+      : ((): number => {
+          const v = (pricing as any).asOf;
+          const parsed = typeof v === "string" ? Date.parse(v) : NaN;
+          if (Number.isFinite(parsed)) return parsed;
+          const n = Number(v);
+          if (Number.isFinite(n)) return n;
+          return now;
+        })();
+
+  priceCache = { at: now, prices: pricing.prices, source: pricing.source, asOf: asOfNum };
+  return { prices: pricing.prices, source: pricing.source, asOf: asOfNum };
 }
 
 const E: Record<Resource, string> = {
@@ -305,15 +317,24 @@ function pairFieldsPretty(qtys: Partial<Record<Resource, number>>, prices: Price
 async function tryLedgerNet(aid: number, offshoreAid: number): Promise<Record<string, number> | null> {
   if (!USE_LEDGER) return null;
   try {
-    // Advance cursor to include any new bot-tagged movements then read held balances
-    await catchUpLedgerForPair(prisma, aid, offshoreAid);
-    const held = await readHeldBalances(prisma, aid, offshoreAid);
-    // Convert ledger row → plain net map that matches RESOURCE_KEYS
+    // Dynamic import to avoid hard type coupling.
+    const mod: any = await import("../lib/offshore_ledger");
+    const catchUp = mod?.catchUpLedgerForPair || mod?.["catchUpLedgerForPair"];
+    const readHeldBalances = mod?.readHeldBalances || mod?.["readHeldBalances"];
+    if (!catchUp || !readHeldBalances) return null;
+
+    // Quick catch-up (function in your lib scans from last cursor forward).
+    try { await catchUp(prisma, aid, offshoreAid); } catch { /* ignore */ }
+
+    const ledgerRow = await readHeldBalances(prisma, aid, offshoreAid);
+    if (!ledgerRow || typeof ledgerRow !== "object") return null;
+
+    // Normalize to the shape `pairNetWithOffshore` expects
     const net: Record<string, number> = {};
-    for (const k of RESOURCE_KEYS) net[k] = Number((held as any)[k] ?? 0);
+    for (const k of RESOURCE_KEYS) net[k] = Number((ledgerRow as any)[k] || 0);
     return net;
   } catch (e) {
-    console.warn("[OFFSH_LEDGER_ERR]", e);
+    console.warn("[OFFSH_LEDGER_BG_ERR]", e);
     return null;
   }
 }
@@ -480,7 +501,7 @@ export async function execute(i: ChatInputCommandInteraction) {
       const { fields, total, missing } = pairFieldsPretty(partial, pricing.prices);
 
       const embed = new EmbedBuilder()
-        // 🔧 change: show calling alliance name in title
+        // show calling alliance name
         .setTitle(`📊 Offshore Holdings — ${alliance.name || alliance.id}`)
         .setColor(Colors.Green)
         .setDescription(
@@ -499,7 +520,7 @@ export async function execute(i: ChatInputCommandInteraction) {
             .join(" • "),
         });
 
-      // 🔧 keep/ensure refresh button here
+      // refresh button
       const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder().setCustomId("offsh:check").setStyle(ButtonStyle.Secondary).setEmoji("🔄").setLabel("Refresh"),
       );
@@ -759,7 +780,6 @@ export async function handleButton(i: Interaction) {
       const { fields, total, missing } = pairFieldsPretty(partial, pricing.prices);
 
       const embed = new EmbedBuilder()
-        // 🔧 change: show calling alliance name in title
         .setTitle(`📊 Offshore Holdings — ${alliance.name || alliance.id}`)
         .setColor(Colors.Green)
         .setDescription(
@@ -778,7 +798,6 @@ export async function handleButton(i: Interaction) {
             .join(" • "),
         });
 
-      // 🔧 keep/ensure refresh button here
       const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder().setCustomId("offsh:check").setStyle(ButtonStyle.Secondary).setEmoji("🔄").setLabel("Refresh"),
       );
