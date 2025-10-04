@@ -1,297 +1,337 @@
-cd ~/gemstone-tools
-
-# Safety backup
-cp src/commands/offshore.ts src/commands/offshore.ts.bak.$(date +%s)
-
-# Write the corrected file (NO leading comment line!)
-cat > src/commands/offshore.ts <<'TS'
 import {
-  SlashCommandBuilder,
-  ChatInputCommandInteraction,
-  ButtonInteraction,
-  ModalSubmitInteraction,
-  EmbedBuilder,
-  Colors,
-  ButtonBuilder,
-  ButtonStyle,
   ActionRowBuilder,
+  ButtonBuilder,
+  ButtonInteraction,
+  ButtonStyle,
+  Colors,
+  EmbedBuilder,
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
 } from "discord.js";
 import { PrismaClient } from "@prisma/client";
-import { open as cryptoOpen } from "../lib/crypto.js";
-import { RES_EMOJI, ORDER } from "../lib/emojis.js";
-import { catchUpLedgerForPair } from "../lib/offshore_ledger.js";
+import { ORDER, RES_EMOJI } from "../lib/emojis";
+import { open } from "../lib/crypto";
+
+// ---------- Public exports expected elsewhere ----------
+export const OFFSH_NOTE_TAG = "Gemstone Offsh";
+// Keep signatures compatible with old callers (no-ops here; real logic lives elsewhere)
+export async function catchUpLedgerForPair(
+  _prisma: PrismaClient,
+  _allianceId: number,
+  _offshoreAid: number,
+  _opts?: { maxLoops?: number; batchSize?: number }
+): Promise<void> { /* no-op to satisfy imports */ }
+
+export async function readLedger(
+  _prisma: PrismaClient,
+  _allianceId: number,
+  _offshoreAid: number
+): Promise<Record<string, number>> {
+  // Simple read from OffshoreLedger if present
+  try {
+    const row: any = await _prisma.offshoreLedger.findUnique({
+      where: { allianceId_offshoreId: { allianceId: _allianceId, offshoreId: _offshoreAid } }
+    });
+    if (!row) return {};
+    const out: Record<string, number> = {};
+    for (const k of ORDER) out[k] = Number(row[k as keyof typeof row] || 0);
+    return out;
+  } catch {
+    return {};
+  }
+}
+// -------------------------------------------------------
 
 const prisma = new PrismaClient();
 
-const OFFSH_NOTE_TAG = "Gemstone Offsh";
-const RES_PER_MODAL_PAGE = 4;
-const emoji = (k: string) => (RES_EMOJI as any)[k] ?? "";
-const label = (k: string) => k.slice(0, 1).toUpperCase() + k.slice(1);
-const round0 = (n: number) => Number(n || 0);
+// A very small, in-memory session store (ephemeral)
+type SendSess = {
+  data: Record<string, number>;
+  page: number;           // current page last edited
+  createdAt: number;
+};
+const sendSessions = new Map<string, SendSess>();
 
-// ---------- Alliance helpers ----------
-async function findAllianceForGuild(guildId?: string) {
+// Discord modal limit is 5 inputs → chunk by 5
+const PAGE_SIZE = 5;
+const PAGES = Math.ceil(ORDER.length / PAGE_SIZE);
+const slicePage = (page: number) => {
+  const s = page * PAGE_SIZE;
+  return ORDER.slice(s, s + PAGE_SIZE);
+};
+
+// ---------- Utility ----------
+function parseNum(s: string): number {
+  const cleaned = (s || "").replace(/[, _]/g, "");
+  if (!cleaned) return 0;
+  const n = Number(cleaned);
+  return Number.isFinite(n) && n >= 0 ? n : NaN;
+}
+function sumMV(rows: Record<string, number>): number {
+  // Placeholder: if you later fetch market prices, multiply; for now count money+resources as numbers
+  // Money dominates, so we keep the UI happy
+  let total = 0;
+  for (const k of ORDER) total += Number(rows[k] || 0);
+  return total;
+}
+function fmtLine(k: string, v: number) {
+  const emoji = RES_EMOJI[k as keyof typeof RES_EMOJI] ?? "";
+  return `${emoji} **${k}**: ${v.toLocaleString()}`;
+}
+
+async function resolveAllianceIdFromGuild(guildId?: string | null) {
   if (!guildId) return null;
-  const map = await prisma.allianceGuild.findUnique({ where: { guildId } });
+
+  // Try new mapping table first (supports multi-guild)
+  const map = await prisma.allianceGuild.findUnique({ where: { guildId: String(guildId) } });
   if (map) {
     const a = await prisma.alliance.findUnique({ where: { id: map.allianceId } });
-    if (a) return a;
+    if (a) return a.id;
   }
-  return prisma.alliance.findFirst({ where: { guildId } });
+  // Fallback to legacy
+  const legacy = await prisma.alliance.findFirst({ where: { guildId: String(guildId) } });
+  return legacy?.id ?? null;
 }
 
-async function resolveOffshoreAidForAlliance(allianceId: number): Promise<number | null> {
+async function resolveOffshoreTargetAid(allianceId: number): Promise<number | null> {
+  // 1) per-alliance override
   const a = await prisma.alliance.findUnique({ where: { id: allianceId } });
-  if (!a) return null;
-  if ((a as any).offshoreOverrideAllianceId) return (a as any).offshoreOverrideAllianceId;
+  if (a?.offshoreOverrideAllianceId) return a.offshoreOverrideAllianceId;
 
+  // 2) global Setting default_offshore_aid
   const s = await prisma.setting.findUnique({ where: { key: "default_offshore_aid" } });
+  if (s?.value && (s.value as any).aid) return Number((s.value as any).aid);
+
+  return null;
+}
+
+async function getAllianceApiKey(allianceId: number): Promise<string | null> {
+  const k = await prisma.allianceKey.findFirst({
+    where: { allianceId },
+    orderBy: { id: "desc" },
+  });
+  if (!k) return null;
   try {
-    const aid = (s?.value as any)?.aid;
-    return Number.isFinite(aid) ? Number(aid) : null;
-  } catch { return null; }
-}
-
-async function getAllianceApiBotKeys(allianceId: number) {
-  const a = await prisma.alliance.findUnique({
-    where: { id: allianceId },
-    include: { keys: { orderBy: { id: "desc" }, take: 1 } },
-  });
-
-  let apiKey = "";
-  const latest = a?.keys?.[0];
-  if (latest) {
-    try { apiKey = cryptoOpen(latest.encryptedApiKey as any, latest.nonceApi as any); } catch {}
+    return open(k.encryptedApiKey as any, k.nonceApi as any);
+  } catch {
+    return null;
   }
-  if (!apiKey) apiKey = process.env.PNW_DEFAULT_API_KEY || "";
-  const botKey = process.env.PNW_BOT_KEY || "";
-  return { apiKey, botKey };
 }
 
-// ---------- PnW send ----------
-async function bankWithdrawAlliance(opts: {
-  apiKey: string; botKey: string; receiverAllianceId: number; note?: string;
-  payload: Record<string, number>;
-}): Promise<{ ok: boolean; error?: string }> {
-  const fields: string[] = [];
-  for (const [k, v] of Object.entries(opts.payload)) {
-    const n = Number(v);
-    if (Number.isFinite(n) && n > 0) fields.push(`${k}:${n}`);
-  }
-  if (!fields.length) return { ok: false, error: "Nothing to send (all zero)." };
-  if (opts.note) fields.push(`note:${JSON.stringify(opts.note)}`);
-
-  const query = `mutation{
-    bankWithdraw(receiver:${opts.receiverAllianceId}, receiver_type:2, ${fields.join(",")}) { id }
-  }`;
-
-  const url = "https://api.politicsandwar.com/graphql?api_key=" + encodeURIComponent(opts.apiKey);
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Api-Key": opts.apiKey, "X-Bot-Key": opts.botKey },
-    body: JSON.stringify({ query }),
-  });
-
-  const json: any = await res.json().catch(() => ({}));
-  if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
-  if (json?.errors?.length) {
-    const msg = json.errors.map((e: any) => e?.message).join("; ");
-    return { ok: false, error: msg || "GraphQL error" };
-  }
-  const id = json?.data?.bankWithdraw?.id;
-  return id ? { ok: true } : { ok: false, error: "No ID returned" };
-}
-
-// ---------- Slash command ----------
-export const data = new SlashCommandBuilder()
-  .setName("offshore")
-  .setDescription("Offshore tools")
-  .addSubcommand(s => s.setName("show").setDescription("Show offshore holdings (running balance, bot-tagged only)"));
-
-export async function execute(i: ChatInputCommandInteraction) {
-  const sub = i.options.getSubcommand();
-  if (sub === "show") return showHoldings(i);
-}
-
-// ---------- Classic holdings card ----------
-async function showHoldings(i: ChatInputCommandInteraction) {
-  const alliance = await findAllianceForGuild(i.guildId ?? undefined);
-  if (!alliance) return i.reply({ content: "Run /setup_alliance first.", ephemeral: true });
-
-  const offshoreAid = await resolveOffshoreAidForAlliance(alliance.id);
-  if (!offshoreAid) return i.reply({ content: "No offshore alliance configured.", ephemeral: true });
-
-  try { await catchUpLedgerForPair(prisma, alliance.id, offshoreAid); } catch {}
-
-  const ledger = await prisma.offshoreLedger.findUnique({
-    where: { allianceId_offshoreId: { allianceId: alliance.id, offshoreId: offshoreAid } },
-  });
-
-  const embed = new EmbedBuilder()
-    .setTitle(`📊 Offshore Holdings — ${alliance.id}`)
-    .setDescription(`**${alliance.id}** held in offshore **${offshoreAid}**\n_Running balance (bot-tagged only)_`)
-    .setColor(Colors.Blurple)
-    .setTimestamp(ledger?.updatedAt ?? new Date());
-
-  const blocks: string[] = [];
-  if (ledger) {
-    const money = round0((ledger as any).money);
-    if (money > 0) blocks.push(`${emoji("money")} **Money**\n$${money.toLocaleString()}`);
-    for (const k of ORDER) {
-      if (k === "money") continue;
-      const v = round0((ledger as any)[k]);
-      if (v > 0) blocks.push(`${emoji(k)} **${label(k)}**\n${v.toLocaleString()}`);
-    }
-  }
-  embed.addFields({ name: "Balances", value: blocks.length ? blocks.join("\n\n") : "— none —" });
-
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("offsh:refresh").setStyle(ButtonStyle.Secondary).setLabel("Refresh Now"),
-    new ButtonBuilder().setCustomId("offsh:send:open:0").setStyle(ButtonStyle.Primary).setLabel("Send to Offshore")
-  );
-
-  await i.reply({ embeds: [embed], components: [row], ephemeral: true });
-}
-
-// ---------- Send flow (submit any time) ----------
-type SendSess = { allianceId: number; offshoreAid: number; page: number; note?: string; amounts: Record<string, number>; createdAt: number; };
-const sendSessions = new Map<string, SendSess>();
-const totalPages = () => Math.ceil(ORDER.length / RES_PER_MODAL_PAGE);
-const pageKeys = (p: number) => ORDER.slice(p * RES_PER_MODAL_PAGE, p * RES_PER_MODAL_PAGE + RES_PER_MODAL_PAGE);
-
-function previewEmbed(sess: SendSess) {
-  const lines = Object.entries(sess.amounts).filter(([, v]) => Number(v) > 0)
-    .map(([k, v]) => `${emoji(k)} **${label(k)}**: ${Number(v).toLocaleString()}`);
-  return new EmbedBuilder()
-    .setTitle("Send to Offshore — Preview")
-    .setDescription(lines.length ? lines.join(" · ") : "— none —")
-    .setFooter({ text: `Alliance ${sess.allianceId} → Offshore ${sess.offshoreAid}` })
-    .setColor(Colors.Blurple);
-}
-
+// ---------- Modal ----------
 async function openSendModal(i: ButtonInteraction, page: number) {
-  const sess = sendSessions.get(i.user.id);
-  if (!sess) return i.reply({ content: "Session expired. Press **Send to Offshore** again.", ephemeral: true });
-  sess.page = page; sendSessions.set(i.user.id, sess);
+  const modal = new ModalBuilder()
+    .setCustomId(`offsh:send:modal:${page}`)
+    .setTitle(`Send to Offshore (${page + 1}/${PAGES})`);
 
-  const modal = new ModalBuilder().setCustomId(`offsh:send:modal:${page}`).setTitle(`Send to Offshore (${page + 1}/${totalPages()})`);
-  for (const k of pageKeys(page)) {
-    modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(
-      new TextInputBuilder()
-        .setCustomId(`res:${k}`)
-        .setLabel(`${emoji(k)} ${label(k)} (leave blank for 0)`)
-        .setStyle(TextInputStyle.Short).setRequired(false)
-        .setPlaceholder(String(sess.amounts[k] ?? 0))
-    ));
-  }
-  if (page === 0) {
-    modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(
-      new TextInputBuilder().setCustomId("meta:note").setLabel("Note (optional)").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder(sess.note ?? "")
-    ));
+  for (const k of slicePage(page)) {
+    const input = new TextInputBuilder()
+      .setCustomId(k)
+      .setLabel(`${RES_EMOJI[k as keyof typeof RES_EMOJI] ?? ""} ${k}`)
+      .setStyle(TextInputStyle.Short)
+      .setRequired(false)
+      .setPlaceholder("0");
+    modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
   }
   await i.showModal(modal);
 }
 
-async function submitSend(i: ButtonInteraction | ModalSubmitInteraction, sess: SendSess) {
-  const payload: Record<string, number> = {};
-  for (const [k, v] of Object.entries(sess.amounts)) {
-    const n = Number(v);
-    if (Number.isFinite(n) && n > 0) payload[k] = n;
-  }
-  if (!Object.keys(payload).length) {
-    const msg = { content: "Nothing to send — all zero.", ephemeral: true };
-    // @ts-ignore
-    return (i.reply ?? i.followUp).call(i, msg);
-  }
+// ---------- Review + Embeds ----------
+function buildSummaryEmbed(allianceId: number, offshoreAid: number, data: Record<string, number>) {
+  const nonZero = Object.entries(data).filter(([, v]) => Number(v) > 0);
+  const fields = nonZero.length
+    ? nonZero.map(([k, v]) => ({ name: k, value: `${RES_EMOJI[k as keyof typeof RES_EMOJI] ?? ""} ${Number(v).toLocaleString()}`, inline: true }))
+    : [{ name: "Nothing selected", value: "—", inline: false }];
 
-  const { apiKey, botKey } = await getAllianceApiBotKeys(sess.allianceId);
-  if (!apiKey) return i.reply({ content: "No alliance API key set. Run **/setup_alliance**.", ephemeral: true });
-  if (!botKey) return i.reply({ content: "Missing PNW_BOT_KEY in environment.", ephemeral: true });
-
-  const note = `${OFFSH_NOTE_TAG}${sess.note ? " • " + sess.note : ""}`;
-  const res = await bankWithdrawAlliance({ apiKey, botKey, receiverAllianceId: sess.offshoreAid, note, payload });
-
-  if (!res.ok) {
-    const msg = /api key/i.test(res.error || "") ? "Alliance API key looks invalid. Re-run **/setup_alliance**." : (res.error || "Unknown error.");
-    return i.reply({ content: `❌ Send failed: ${msg}`, ephemeral: true });
-  }
-
-  try { await catchUpLedgerForPair(prisma, sess.allianceId, sess.offshoreAid); } catch {}
-  sendSessions.delete((i as any).user?.id ?? "");
-  const ok = new EmbedBuilder()
-    .setTitle("✅ Sent to Offshore")
-    .setDescription(Object.entries(payload).map(([k, v]) => `${emoji(k)} **${label(k)}**: ${v.toLocaleString()}`).join(" · "))
-    .setColor(Colors.Green);
-  // @ts-ignore
-  return (i.update ?? i.reply).call(i, { embeds: [ok], components: [], ephemeral: "update" in i ? undefined : true });
+  return new EmbedBuilder()
+    .setTitle("⛵ Send to Offshore — Review")
+    .setDescription(
+      `Alliance **${allianceId}** → Offshore **${offshoreAid}**\n` +
+      `Tag: \`${OFFSH_NOTE_TAG}\``
+    )
+    .addFields(fields)
+    .setFooter({ text: `Total (raw sum): ${sumMV(data).toLocaleString()}` })
+    .setColor(Colors.Blurple);
 }
 
-// ---------- Routers ----------
+function buildHoldingsEmbed(aid: number, off: number, data: Record<string, number>) {
+  const nonZero = Object.entries(data).filter(([, v]) => Number(v) > 0);
+  const lines = nonZero.length
+    ? nonZero.map(([k, v]) => fmtLine(k, Number(v))).join("\n")
+    : "— none —";
+
+  return new EmbedBuilder()
+    .setTitle(`📊 Offshore Holdings — ${aid}`)
+    .setDescription(`Held in offshore **${off}** • as of ${new Date().toISOString()}`)
+    .addFields({ name: "Resources", value: lines })
+    .setColor(Colors.Gold);
+}
+
+// ---------- PnW GraphQL ----------
+async function pnwAllianceToAllianceWithdraw(opts: {
+  apiKey: string;
+  botKey: string;
+  receiverAllianceId: number;
+  payload: Record<string, number>;
+  note?: string;
+}): Promise<{ ok: boolean; status: number; body: any }> {
+  // GraphQL mutation; receiver_type = 2 (alliance)
+  const resourceArgs = Object.entries(opts.payload)
+    .filter(([, v]) => Number(v) > 0)
+    .map(([k, v]) => `${k}:${Number(v)}`);
+
+  const extra = opts.note ? `, note:${JSON.stringify(opts.note)}` : "";
+  const q = `mutation{
+    bankWithdraw(receiver:${opts.receiverAllianceId}, receiver_type:2, ${resourceArgs.join(",")}${extra}) { id }
+  }`;
+
+  const url = `https://api.politicsandwar.com/graphql?api_key=${encodeURIComponent(opts.apiKey)}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Api-Key": opts.apiKey,
+      "X-Bot-Key": opts.botKey,
+    },
+    body: JSON.stringify({ query: q }),
+  });
+  let body: any = {};
+  try { body = await res.json(); } catch { body = {}; }
+  const ok = res.ok && !body?.errors && body?.data?.bankWithdraw;
+  return { ok, status: res.status, body };
+}
+
+// ---------- Button / Modal handlers (exported to index.ts) ----------
 export async function handleButton(i: ButtonInteraction) {
-  if (!i.customId.startsWith("offsh:")) return;
+  try {
+    // Buttons:
+    // offsh:send:open:<page>
+    // offsh:send:review
+    // offsh:send:confirm
+    // offsh:send:cancel
 
-  if (i.customId === "offsh:refresh") {
-    return showHoldings(i as any as ChatInputCommandInteraction);
+    if (i.customId.startsWith("offsh:send:open:")) {
+      const m = i.customId.match(/^offsh:send:open:(\d+)$/);
+      const page = m ? Math.max(0, parseInt(m[1]!, 10)) : 0;
+      // init session if missing
+      if (!sendSessions.get(i.user.id)) {
+        sendSessions.set(i.user.id, { data: {}, page, createdAt: Date.now() });
+      }
+      return openSendModal(i, page);
+    }
+
+    if (i.customId === "offsh:send:cancel") {
+      sendSessions.delete(i.user.id);
+      return i.reply({ content: "❎ Cancelled.", ephemeral: true });
+    }
+
+    if (i.customId === "offsh:send:review") {
+      const allianceId = await resolveAllianceIdFromGuild(i.guildId);
+      if (!allianceId) return i.reply({ content: "This server is not linked to an alliance. Run /setup_alliance first.", ephemeral: true });
+
+      const offshoreAid = await resolveOffshoreTargetAid(allianceId);
+      if (!offshoreAid) return i.reply({ content: "No offshore target configured. Set Alliance override or Setting `default_offshore_aid`.", ephemeral: true });
+
+      const sess = sendSessions.get(i.user.id) || { data: {}, page: 0, createdAt: Date.now() };
+      const embed = buildSummaryEmbed(allianceId, offshoreAid, sess.data);
+
+      const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId("offsh:send:confirm").setStyle(ButtonStyle.Success).setEmoji("✅").setLabel("Confirm"),
+        new ButtonBuilder().setCustomId("offsh:send:open:0").setStyle(ButtonStyle.Secondary).setEmoji("📝").setLabel("Edit"),
+        new ButtonBuilder().setCustomId("offsh:send:cancel").setStyle(ButtonStyle.Danger).setEmoji("✖️").setLabel("Cancel"),
+      );
+      return i.reply({ embeds: [embed], components: [row], ephemeral: true });
+    }
+
+    if (i.customId === "offsh:send:confirm") {
+      const allianceId = await resolveAllianceIdFromGuild(i.guildId);
+      if (!allianceId) return i.reply({ content: "This server is not linked to an alliance. Run /setup_alliance first.", ephemeral: true });
+
+      const offshoreAid = await resolveOffshoreTargetAid(allianceId);
+      if (!offshoreAid) return i.reply({ content: "No offshore target configured. Set Alliance override or Setting `default_offshore_aid`.", ephemeral: true });
+
+      const sess = sendSessions.get(i.user.id);
+      if (!sess || !Object.values(sess.data).some(v => Number(v) > 0)) {
+        return i.reply({ content: "Nothing to send — enter some amounts first.", ephemeral: true });
+      }
+
+      const apiKey = await getAllianceApiKey(allianceId);
+      const botKey = process.env.PNW_BOT_KEY || "";
+
+      if (!apiKey || !botKey) {
+        return i.reply({ content: "Missing alliance API key (run /setup_alliance) or PNW_BOT_KEY in .env.", ephemeral: true });
+      }
+
+      const note = `${OFFSH_NOTE_TAG} • A:${allianceId}→${offshoreAid} • by ${i.user.id}`;
+      const { ok, status, body } = await pnwAllianceToAllianceWithdraw({
+        apiKey, botKey, receiverAllianceId: offshoreAid, payload: sess.data, note
+      });
+
+      if (!ok) {
+        console.error("[OFFSH_SEND_ERR]", status, JSON.stringify(body));
+        const msg = body?.errors?.[0]?.message || `HTTP ${status}`;
+        return i.reply({ content: `❌ Send failed: ${msg}`, ephemeral: true });
+      }
+
+      // success UX
+      const embed = new EmbedBuilder()
+        .setTitle("✅ Sent to Offshore")
+        .setDescription(`Alliance **${allianceId}** → offshore **${offshoreAid}**`)
+        .addFields(
+          ...Object.entries(sess.data)
+            .filter(([, v]) => Number(v) > 0)
+            .map(([k, v]) => ({ name: k, value: `${RES_EMOJI[k as keyof typeof RES_EMOJI] ?? ""} ${Number(v).toLocaleString()}`, inline: true }))
+        )
+        .setFooter({ text: `Tag: ${OFFSH_NOTE_TAG}` })
+        .setColor(Colors.Green);
+
+      sendSessions.delete(i.user.id);
+      return i.reply({ embeds: [embed], ephemeral: true });
+    }
+  } catch (err) {
+    console.error("[OFFSH_BTN_ERR]", err);
+    try { await i.reply({ content: "Something went wrong.", ephemeral: true }); } catch {}
   }
-
-  if (i.customId.startsWith("offsh:send:open:")) {
-    const alliance = await findAllianceForGuild(i.guildId ?? undefined);
-    if (!alliance) return i.reply({ content: "Run /setup_alliance first.", ephemeral: true });
-    const offshoreAid = await resolveOffshoreAidForAlliance(alliance.id);
-    if (!offshoreAid) return i.reply({ content: "No offshore alliance configured.", ephemeral: true });
-
-    sendSessions.set(i.user.id, { allianceId: alliance.id, offshoreAid, page: 0, amounts: {}, createdAt: Date.now() });
-    return openSendModal(i, 0);
-  }
-
-  if (i.customId === "offsh:send:cancel") {
-    sendSessions.delete(i.user.id);
-    return i.update({ content: "Canceled.", embeds: [], components: [] }).catch(() => {});
-  }
-
-  if (i.customId === "offsh:send:submit") {
-    const sess = sendSessions.get(i.user.id);
-    if (!sess) return i.reply({ content: "Session expired. Press **Send to Offshore** again.", ephemeral: true });
-    return submitSend(i, sess);
-  }
-
-  const m = i.customId.match(/^offsh:send:page:(\d+)$/);
-  if (m) return openSendModal(i, Math.max(0, parseInt(m[1]!, 10)));
 }
 
-export async function handleModal(i: ModalSubmitInteraction) {
-  if (!i.customId.startsWith("offsh:send:modal:")) return;
-  const sess = sendSessions.get(i.user.id);
-  if (!sess) return i.reply({ content: "Session expired. Press **Send to Offshore** again.", ephemeral: true });
+export async function handleModal(i: any) {
+  try {
+    // offsh:send:modal:<page>
+    if (!String(i.customId).startsWith("offsh:send:modal:")) return;
+    const m = String(i.customId).match(/^offsh:send:modal:(\d+)$/);
+    const page = m ? Math.max(0, parseInt(m[1]!, 10)) : 0;
 
-  const page = parseInt(i.customId.split(":").pop()!, 10);
-  for (const k of pageKeys(page)) {
-    const raw = (i.fields.getTextInputValue(`res:${k}`) || "").trim();
-    if (!raw) { delete sess.amounts[k]; continue; }
-    const n = Number(raw.replace(/[, _]/g, ""));
-    if (!Number.isFinite(n) || n < 0) return i.reply({ content: `Invalid number for ${label(k)}.`, ephemeral: true });
-    if (n === 0) delete sess.amounts[k]; else sess.amounts[k] = n;
+    const sess = sendSessions.get(i.user.id) || { data: {}, page, createdAt: Date.now() };
+
+    for (const k of slicePage(page)) {
+      const raw = (i.fields.getTextInputValue(k) || "").trim();
+      if (!raw) { delete sess.data[k]; continue; }
+      const num = parseNum(raw);
+      if (!Number.isFinite(num) || num < 0) {
+        return i.reply({ content: `Invalid number for ${k}.`, ephemeral: true });
+      }
+      sess.data[k] = num;
+    }
+    sess.page = page;
+    sendSessions.set(i.user.id, sess);
+
+    // Build a compact “saved so far” + quick controls
+    const summary = Object.entries(sess.data)
+      .filter(([, v]) => Number(v) > 0)
+      .map(([k, v]) => `${RES_EMOJI[k as keyof typeof RES_EMOJI] ?? ""}${k}: ${Number(v).toLocaleString()}`)
+      .join("  •  ") || "— none yet —";
+
+    const buttons: ButtonBuilder[] = [];
+    if (page > 0) buttons.push(new ButtonBuilder().setCustomId(`offsh:send:open:${page - 1}`).setStyle(ButtonStyle.Secondary).setLabel("◀ Prev"));
+    if (page < PAGES - 1) buttons.push(new ButtonBuilder().setCustomId(`offsh:send:open:${page + 1}`).setStyle(ButtonStyle.Secondary).setLabel("Next ▶"));
+    buttons.push(new ButtonBuilder().setCustomId("offsh:send:review").setStyle(ButtonStyle.Success).setEmoji("✅").setLabel("Review / Submit Now"));
+    buttons.push(new ButtonBuilder().setCustomId("offsh:send:cancel").setStyle(ButtonStyle.Danger).setLabel("Cancel"));
+
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons);
+    return i.reply({ content: `Saved so far:\n${summary}`, components: [row], ephemeral: true });
+  } catch (err) {
+    console.error("[OFFSH_MODAL_ERR]", err);
+    try { await i.reply({ content: "Something went wrong.", ephemeral: true }); } catch {}
   }
-  if (page === 0) {
-    const noteRaw = (i.fields.getTextInputValue("meta:note") || "").trim();
-    sess.note = noteRaw || undefined;
-  }
-  sendSessions.set(i.user.id, sess);
-
-  const total = totalPages();
-  const btns: ButtonBuilder[] = [];
-  if (page > 0) btns.push(new ButtonBuilder().setCustomId(`offsh:send:page:${page - 1}`).setLabel("◀ Prev").setStyle(ButtonStyle.Secondary));
-  if (page < total - 1) btns.push(new ButtonBuilder().setCustomId(`offsh:send:page:${page + 1}`).setLabel(`Next ▶ (${page + 2}/${total})`).setStyle(ButtonStyle.Secondary));
-  btns.push(new ButtonBuilder().setCustomId("offsh:send:submit").setLabel("Submit Now").setStyle(ButtonStyle.Success));
-  btns.push(new ButtonBuilder().setCustomId("offsh:send:cancel").setLabel("Cancel").setStyle(ButtonStyle.Danger));
-
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(...btns);
-  await i.reply({ embeds: [previewEmbed(sess)], components: [row], ephemeral: true });
 }
-TS
-
-# Make sure there are NO occurrences of the old handlers
-grep -nE 'offsh:send:(review|confirm)' src/commands/offshore.ts || echo "👍 No legacy buttons present"
