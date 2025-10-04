@@ -2,21 +2,26 @@
 //
 // Offshore controller: show / set default / set override / holdings / send (modal).
 //
-// ✅ Send auth model (already proven by curl; DO NOT CHANGE):
-//   - URL  ?api_key=  → SENDER alliance key (the main alliance moving funds)
+// ✅ Send auth model (do not change):
+//   - URL  ?api_key=  → SENDER alliance key (main alliance)
 //   - HEAD X-Api-Key  → OFFSHORE alliance saved key (actor header)
 //   - HEAD X-Bot-Key  → mutations key (PNW_BOT_KEY)
 //
 // 📊 Holdings (leader view):
-//   - /offshore holdings  → shows only what THIS alliance is holding in the offshore
-//     (pairwise net: A→Off minus Off→A, computed from the offshore’s recent bankrecs window)
-//   - The “Show Holdings” button mirrors the same view.
-//   - Embed includes a Total Market Value similar to /market_value (best-effort).
+//   - /offshore holdings  & “Show Holdings” button show ONLY what THIS alliance is
+//     holding in the offshore (pair net A→Off − Off→A), **filtered to bot-tagged
+//     transfers only** (note includes "Gemstone Offsh").
+//   - Uses the same pricing stack as /market_value for **accurate $ totals**.
 //
-// Requirements (env):
+// Perf:
+//   - Default window: OFFSH_HOLDINGS_LIMIT (env, default 200)
+//   - 60s cache for pairwise holdings; 5m cache for prices
+//
+// Env:
 //   BOT_ADMIN_DISCORD_ID
 //   PNW_BOT_KEY
-//   PNW_GRAPHQL_URL (optional; defaults to official)
+//   PNW_GRAPHQL_URL (optional)
+//   OFFSH_HOLDINGS_LIMIT (optional)
 
 import {
   SlashCommandBuilder,
@@ -37,6 +42,15 @@ import { RESOURCE_KEYS, fetchBankrecs } from "../lib/pnw";
 import { getDefaultOffshore, setDefaultOffshore } from "../lib/offshore";
 import { open } from "../lib/crypto";
 
+// pricing (same as /market_value)
+import {
+  fetchAveragePrices,
+  computeTotalValue,
+  fmtMoney,
+  Resource,
+  PriceMap,
+} from "../lib/market.js";
+
 const prisma = new PrismaClient();
 
 function fmt(n: number) {
@@ -52,6 +66,22 @@ function nowIso() {
   return new Date().toISOString();
 }
 const GQL_URL = process.env.PNW_GRAPHQL_URL || "https://api.politicsandwar.com/graphql";
+
+// ---- Perf knobs ----
+const OFFSH_HOLDINGS_LIMIT = Number(process.env.OFFSH_HOLDINGS_LIMIT || 200);
+const OFFSH_CACHE_MS = 60_000;  // pair net cache TTL (60s)
+const PRICE_CACHE_MS = 300_000; // price cache TTL (5m)
+
+// ---- Bot note tag ----
+const OFFSH_NOTE_TAG = "Gemstone Offsh";
+
+// ---- caches ----
+const pairCache = new Map<string, { at: number; net: Record<string, number> }>();
+let priceCache: { at: number; prices: PriceMap; source: string; asOf: number } | null = null;
+
+function cacheKeyPair(aid: number, oid: number, take: number, onlyMarked: boolean) {
+  return `${aid}:${oid}:${take}:${onlyMarked ? "M" : "A"}`;
+}
 
 // ---------- effective offshore (global default + per-alliance override) ----------
 async function resolveOffshoreAid(allianceId: number): Promise<{ global: number | null; override: number | null; effective: number | null }> {
@@ -163,19 +193,118 @@ async function bankWithdrawAllianceToAlliance(opts: {
   }
 }
 
-// ---------- Holdings helpers (pairwise net + market value) ----------
-function fmtLines(rec: Record<string, number>) {
-  const parts = RESOURCE_KEYS
-    .map((k) => {
-      const v = Number(rec[k] || 0);
-      return Math.abs(v) > 0 ? `• **${k}**: ${fmt(v)}` : null;
-    })
-    .filter(Boolean);
-  return parts.length ? parts.join("\n") : "— none in window —";
+// ---------- Pricing (identical sources to /market_value) ----------
+async function getAveragePricesCached(): Promise<{ prices: PriceMap; source: string; asOf: number } | null> {
+  const now = Date.now();
+  if (priceCache && (now - priceCache.at < PRICE_CACHE_MS)) {
+    return { prices: priceCache.prices, source: priceCache.source, asOf: priceCache.asOf };
+  }
+  const pricing = await fetchAveragePrices();
+  if (!pricing) return null;
+  priceCache = { at: now, prices: pricing.prices, source: pricing.source, asOf: pricing.asOf };
+  return { prices: pricing.prices, source: pricing.source, asOf: pricing.asOf };
 }
 
-// Build pairwise net for A (caller) vs Offshore O over a recent window (last `take` bankrecs on O).
-async function pairNetWithOffshore(aid: number, offshoreAid: number, take = 500) {
+const E: Record<Resource, string> = {
+  money: "💵",
+  food: "🍞",
+  coal: "⚫",
+  oil: "🛢️",
+  uranium: "☢️",
+  lead: "🔩",
+  iron: "⛓️",
+  bauxite: "🧱",
+  gasoline: "⛽",
+  munitions: "💣",
+  steel: "🛠️",
+  aluminum: "🧪",
+  credits: "🎟️",
+};
+const ORDER: Array<{ key: Resource; label: string }> = [
+  { key: "money", label: "Money" },
+  { key: "food", label: "Food" },
+  { key: "coal", label: "Coal" },
+  { key: "oil", label: "Oil" },
+  { key: "uranium", label: "Uranium" },
+  { key: "lead", label: "Lead" },
+  { key: "iron", label: "Iron" },
+  { key: "bauxite", label: "Bauxite" },
+  { key: "gasoline", label: "Gasoline" },
+  { key: "munitions", label: "Munitions" },
+  { key: "steel", label: "Steel" },
+  { key: "aluminum", label: "Aluminum" },
+  // { key: "credits", label: "Credits" },
+];
+
+// ---------- Holdings helpers (pairwise net, filtered by our note tag) ----------
+function pairFieldsPretty(qtys: Partial<Record<Resource, number>>, prices: PriceMap): {
+  fields: { name: string; value: string; inline: boolean }[];
+  total: number;
+  missing: string[];
+} {
+  const fields: { name: string; value: string; inline: boolean }[] = [];
+  const missing: string[] = [];
+  let anyPriced = false;
+
+  const getPrice = (res: Resource, pmap: PriceMap) =>
+    Number.isFinite(pmap[res] as number) ? (pmap[res] as number) : undefined;
+
+  for (const { key, label } of ORDER) {
+    const qty = Number(qtys[key] ?? 0);
+    if (!qty) continue;
+
+    const price = getPrice(key, prices);
+    if (price === undefined) {
+      const qtyStr = key === "money" ? `$${Math.round(qty).toLocaleString("en-US")}` : qty.toLocaleString("en-US");
+      fields.push({ name: `${E[key]} ${label}`, value: `*price unavailable*\n${qtyStr}`, inline: true });
+      if (key !== "money") missing.push(label);
+      continue;
+    }
+
+    const qtyStr = key === "money" ? `$${Math.round(qty).toLocaleString("en-US")}` : qty.toLocaleString("en-US");
+    const priceStr = key === "money" ? "$1" : `$${Number(price).toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
+    const valueStr = fmtMoney(qty * price);
+    fields.push({ name: `${E[key]} ${label}`, value: `**${valueStr}**\n${qtyStr} × ${priceStr}`, inline: true });
+    anyPriced = true;
+  }
+
+  if (!anyPriced && (qtys.money ?? 0) > 0) {
+    const money = Number(qtys.money ?? 0);
+    fields.push({
+      name: `${E.money} Money`,
+      value: `**${fmtMoney(money)}**\n$${Math.round(money).toLocaleString("en-US")} × $1`,
+      inline: true,
+    });
+  }
+
+  const total = computeTotalValue(
+    {
+      money: Number(qtys.money ?? 0),
+      food: Number(qtys.food ?? 0),
+      coal: Number(qtys.coal ?? 0),
+      oil: Number(qtys.oil ?? 0),
+      uranium: Number(qtys.uranium ?? 0),
+      lead: Number(qtys.lead ?? 0),
+      iron: Number(qtys.iron ?? 0),
+      bauxite: Number(qtys.bauxite ?? 0),
+      gasoline: Number(qtys.gasoline ?? 0),
+      munitions: Number(qtys.munitions ?? 0),
+      steel: Number(qtys.steel ?? 0),
+      aluminum: Number(qtys.aluminum ?? 0),
+    },
+    prices
+  );
+
+  return { fields, total, missing };
+}
+
+// cached pairwise net; counts only bankrecs with our note tag when onlyMarked=true
+async function pairNetWithOffshore(aid: number, offshoreAid: number, take = OFFSH_HOLDINGS_LIMIT, onlyMarked = true) {
+  const key = cacheKeyPair(aid, offshoreAid, take, onlyMarked);
+  const now = Date.now();
+  const cached = pairCache.get(key);
+  if (cached && now - cached.at < OFFSH_CACHE_MS) return cached.net;
+
   const rows = await fetchBankrecs(offshoreAid, { limit: take });
   const A = String(aid);
   const O = String(offshoreAid);
@@ -186,6 +315,11 @@ async function pairNetWithOffshore(aid: number, offshoreAid: number, take = 500)
     const rType = Number((r as any).receiver_type || 0);
     const sId = String((r as any).sender_id || "");
     const rId = String((r as any).receiver_id || "");
+    const note = String((r as any).note || "");
+    const marked = !onlyMarked || note.includes(OFFSH_NOTE_TAG);
+
+    if (!marked) continue;
+
     const isAtoO = (sType === 2 || sType === 3) && sId === A && (rType === 2 || rType === 3) && rId === O;
     const isOtoA = (sType === 2 || sType === 3) && sId === O && (rType === 2 || rType === 3) && rId === A;
 
@@ -196,36 +330,9 @@ async function pairNetWithOffshore(aid: number, offshoreAid: number, take = 500)
       if (isOtoA) net[k] -= v;
     }
   }
+
+  pairCache.set(key, { at: now, net });
   return net;
-}
-
-// Best-effort market prices:
-// - Tries to dynamically import an internal market module (if your repo has one used by /market_value).
-// - Falls back to money=1 and 0 for others (so it still renders nicely for testing).
-async function getMarketPricesSafe(): Promise<Record<string, number>> {
-  try {
-    // Try common internal module names (ts builds emit .js)
-    // @ts-ignore
-    const mod = (await import("../lib/market.js")).default || (await import("../lib/market.js"));
-    // attempt common exports
-    const fn = (mod.getLatestMarketPrices || mod.fetchLatestPrices || mod.getMarketPrices || mod.prices) as (() => Promise<Record<string, number>>) | undefined;
-    if (fn) return await fn();
-    if (typeof mod === "object") return mod as Record<string, number>;
-  } catch {}
-  const p: Record<string, number> = {};
-  for (const k of RESOURCE_KEYS) p[k] = 0;
-  p.money = 1; // at minimum treat money at par
-  return p;
-}
-
-function computeMarketValue(amounts: Record<string, number>, prices: Record<string, number>) {
-  let total = 0;
-  for (const k of RESOURCE_KEYS) {
-    const qty = Number(amounts[k] || 0);
-    const px = Number(prices[k] || 0);
-    if (qty && px) total += qty * px;
-  }
-  return total;
 }
 
 // ---------- Slash Command (builder) ----------
@@ -246,7 +353,7 @@ export const data = new SlashCommandBuilder()
       .addIntegerOption((o) => o.setName("alliance_id").setDescription("Alliance ID for override (blank to clear)").setRequired(false)),
   )
   .addSubcommand((sc) =>
-    sc.setName("holdings").setDescription("Show what YOUR alliance is holding in the offshore (pair net in recent window)"),
+    sc.setName("holdings").setDescription("Show what YOUR alliance is holding in the offshore (bot-tagged transfers only)"),
   )
   .addSubcommand((sc) => sc.setName("send").setDescription("Send from your alliance bank to the configured offshore (guided modal)"));
 
@@ -316,28 +423,54 @@ export async function execute(i: ChatInputCommandInteraction) {
       return i.editReply({ content: "No offshore set. Use **/offshore set_override** or ask the bot admin to set a global default." });
     }
 
-    const take = 500;
+    const take = OFFSH_HOLDINGS_LIMIT;
     try {
-      const [net, prices] = await Promise.all([
-        pairNetWithOffshore(alliance.id, offshoreAid, take),
-        getMarketPricesSafe(),
+      const [net, pricing] = await Promise.all([
+        pairNetWithOffshore(alliance.id, offshoreAid, take, /*onlyMarked*/ true),
+        getAveragePricesCached(),
       ]);
-      const totalValue = computeMarketValue(net, prices);
 
-      // Pretty embed that mimics /market_value style
+      if (!pricing) {
+        return i.editReply("Market data is unavailable right now. Please try again later.");
+      }
+
+      // render pretty fields like /market_value
+      const partial: Partial<Record<Resource, number>> = {
+        money: Number(net.money || 0),
+        food: Number(net.food || 0),
+        coal: Number(net.coal || 0),
+        oil: Number(net.oil || 0),
+        uranium: Number(net.uranium || 0),
+        lead: Number(net.lead || 0),
+        iron: Number(net.iron || 0),
+        bauxite: Number(net.bauxite || 0),
+        gasoline: Number(net.gasoline || 0),
+        munitions: Number(net.munitions || 0),
+        steel: Number(net.steel || 0),
+        aluminum: Number(net.aluminum || 0),
+        // credits intentionally omitted for now
+      };
+
+      const { fields, total, missing } = pairFieldsPretty(partial, pricing.prices);
+
       const embed = new EmbedBuilder()
         .setTitle("📊 Offshore Holdings — Your Alliance")
         .setColor(Colors.Green)
         .setDescription(
           [
             `**${alliance.name || alliance.id}** held in offshore **${offshoreAid}**`,
-            `_Window: last ${take} offshore bankrecs • as of ${nowIso()}_`,
+            `_Window: last ${take} offshore bankrecs (bot-tagged only) • as of ${nowIso()}_`,
           ].join("\n"),
         )
         .addFields(
-          { name: "Breakdown", value: fmtLines(net) },
-          { name: "Total Market Value (est.)", value: `**$${fmt(totalValue)}**`, inline: true },
-        );
+          ...fields,
+          { name: "Total Market Value", value: `🎯 **${fmtMoney(total)}**`, inline: false },
+        )
+        .setFooter({
+          text: [`Source: ${pricing.source}`, `As of ${new Date(pricing.asOf).toLocaleString()}`, missing.length ? `No prices for: ${missing.join(", ")}` : ""]
+            .filter(Boolean)
+            .join(" • "),
+        });
 
       const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder().setCustomId("offsh:check").setStyle(ButtonStyle.Secondary).setEmoji("🔄").setLabel("Refresh"),
@@ -519,7 +652,7 @@ export async function handleButton(i: Interaction) {
 
     // Attempt send
     try {
-      const note = `Gemstone Offsh • src ${alliance.id} -> off ${offshoreAid} • by ${(i as any).user.id}`;
+      const note = `${OFFSH_NOTE_TAG} • src ${alliance.id} -> off ${offshoreAid} • by ${(i as any).user.id}`;
       const ok = await bankWithdrawAllianceToAlliance({
         srcAllianceId: alliance.id,
         dstAllianceId: offshoreAid,
@@ -555,7 +688,7 @@ export async function handleButton(i: Interaction) {
     }
   }
 
-  // Show holdings button (pretty + market value)
+  // Show holdings button (pretty + market value) — bot-tagged only
   if ((i as any).customId === "offsh:check") {
     await (i as any).deferReply({ ephemeral: true });
 
@@ -571,13 +704,31 @@ export async function handleButton(i: Interaction) {
       return (i as any).editReply({ content: "No offshore set. Use **/offshore set_override** or ask the bot admin to set a global default." });
     }
 
-    const take = 500;
+    const take = OFFSH_HOLDINGS_LIMIT;
     try {
-      const [net, prices] = await Promise.all([
-        pairNetWithOffshore(alliance.id, offshoreAid, take),
-        getMarketPricesSafe(),
+      const [net, pricing] = await Promise.all([
+        pairNetWithOffshore(alliance.id, offshoreAid, take, /*onlyMarked*/ true),
+        getAveragePricesCached(),
       ]);
-      const totalValue = computeMarketValue(net, prices);
+
+      if (!pricing) return (i as any).editReply("Market data is unavailable right now. Please try again later.");
+
+      const partial: Partial<Record<Resource, number>> = {
+        money: Number(net.money || 0),
+        food: Number(net.food || 0),
+        coal: Number(net.coal || 0),
+        oil: Number(net.oil || 0),
+        uranium: Number(net.uranium || 0),
+        lead: Number(net.lead || 0),
+        iron: Number(net.iron || 0),
+        bauxite: Number(net.bauxite || 0),
+        gasoline: Number(net.gasoline || 0),
+        munitions: Number(net.munitions || 0),
+        steel: Number(net.steel || 0),
+        aluminum: Number(net.aluminum || 0),
+      };
+
+      const { fields, total, missing } = pairFieldsPretty(partial, pricing.prices);
 
       const embed = new EmbedBuilder()
         .setTitle("📊 Offshore Holdings — Your Alliance")
@@ -585,13 +736,18 @@ export async function handleButton(i: Interaction) {
         .setDescription(
           [
             `**${alliance.name || alliance.id}** held in offshore **${offshoreAid}**`,
-            `_Window: last ${take} offshore bankrecs • as of ${nowIso()}_`,
+            `_Window: last ${take} offshore bankrecs (bot-tagged only) • as of ${nowIso()}_`,
           ].join("\n"),
         )
         .addFields(
-          { name: "Breakdown", value: fmtLines(net) },
-          { name: "Total Market Value (est.)", value: `**$${fmt(totalValue)}**`, inline: true },
-        );
+          ...fields,
+          { name: "Total Market Value", value: `🎯 **${fmtMoney(total)}**`, inline: false },
+        )
+        .setFooter({
+          text: [`Source: ${pricing.source}`, `As of ${new Date(pricing.asOf).toLocaleString()}`, missing.length ? `No prices for: ${missing.join(", ")}` : ""]
+            .filter(Boolean)
+            .join(" • "),
+        });
 
       await (i as any).editReply({ embeds: [embed] });
       return;
