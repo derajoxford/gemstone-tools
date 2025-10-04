@@ -1,6 +1,7 @@
-// Resource emojis + canonical ordering used across the bot
+// src/lib/emojis.ts
+// Keep types permissive so indexing like RES_EMOJI[k as any] doesn't TS7053.
 
-export const RES_EMOJI = {
+export const RES_EMOJI: Record<string, string> = {
   money: '💵',
   food: '🍖',
   coal: '⛏️',
@@ -13,10 +14,10 @@ export const RES_EMOJI = {
   munitions: '💣',
   steel: '🔗',
   aluminum: '🥫',
-} as const;
+};
 
-// Keep this order in sync anywhere resources are iterated (modals, embeds, math)
-export const ORDER = [
+// The canonical order used everywhere (modals, embeds, math)
+export const ORDER: string[] = [
   'money',
   'food',
   'coal',
@@ -29,6 +30,8 @@ export const ORDER = [
   'munitions',
   'steel',
   'aluminum',
-] as const;
+];
 
-export type Resource = typeof ORDER[number];
+// (Optional) legacy default export shape if any code `import emojis from ...`
+const defaultExport = { RES_EMOJI, ORDER };
+export default defaultExport;
