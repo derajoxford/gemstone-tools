@@ -27,6 +27,7 @@ import {
   TextInputBuilder,
   TextInputStyle,
   Interaction,
+  ButtonInteraction,
 } from "discord.js";
 import { PrismaClient } from "@prisma/client";
 import { RESOURCE_KEYS } from "../lib/pnw";
@@ -157,7 +158,11 @@ async function bankWithdrawAllianceToAlliance(opts: {
     });
     const data: any = await resp.json().catch(() => ({} as any));
     if (!resp.ok || data?.errors) {
-      console.error("OFFSH_SEND_ERR", resp.status, JSON.stringify({ msg: data?.errors?.[0]?.message || data, src: opts.srcAllianceId, dst: opts.dstAllianceId }));
+      console.error(
+        "OFFSH_SEND_ERR",
+        resp.status,
+        JSON.stringify({ msg: data?.errors?.[0]?.message || data, src: opts.srcAllianceId, dst: opts.dstAllianceId })
+      );
       return false;
     }
     return Boolean(data?.data?.bankWithdraw?.id);
@@ -168,9 +173,9 @@ async function bankWithdrawAllianceToAlliance(opts: {
 }
 
 // ---------- Pricing ----------
-let priceCache: { at: number; prices: PriceMap; source: string; asOf: number } | null = null;
+let priceCache: { at: number; prices: PriceMap; source: string; asOf: string } | null = null; // asOf is ISO string
 const PRICE_CACHE_MS = 300_000;
-async function getAveragePricesCached(): Promise<{ prices: PriceMap; source: string; asOf: number } | null> {
+async function getAveragePricesCached(): Promise<{ prices: PriceMap; source: string; asOf: string } | null> {
   const now = Date.now();
   if (priceCache && (now - priceCache.at < PRICE_CACHE_MS)) return priceCache;
   const pricing = await fetchAveragePrices();
@@ -432,6 +437,7 @@ async function openSendModal(i: Interaction, allianceId: number, page: number) {
       modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
     }
 
+    // Works for both Button and SlashCommand interactions
     // @ts-ignore
     await i.showModal(modal);
 
@@ -440,7 +446,7 @@ async function openSendModal(i: Interaction, allianceId: number, page: number) {
     sendSessions.set(u, sess);
   } catch (e) {
     console.error("[OFFSH_MODAL_OPEN_ERR]", e);
-    try { /* @ts-ignore */ await i.reply({ content: "Couldn’t open the modal. Try again.", ephemeral: true }); } catch {}
+    try { await (i as any).reply({ content: "Couldn’t open the modal. Try again.", ephemeral: true }); } catch {}
   }
 }
 
@@ -561,7 +567,6 @@ export async function handleButton(i: Interaction) {
 
       if (ok) {
         sendSessions.delete(u);
-        // Optional: optimistic bump of ledger (not required—next refresh will catch it)
         return (i as any).reply({
           content: `✅ Sent to offshore **${offshoreAid}**.\nNote: \`${note}\`\nCheck **Show Holdings** to see the running balance.`,
           ephemeral: true,
