@@ -44,6 +44,9 @@ import { RESOURCE_KEYS, fetchBankrecs } from "../lib/pnw";
 import { getDefaultOffshore, setDefaultOffshore } from "../lib/offshore";
 import { open } from "../lib/crypto";
 
+// ⬇️ LEDGER HELPERS (added)
+import { catchUpLedgerForPair, readHeldBalances } from "../lib/offshore_ledger";
+
 // pricing (same as /market_value)
 import {
   fetchAveragePrices,
@@ -302,19 +305,15 @@ function pairFieldsPretty(qtys: Partial<Record<Resource, number>>, prices: Price
 async function tryLedgerNet(aid: number, offshoreAid: number): Promise<Record<string, number> | null> {
   if (!USE_LEDGER) return null;
   try {
-    // Dynamic import so we don't break build/types if names change.
-    const mod: any = await import("../lib/offshore_ledger");
-    const catchUp = mod?.catchUpLedgerForPair || mod?.["catchUpLedgerForPair"];
-    const readLedger = mod?.readLedger || mod?.["readLedger"];
-    if (!catchUp || !readLedger) return null;
-
-    // Small/zero catch-up; background job does heavy lifting.
-    try { await catchUp(prisma, aid, offshoreAid, { maxLoops: 0 }); } catch { /* ignore */ }
-    const net = await readLedger(prisma, aid, offshoreAid);
-    if (net && typeof net === "object") return net as Record<string, number>;
-    return null;
+    // Advance cursor to include any new bot-tagged movements then read held balances
+    await catchUpLedgerForPair(prisma, aid, offshoreAid);
+    const held = await readHeldBalances(prisma, aid, offshoreAid);
+    // Convert ledger row → plain net map that matches RESOURCE_KEYS
+    const net: Record<string, number> = {};
+    for (const k of RESOURCE_KEYS) net[k] = Number((held as any)[k] ?? 0);
+    return net;
   } catch (e) {
-    console.warn("[OFFSH_LEDGER_BG_ERR]", e);
+    console.warn("[OFFSH_LEDGER_ERR]", e);
     return null;
   }
 }
