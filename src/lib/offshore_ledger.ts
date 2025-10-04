@@ -45,6 +45,7 @@ export async function getOrCreateLedger(
  *  - A -> Off increases the ledger (we hold more on behalf of A)
  *  - Off -> A decreases the ledger (we hold less on behalf of A)
  *  - Only rows whose `note` ILIKE %BOT_TAG% are counted
+ *  - Treat sender/receiver types 2 **or** 3 as alliance-level bank records
  */
 export async function catchUpLedgerForPair(
   prisma: PrismaClient,
@@ -53,59 +54,48 @@ export async function catchUpLedgerForPair(
 ) {
   const ledger = await getOrCreateLedger(prisma, allianceId, offshoreId);
 
-  // Pull new bankrecs for both alliances after lastSeen
-  // We use the denormalized cache table you already sync (AllianceBankrec)
-  // Columns (from your model): id (text), date, note, sender_type, receiver_type, sender_id, receiver_id, ...
   const sinceId = ledger.lastSeenBankrecId ?? 0;
 
   const rows = await prisma.allianceBankrec.findMany({
     where: {
-      // scan both sides (source or target alliance)
       alliance_id_derived: { in: [allianceId, offshoreId] },
-      // after last seen numeric id (id is text in the model, so compare by parsed int below)
     },
     orderBy: { date: "asc" },
-    take: 5000, // defensive cap
+    take: 5000, // safety cap
   });
 
-  // Compute max numeric id and delta across only NEW rows, bot-tagged, and relevant directions
   let maxSeen = sinceId;
   const delta = zeroDelta();
 
   for (const r of rows) {
-    // Ignore rows we've already seen
+    // Skip already-seen ids
     const numericId = parseInt(r.id, 10);
     if (!Number.isFinite(numericId) || numericId <= sinceId) continue;
 
     if (typeof r.note !== "string" || !r.note.toLowerCase().includes(BOT_TAG.toLowerCase())) {
-      // not a bot-tagged offshoring move
       maxSeen = Math.max(maxSeen, numericId);
       continue;
     }
 
-    // sender/receiver types: 2 == alliance (matches your prior usage)
-    const sType = r.sender_type;
-    const rType = r.receiver_type;
+    // Treat 2 or 3 as "alliance-level" (matches your live scan logic)
+    const sType = Number(r.sender_type);
+    const tType = Number(r.receiver_type);
 
     const sId = parseInt(r.sender_id, 10);
     const tId = parseInt(r.receiver_id, 10);
 
-    // Only count the two directions that matter for THIS pair:
-    // allianceId -> offshoreId  (increase)
-    // offshoreId -> allianceId  (decrease)
-    const aToOff = sType === 2 && rType === 2 && sId === allianceId && tId === offshoreId;
-    const offToA = sType === 2 && rType === 2 && sId === offshoreId && tId === allianceId;
+    const isAtoOff = (sType === 2 || sType === 3) && (tType === 2 || tType === 3) && sId === allianceId && tId === offshoreId;
+    const isOffToA = (sType === 2 || sType === 3) && (tType === 2 || tType === 3) && sId === offshoreId && tId === allianceId;
 
-    if (!aToOff && !offToA) {
+    if (!isAtoOff && !isOffToA) {
       maxSeen = Math.max(maxSeen, numericId);
       continue;
     }
 
-    // Apply sign (+ for A→Off, − for Off→A)
-    const sign = aToOff ? 1 : -1;
+    const sign = isAtoOff ? 1 : -1;
 
     for (const res of RESOURCES) {
-      // @ts-ignore – AllianceBankrec uses snake columns; the resource columns are lowercase in your schema mapping
+      // @ts-ignore resource columns are lowercase in your cache table
       const raw = (r as any)[res];
       const n = raw == null ? 0 : Number(raw);
       if (!n) continue;
@@ -116,12 +106,9 @@ export async function catchUpLedgerForPair(
     maxSeen = Math.max(maxSeen, numericId);
   }
 
-  // If nothing new, bail early
   const touched = RESOURCES.some((k) => !(delta[k] as Prisma.Decimal).isZero());
   if (!touched && maxSeen === sinceId) return;
 
-  // Atomic increments per column + advance cursor
-  // Prisma supports { increment: <Decimal|number> } on Decimal fields.
   const data: any = { lastSeenBankrecId: maxSeen };
   for (const res of RESOURCES) {
     const inc = delta[res] as Prisma.Decimal;
@@ -134,9 +121,7 @@ export async function catchUpLedgerForPair(
   });
 }
 
-/**
- * Read the current held balances (already netted).
- */
+/** Read the current held balances (already netted). */
 export async function readHeldBalances(
   prisma: PrismaClient,
   allianceId: number,
@@ -146,4 +131,27 @@ export async function readHeldBalances(
   const out: any = { lastSeenBankrecId: row.lastSeenBankrecId };
   for (const r of RESOURCES) out[r] = Number(row[r] as unknown as Prisma.Decimal) || 0;
   return out;
+}
+
+/**
+ * Immediate bump used right after a successful /offshore send.
+ * Positive values increase holdings; negative decrease.
+ */
+export async function applyImmediateDelta(
+  prisma: PrismaClient,
+  allianceId: number,
+  offshoreId: number,
+  payload: Partial<Record<Resource, number>>
+) {
+  await getOrCreateLedger(prisma, allianceId, offshoreId);
+  const data: any = {};
+  for (const r of RESOURCES) {
+    const v = Number(payload[r] || 0);
+    if (v) data[r] = { increment: v };
+  }
+  if (Object.keys(data).length === 0) return;
+  await prisma.offshoreLedger.update({
+    where: { allianceId_offshoreId: { allianceId, offshoreId } },
+    data,
+  });
 }
