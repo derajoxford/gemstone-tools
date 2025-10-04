@@ -249,3 +249,28 @@ model AllianceGuild {
 
   @@index([allianceId])
 }
+
+model OffshoreLedger {
+  id                Int      @id @default(autoincrement())
+  allianceId        Int
+  offshoreId        Int
+  lastSeenBankrecId Int      @default(0)
+  // Running net held in offshore on behalf of alliance (A→Off − Off→A), bot-tagged only
+  money             Decimal  @default(0)
+  food              Decimal  @default(0)
+  coal              Decimal  @default(0)
+  oil               Decimal  @default(0)
+  uranium           Decimal  @default(0)
+  lead              Decimal  @default(0)
+  iron              Decimal  @default(0)
+  bauxite           Decimal  @default(0)
+  gasoline          Decimal  @default(0)
+  munitions         Decimal  @default(0)
+  steel             Decimal  @default(0)
+  aluminum          Decimal  @default(0)
+
+  updatedAt         DateTime @updatedAt
+
+  @@unique([allianceId, offshoreId])
+}
+
