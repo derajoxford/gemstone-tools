@@ -4,7 +4,7 @@ import { fetchBankrecs, RESOURCE_KEYS } from "./pnw";
 
 const prisma = new PrismaClient();
 
-// Must match the tag used by offshore send()
+// NOTE TAG must match the one used by offshore send()
 export const OFFSH_NOTE_TAG = "Gemstone Offsh";
 
 // Get or create a ledger row for (allianceId, offshoreId)
@@ -51,7 +51,7 @@ async function applyDelta(allianceId: number, offshoreId: number, delta: Record<
   });
 }
 
-// Incrementally catch up ledger using offshore's latest bankrecs.
+// Incrementally catch up ledger using offshore’s latest bankrecs.
 // Counts only bot-tagged rows for the specific (A ↔ O) pair.
 // Idempotent: processes rows with id > lastSeenBankrecId only.
 export async function catchUpLedgerForPair(allianceId: number, offshoreId: number, take = 500): Promise<OffshoreLedger> {
