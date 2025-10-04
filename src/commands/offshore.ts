@@ -16,12 +16,14 @@
 // Perf:
 //   - Default window: OFFSH_HOLDINGS_LIMIT (env, default 200)
 //   - 60s cache for pairwise holdings; 5m cache for prices
+//   - Optional ledger fast-path (set OFFSH_USE_LEDGER=1)
 //
 // Env:
 //   BOT_ADMIN_DISCORD_ID
 //   PNW_BOT_KEY
 //   PNW_GRAPHQL_URL (optional)
 //   OFFSH_HOLDINGS_LIMIT (optional)
+//   OFFSH_USE_LEDGER=1 (optional)
 
 import {
   SlashCommandBuilder,
@@ -71,6 +73,7 @@ const GQL_URL = process.env.PNW_GRAPHQL_URL || "https://api.politicsandwar.com/g
 const OFFSH_HOLDINGS_LIMIT = Number(process.env.OFFSH_HOLDINGS_LIMIT || 200);
 const OFFSH_CACHE_MS = 60_000;  // pair net cache TTL (60s)
 const PRICE_CACHE_MS = 300_000; // price cache TTL (5m)
+const USE_LEDGER = process.env.OFFSH_USE_LEDGER === "1";
 
 // ---- Bot note tag ----
 const OFFSH_NOTE_TAG = "Gemstone Offsh";
@@ -144,9 +147,6 @@ async function getAllianceApiKeyFor(aid: number): Promise<string | null> {
 }
 
 // ---------- GraphQL: bankWithdraw (Alliance→Alliance for offshore) ----------
-// URL ?api_key=  → sender alliance key
-// HEAD X-Api-Key → offshore alliance key (actor)
-// HEAD X-Bot-Key → PNW_BOT_KEY
 async function bankWithdrawAllianceToAlliance(opts: {
   srcAllianceId: number;
   dstAllianceId: number;
@@ -298,6 +298,27 @@ function pairFieldsPretty(qtys: Partial<Record<Resource, number>>, prices: Price
   return { fields, total, missing };
 }
 
+// ---------- Optional fast-path via ledger (safe; falls back if unavailable) ----------
+async function tryLedgerNet(aid: number, offshoreAid: number): Promise<Record<string, number> | null> {
+  if (!USE_LEDGER) return null;
+  try {
+    // Dynamic import so we don't break build/types if names change.
+    const mod: any = await import("../lib/offshore_ledger");
+    const catchUp = mod?.catchUpLedgerForPair || mod?.["catchUpLedgerForPair"];
+    const readLedger = mod?.readLedger || mod?.["readLedger"];
+    if (!catchUp || !readLedger) return null;
+
+    // Small/zero catch-up; background job does heavy lifting.
+    try { await catchUp(prisma, aid, offshoreAid, { maxLoops: 0 }); } catch { /* ignore */ }
+    const net = await readLedger(prisma, aid, offshoreAid);
+    if (net && typeof net === "object") return net as Record<string, number>;
+    return null;
+  } catch (e) {
+    console.warn("[OFFSH_LEDGER_BG_ERR]", e);
+    return null;
+  }
+}
+
 // cached pairwise net; counts only bankrecs with our note tag when onlyMarked=true
 async function pairNetWithOffshore(aid: number, offshoreAid: number, take = OFFSH_HOLDINGS_LIMIT, onlyMarked = true) {
   const key = cacheKeyPair(aid, offshoreAid, take, onlyMarked);
@@ -305,6 +326,14 @@ async function pairNetWithOffshore(aid: number, offshoreAid: number, take = OFFS
   const cached = pairCache.get(key);
   if (cached && now - cached.at < OFFSH_CACHE_MS) return cached.net;
 
+  // 1) Try ledger fast-path first (if enabled).
+  const ledgerNet = await tryLedgerNet(aid, offshoreAid);
+  if (ledgerNet) {
+    pairCache.set(key, { at: now, net: ledgerNet });
+    return ledgerNet;
+  }
+
+  // 2) Fallback to live bankrecs scan (existing behavior).
   const rows = await fetchBankrecs(offshoreAid, { limit: take });
   const A = String(aid);
   const O = String(offshoreAid);
@@ -434,7 +463,6 @@ export async function execute(i: ChatInputCommandInteraction) {
         return i.editReply("Market data is unavailable right now. Please try again later.");
       }
 
-      // render pretty fields like /market_value
       const partial: Partial<Record<Resource, number>> = {
         money: Number(net.money || 0),
         food: Number(net.food || 0),
@@ -448,13 +476,13 @@ export async function execute(i: ChatInputCommandInteraction) {
         munitions: Number(net.munitions || 0),
         steel: Number(net.steel || 0),
         aluminum: Number(net.aluminum || 0),
-        // credits intentionally omitted for now
       };
 
       const { fields, total, missing } = pairFieldsPretty(partial, pricing.prices);
 
       const embed = new EmbedBuilder()
-        .setTitle("📊 Offshore Holdings — Your Alliance")
+        // 🔧 change: show calling alliance name in title
+        .setTitle(`📊 Offshore Holdings — ${alliance.name || alliance.id}`)
         .setColor(Colors.Green)
         .setDescription(
           [
@@ -472,6 +500,7 @@ export async function execute(i: ChatInputCommandInteraction) {
             .join(" • "),
         });
 
+      // 🔧 keep/ensure refresh button here
       const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder().setCustomId("offsh:check").setStyle(ButtonStyle.Secondary).setEmoji("🔄").setLabel("Refresh"),
       );
@@ -731,7 +760,8 @@ export async function handleButton(i: Interaction) {
       const { fields, total, missing } = pairFieldsPretty(partial, pricing.prices);
 
       const embed = new EmbedBuilder()
-        .setTitle("📊 Offshore Holdings — Your Alliance")
+        // 🔧 change: show calling alliance name in title
+        .setTitle(`📊 Offshore Holdings — ${alliance.name || alliance.id}`)
         .setColor(Colors.Green)
         .setDescription(
           [
@@ -749,7 +779,12 @@ export async function handleButton(i: Interaction) {
             .join(" • "),
         });
 
-      await (i as any).editReply({ embeds: [embed] });
+      // 🔧 keep/ensure refresh button here
+      const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId("offsh:check").setStyle(ButtonStyle.Secondary).setEmoji("🔄").setLabel("Refresh"),
+      );
+
+      await (i as any).editReply({ embeds: [embed], components: [row] });
       return;
     } catch (e) {
       console.error("[OFFSH_BTN_HOLDINGS_ERR]", e);
