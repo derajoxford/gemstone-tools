@@ -2,449 +2,354 @@
 import {
   SlashCommandBuilder,
   ChatInputCommandInteraction,
+  EmbedBuilder,
+  Colors,
   ButtonBuilder,
   ButtonStyle,
   ActionRowBuilder,
+  ButtonInteraction,
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
-  EmbedBuilder,
-  type Interaction,
-  type CacheType,
 } from "discord.js";
 import { PrismaClient } from "@prisma/client";
-
-import {
-  fetchAveragePrices,
-  computeTotalValue,
-  fmtMoney,
-  type Resource,
-  type PriceMap,
-} from "../lib/market.js";
-
-// Ledger helpers
-import { catchUpLedgerForPair, readHeldBalances } from "../lib/offshore_ledger.js";
-
-// local crypto (for alliance keys)
-import * as cryptoMod from "../lib/crypto.js";
-const open = (cryptoMod as any).open as (cipher: Uint8Array, nonce: Uint8Array) => string;
-
-// Tag we embed into notes so our ledger scanner can trust transactions
-const OFFSH_NOTE_TAG = "Gemstone Offsh";
-
-// Node 20+: global fetch
-const httpFetch: typeof fetch = (globalThis as any).fetch;
+import { ORDER, RES_EMOJI } from "../lib/emojis";
+import { open } from "../lib/crypto.js";
+// Optional: if you want to advance the ledger before showing holdings
+import { catchUpLedgerForPair } from "../lib/offshore_ledger";
 
 const prisma = new PrismaClient();
 
-const E: Record<Resource, string> = {
-  money: "💵",
-  food: "🍞",
-  coal: "⚫",
-  oil: "🛢️",
-  uranium: "☢️",
-  lead: "🔩",
-  iron: "⛓️",
-  bauxite: "🧱",
-  gasoline: "⛽",
-  munitions: "💣",
-  steel: "🛠️",
-  aluminum: "🧪",
-  credits: "🎟️",
+// ---------- config ----------
+const SEND_PAGE_SIZE = 4; // 4 inputs per modal page (Discord max = 5; we keep 1 slot free)
+const SEND_NOTE_ON_LAST_PAGE = true;
+const NOTE_KEY = "__note__";
+
+// simple per-user session for the send flow
+type SendSession = {
+  sourceAid: number;
+  offshoreAid: number;
+  data: Record<string, number>;
+  note?: string;
+  createdAt: number;
 };
+const sendSessions = new Map<string, SendSession>();
 
-const ORDER: Array<{ key: Resource; label: string }> = [
-  { key: "money", label: "Money" },
-  { key: "food", label: "Food" },
-  { key: "coal", label: "Coal" },
-  { key: "oil", label: "Oil" },
-  { key: "uranium", label: "Uranium" },
-  { key: "lead", label: "Lead" },
-  { key: "iron", label: "Iron" },
-  { key: "bauxite", label: "Bauxite" },
-  { key: "gasoline", label: "Gasoline" },
-  { key: "munitions", label: "Munitions" },
-  { key: "steel", label: "Steel" },
-  { key: "aluminum", label: "Aluminum" },
-];
+// ---------- helpers ----------
+function fmtLine(k: string, v: number) {
+  return `${RES_EMOJI[k] ?? ""} ${k}: ${Number(v).toLocaleString()}`;
+}
 
-async function resolveAllianceAndOffshore(i: ChatInputCommandInteraction) {
-  const guildLink = await prisma.allianceGuild.findFirst({
-    where: { guildId: i.guildId! },
-    include: { alliance: true },
+function parseNum(s: string): number {
+  if (!s) return 0;
+  const cleaned = s.replace(/[, _]/g, "");
+  const n = Number(cleaned);
+  return Number.isFinite(n) && n >= 0 ? n : NaN;
+}
+
+async function findAllianceForGuild(guildId?: string) {
+  if (!guildId) return null;
+  const map = await prisma.allianceGuild.findUnique({ where: { guildId } });
+  if (map) {
+    const a = await prisma.alliance.findUnique({ where: { id: map.allianceId } });
+    if (a) return a;
+  }
+  return await prisma.alliance.findFirst({ where: { guildId } });
+}
+
+async function resolveOffshoreAidForAlliance(aid: number): Promise<number | null> {
+  const a = await prisma.alliance.findUnique({ where: { id: aid } });
+  if (a?.offshoreOverrideAllianceId) return a.offshoreOverrideAllianceId;
+  const setting = await prisma.setting.findUnique({ where: { key: "default_offshore_aid" } });
+  const v = (setting?.value as any)?.aid;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function sliceKeys(page: number) {
+  const s = page * SEND_PAGE_SIZE;
+  return ORDER.slice(s, s + SEND_PAGE_SIZE);
+}
+
+function pageCount() {
+  return Math.ceil(ORDER.length / SEND_PAGE_SIZE);
+}
+
+function buildSendSummary(sess: SendSession) {
+  const lines = Object.entries(sess.data)
+    .filter(([, v]) => Number(v) > 0)
+    .map(([k, v]) => fmtLine(k, v));
+  return lines.join(" · ") || "— none —";
+}
+
+// ---------- show holdings ----------
+async function showHoldings(i: ChatInputCommandInteraction) {
+  const alliance = await findAllianceForGuild(i.guildId ?? undefined);
+  if (!alliance) return i.reply({ content: "This server is not linked yet. Run /setup_alliance first.", ephemeral: true });
+
+  const offshoreAid = await resolveOffshoreAidForAlliance(alliance.id);
+  if (!offshoreAid) return i.reply({ content: "No offshore alliance configured.", ephemeral: true });
+
+  // Ensure ledger is caught up quickly (best effort)
+  try { await catchUpLedgerForPair(prisma, alliance.id, offshoreAid); } catch {}
+
+  const ledger = await prisma.offshoreLedger.findUnique({
+    where: { allianceId_offshoreId: { allianceId: alliance.id, offshoreId: offshoreAid } },
   });
-  if (!guildLink?.alliance) {
-    throw new Error("This server isn’t linked to an alliance. Use /guild_link_alliance first.");
-  }
-  const alliance = guildLink.alliance;
 
-  let offshoreAid: number | null = alliance.offshoreOverrideAllianceId ?? null;
-  if (!offshoreAid) {
-    const s = await prisma.setting.findUnique({ where: { key: "default_offshore_aid" } });
-    const v = (s?.value as any) || null;
-    if (v && typeof v.aid === "number") offshoreAid = v.aid;
-  }
-  if (!offshoreAid) throw new Error("No offshore alliance configured.");
+  const embed = new EmbedBuilder()
+    .setTitle(`📊 Offshore Holdings — ${alliance.id}`)
+    .setDescription(`${alliance.id} held in offshore ${offshoreAid}\nRunning balance (bot-tagged only)`)
+    .setColor(Colors.Blurple);
 
-  return { alliance, offshoreAid };
+  if (ledger) {
+    const entries: string[] = [];
+    for (const k of ORDER) {
+      const v = Number((ledger as any)[k] || 0);
+      if (v > 0) entries.push(fmtLine(k, v));
+    }
+    embed.addFields({ name: "Balances", value: entries.join("\n") || "— none —", inline: false });
+  } else {
+    embed.addFields({ name: "Balances", value: "— none —", inline: false });
+  }
+
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("offsh:refresh").setStyle(ButtonStyle.Secondary).setLabel("Refresh Now"),
+    new ButtonBuilder().setCustomId("offsh:send:open:0").setStyle(ButtonStyle.Primary).setLabel("Send to Offshore"),
+  );
+
+  await i.reply({ embeds: [embed], components: [row], ephemeral: true });
 }
 
-async function decryptLatestKeys(aid: number): Promise<{ apiKey?: string; botKey?: string }> {
-  const k = await prisma.allianceKey.findFirst({
-    where: { allianceId: aid },
-    orderBy: { id: "desc" },
-  });
-  if (!k) return {};
-  const out: { apiKey?: string; botKey?: string } = {};
-  try {
-    if (k.encryptedApiKey && k.nonceApi) out.apiKey = open(k.encryptedApiKey as any, k.nonceApi as any);
-  } catch {}
-  try {
-    if (k.encryptedBotKey && k.nonceBot) out.botKey = open(k.encryptedBotKey as any, k.nonceBot as any);
-  } catch {}
-  return out;
-}
+// ---------- modal flow (all 12 resources, paged) ----------
+async function openSendModal(i: ButtonInteraction, page: number) {
+  const alliance = await findAllianceForGuild(i.guildId ?? undefined);
+  if (!alliance) return i.reply({ content: "No alliance linked here.", ephemeral: true });
 
-async function bankWithdraw({
-  sourceAidApiKey,
-  offshoreAidApiKey,
-  botKey,
-  receiverAid,
-  payload, // { money?: number, ...; note?: string }
-}: {
-  sourceAidApiKey: string;
-  offshoreAidApiKey: string;
-  botKey: string;
-  receiverAid: number;
-  payload: { [k in Resource]?: number } & { note?: string };
-}) {
-  const url =
-    (process.env.PNW_GRAPHQL_URL || "https://api.politicsandwar.com/graphql") +
-    "?api_key=" +
-    encodeURIComponent(sourceAidApiKey);
+  const offshoreAid = await resolveOffshoreAidForAlliance(alliance.id);
+  if (!offshoreAid) return i.reply({ content: "No offshore alliance configured.", ephemeral: true });
 
-  const fields: string[] = [];
-  for (const k of Object.keys(payload)) {
-    if (k === "note") continue;
-    const v = (payload as any)[k];
-    if (typeof v === "number" && v > 0) fields.push(`${k}:${v}`);
+  // init session if missing
+  if (!sendSessions.has(i.user.id)) {
+    sendSessions.set(i.user.id, { sourceAid: alliance.id, offshoreAid, data: {}, createdAt: Date.now() });
   }
-  const note = payload.note ? `, note: ${JSON.stringify(payload.note)}` : "";
-  const args = `receiver:${receiverAid}, receiver_type:2${fields.length ? ", " + fields.join(", ") : ""}${note}`;
+  const sess = sendSessions.get(i.user.id)!;
 
-  const body = { query: `mutation { bankWithdraw(${args}) { id } }` };
+  // modal
+  const total = pageCount();
+  const keys = sliceKeys(page);
+  const modal = new ModalBuilder().setCustomId(`offsh:send:modal:${page}`).setTitle(`Send to Offshore (${page + 1}/${total})`);
 
-  const resp = await httpFetch(url, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "X-Api-Key": offshoreAidApiKey,
-      "X-Bot-Key": botKey,
-    },
-    body: JSON.stringify(body),
-  });
-  const j = (await resp.json().catch(() => ({}))) as any;
-  if (j?.errors?.length) {
-    throw new Error(j.errors[0]?.message || "PnW error");
-  }
-  return j?.data?.bankWithdraw?.id as string | undefined;
-}
-
-export const data = new SlashCommandBuilder()
-  .setName("offshore")
-  .setDescription("Send funds to the configured offshore and/or view current offshore holdings.")
-  .addSubcommand((s) => s.setName("send").setDescription("Open a form to send funds to the offshore."))
-  .addSubcommand((s) => s.setName("show").setDescription("Show your alliance’s holdings in the offshore."));
-
-export async function execute(i: ChatInputCommandInteraction) {
-  try {
-    if (i.options.getSubcommand() === "send") {
-      const modal = new ModalBuilder().setCustomId("offsh_send_modal").setTitle("Send to Offshore");
-      const amount = new TextInputBuilder()
-        .setCustomId("money")
-        .setLabel("Money (leave blank for 0)")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(false);
-      const note = new TextInputBuilder()
-        .setCustomId("note")
-        .setLabel("Note (optional)")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(false);
-      const row1 = new ActionRowBuilder<TextInputBuilder>().addComponents(amount);
-      const row2 = new ActionRowBuilder<TextInputBuilder>().addComponents(note);
-      modal.addComponents(row1, row2);
-      await i.showModal(modal);
-      return;
-    }
-
-    // show
-    await i.deferReply({ ephemeral: true });
-
-    const { alliance, offshoreAid } = await resolveAllianceAndOffshore(i);
-
-    // background refresh (non-blocking)
-    catchUpLedgerForPair(prisma, alliance.id, offshoreAid).catch((e) =>
-      console.warn("[OFFSH_LEDGER_BG_ERR]", e?.message || e)
-    );
-
-    const held = await readHeldBalances(prisma, alliance.id, offshoreAid);
-
-    const pricing = await fetchAveragePrices();
-    const prices = pricing?.prices || ({} as PriceMap);
-    const asOf = pricing?.asOf ?? Date.now();
-    const priceSource = pricing?.source ?? "REST avg";
-
-    const get = (k: Resource) => Number((held as any)[k] ?? 0);
-    const val: Record<Resource, number> = {
-      money: get("money"),
-      food: get("food"),
-      coal: get("coal"),
-      oil: get("oil"),
-      uranium: get("uranium"),
-      lead: get("lead"),
-      iron: get("iron"),
-      bauxite: get("bauxite"),
-      gasoline: get("gasoline"),
-      munitions: get("munitions"),
-      steel: get("steel"),
-      aluminum: get("aluminum"),
-      credits: 0,
-    };
-
-    const fields: { name: string; value: string; inline: boolean }[] = [];
-    let any = false;
-
-    const priceOf = (r: Resource) =>
-      Number.isFinite(prices[r] as number) ? (prices[r] as number) : undefined;
-
-    for (const { key, label } of ORDER) {
-      const qty = val[key];
-      if (!qty || qty <= 0) continue;
-      const qtyStr =
-        key === "money" ? `$${Math.round(qty).toLocaleString("en-US")}` : qty.toLocaleString("en-US");
-      const p = priceOf(key);
-      if (p === undefined) {
-        fields.push({ name: `${E[key]} ${label}`, value: `*price unavailable*\n${qtyStr}`, inline: true });
-        any = true;
-        continue;
-      }
-      const priceStr = key === "money" ? "$1" : `$${Math.round(p).toLocaleString("en-US")}`;
-      const valueStr = fmtMoney(qty * (key === "money" ? 1 : p));
-      fields.push({ name: `${E[key]} ${label}`, value: `**${valueStr}**\n${qtyStr} × ${priceStr}`, inline: true });
-      any = true;
-    }
-
-    if (!any && val.money > 0) {
-      fields.push({
-        name: `${E.money} Money`,
-        value: `**${fmtMoney(val.money)}**\n$${Math.round(val.money).toLocaleString("en-US")} × $1`,
-        inline: true,
-      });
-    }
-
-    const total = computeTotalValue(
-      {
-        money: val.money,
-        food: val.food,
-        coal: val.coal,
-        oil: val.oil,
-        uranium: val.uranium,
-        lead: val.lead,
-        iron: val.iron,
-        bauxite: val.bauxite,
-        gasoline: val.gasoline,
-        munitions: val.munitions,
-        steel: val.steel,
-        aluminum: val.aluminum,
-      },
-      prices
-    );
-
-    const embed = new EmbedBuilder()
-      .setTitle(`📊 Offshore Holdings — ${alliance.name || alliance.id}`)
-      .setDescription(
-        `${alliance.id} held in offshore ${offshoreAid}\nRunning balance (bot-tagged only • note contains “${OFFSH_NOTE_TAG}”)`
-      )
-      .addFields(
-        ...fields,
-        { name: "Total Market Value", value: `🎯 **${fmtMoney(total)}**`, inline: false }
-      )
-      .setFooter({ text: `Prices: ${priceSource} • As of ${new Date(asOf).toLocaleString()}` });
-
-    const btnRefresh = new ButtonBuilder()
-      .setCustomId("offsh_holdings_refresh")
-      .setLabel("Refresh Now")
-      .setStyle(ButtonStyle.Secondary);
-
-    const btnSend = new ButtonBuilder()
-      .setCustomId("offsh_send_open")
-      .setLabel("Send to Offshore")
-      .setStyle(ButtonStyle.Primary);
-
-    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(btnRefresh, btnSend);
-    await i.editReply({ embeds: [embed], components: [row] });
-  } catch (err: any) {
-    const msg = err?.message || "Couldn’t compute holdings right now. Try again shortly.";
-    try {
-      await i.reply({ content: msg, ephemeral: true });
-    } catch {
-      try {
-        await i.editReply({ content: msg });
-      } catch {}
-    }
-  }
-}
-
-export async function handleButton(i: Interaction<CacheType>) {
-  if (!i.isButton()) return;
-
-  if (i.customId === "offsh_send_open") {
-    const modal = new ModalBuilder().setCustomId("offsh_send_modal").setTitle("Send to Offshore");
-    const amount = new TextInputBuilder()
-      .setCustomId("money")
-      .setLabel("Money (leave blank for 0)")
+  for (const k of keys) {
+    const input = new TextInputBuilder()
+      .setCustomId(k)
+      .setLabel(`${RES_EMOJI[k] ?? ""} ${k} (leave blank for 0)`)
       .setStyle(TextInputStyle.Short)
-      .setRequired(false);
+      .setRequired(false)
+      .setPlaceholder(sess.data[k] ? String(sess.data[k]) : "0");
+    modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+  }
+
+  // add note field on the last page (optional)
+  if (SEND_NOTE_ON_LAST_PAGE && page === total - 1) {
     const note = new TextInputBuilder()
-      .setCustomId("note")
+      .setCustomId(NOTE_KEY)
       .setLabel("Note (optional)")
       .setStyle(TextInputStyle.Short)
-      .setRequired(false);
-    const row1 = new ActionRowBuilder<TextInputBuilder>().addComponents(amount);
-    const row2 = new ActionRowBuilder<TextInputBuilder>().addComponents(note);
-    modal.addComponents(row1, row2);
-    await i.showModal(modal);
-    return;
+      .setRequired(false)
+      .setPlaceholder(sess.note ?? "");
+    modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(note));
   }
 
-  if (i.customId === "offsh_holdings_refresh") {
-    await i.deferUpdate();
-    try {
-      const guildLink = await prisma.allianceGuild.findFirst({
-        where: { guildId: i.guildId! },
-        include: { alliance: true },
-      });
-      if (!guildLink?.alliance) throw new Error("Server not linked to an alliance.");
-      const alliance = guildLink.alliance;
+  await i.showModal(modal);
+}
 
-      let offshoreAid: number | null = alliance.offshoreOverrideAllianceId ?? null;
-      if (!offshoreAid) {
-        const s = await prisma.setting.findUnique({ where: { key: "default_offshore_aid" } });
-        const v = (s?.value as any) || null;
-        if (v && typeof v.aid === "number") offshoreAid = v.aid;
-      }
-      if (!offshoreAid) throw new Error("No offshore alliance configured.");
+async function handleSendModal(i: any) {
+  const m = String(i.customId).match(/^offsh:send:modal:(\d+)$/);
+  if (!m) return;
+  const page = Number(m[1]);
+  const total = pageCount();
 
-      await catchUpLedgerForPair(prisma, alliance.id, offshoreAid);
-      const held = await readHeldBalances(prisma, alliance.id, offshoreAid);
+  const sess = sendSessions.get(i.user.id);
+  if (!sess) return i.reply({ content: "Session expired. Press **Send to Offshore** again.", ephemeral: true });
 
-      const pricing = await fetchAveragePrices();
-      const prices = pricing?.prices || ({} as PriceMap);
-      const asOf = pricing?.asOf ?? Date.now();
-      const priceSource = pricing?.source ?? "REST avg";
-
-      const get = (k: Resource) => Number((held as any)[k] ?? 0);
-      const val = {
-        money: get("money"),
-        food: get("food"),
-        coal: get("coal"),
-        oil: get("oil"),
-        uranium: get("uranium"),
-        lead: get("lead"),
-        iron: get("iron"),
-        bauxite: get("bauxite"),
-        gasoline: get("gasoline"),
-        munitions: get("munitions"),
-        steel: get("steel"),
-        aluminum: get("aluminum"),
-      };
-
-      const fields: { name: string; value: string; inline: boolean }[] = [];
-      const priceOf = (r: Resource) =>
-        Number.isFinite(prices[r] as number) ? (prices[r] as number) : undefined;
-
-      for (const { key, label } of ORDER) {
-        const qty = (val as any)[key] as number;
-        if (!qty || qty <= 0) continue;
-        const qtyStr = key === "money" ? `$${Math.round(qty).toLocaleString("en-US")}` : qty.toLocaleString("en-US");
-        const p = priceOf(key);
-        if (p === undefined) {
-          fields.push({ name: `${E[key]} ${label}`, value: `*price unavailable*\n${qtyStr}`, inline: true });
-          continue;
-        }
-        const priceStr = key === "money" ? "$1" : `$${Math.round(p).toLocaleString("en-US")}`;
-        const valueStr = fmtMoney(qty * (key === "money" ? 1 : p));
-        fields.push({ name: `${E[key]} ${label}`, value: `**${valueStr}**\n${qtyStr} × ${priceStr}`, inline: true });
-      }
-
-      const total = computeTotalValue(val as any, prices);
-      const embed = new EmbedBuilder()
-        .setTitle(`📊 Offshore Holdings — ${alliance.name || alliance.id}`)
-        .setDescription(
-          `${alliance.id} held in offshore ${offshoreAid}\nRunning balance (bot-tagged only • note contains “${OFFSH_NOTE_TAG}”)`
-        )
-        .addFields(
-          ...fields,
-          { name: "Total Market Value", value: `🎯 **${fmtMoney(total)}**`, inline: false }
-        )
-        .setFooter({ text: `Prices: ${priceSource} • As of ${new Date(asOf).toLocaleString()}` });
-
-      await i.editReply({ embeds: [embed] });
-    } catch (e: any) {
-      await i.editReply({ content: e?.message || "Refresh failed. Try again shortly." });
+  // collect this page
+  const keys = sliceKeys(page);
+  for (const k of keys) {
+    const raw = (i.fields.getTextInputValue(k) || "").trim();
+    if (!raw) { delete sess.data[k]; continue; }
+    const num = parseNum(raw);
+    if (!Number.isFinite(num) || num < 0) {
+      return i.reply({ content: `Invalid number for ${k}.`, ephemeral: true });
     }
+    sess.data[k] = num;
+  }
+  if (SEND_NOTE_ON_LAST_PAGE && page === total - 1) {
+    const noteRaw = (i.fields.getTextInputValue(NOTE_KEY) || "").trim();
+    sess.note = noteRaw || undefined;
+  }
+  sendSessions.set(i.user.id, sess);
+
+  // build nav buttons
+  const btns: ButtonBuilder[] = [];
+  if (page > 0) btns.push(new ButtonBuilder().setCustomId(`offsh:send:open:${page - 1}`).setLabel("◀ Prev").setStyle(ButtonStyle.Secondary));
+  if (page < total - 1) {
+    btns.push(new ButtonBuilder().setCustomId(`offsh:send:open:${page + 1}`).setLabel(`Next (${page + 2}/${total}) ▶`).setStyle(ButtonStyle.Primary));
+  } else {
+    btns.push(new ButtonBuilder().setCustomId("offsh:send:review").setLabel("Review").setStyle(ButtonStyle.Success));
+  }
+  btns.push(new ButtonBuilder().setCustomId("offsh:send:cancel").setLabel("Cancel").setStyle(ButtonStyle.Danger));
+
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(...btns);
+  const summary = buildSendSummary(sess);
+  await i.reply({ content: `Saved so far:\n${summary}`, components: [row], ephemeral: true });
+}
+
+async function showSendReview(i: ButtonInteraction) {
+  const sess = sendSessions.get(i.user.id);
+  if (!sess) return i.reply({ content: "Session expired. Press **Send to Offshore** again.", ephemeral: true });
+
+  const summary = buildSendSummary(sess);
+  const embed = new EmbedBuilder()
+    .setTitle(`Send to Offshore — Review`)
+    .setDescription(`From **${sess.sourceAid}** → **${sess.offshoreAid}**`)
+    .addFields({ name: "Amounts", value: summary || "— none —" })
+    .setColor(Colors.Blurple);
+
+  if (sess.note) embed.addFields({ name: "Note", value: sess.note });
+
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("offsh:send:confirm").setStyle(ButtonStyle.Success).setLabel("Confirm"),
+    new ButtonBuilder().setCustomId("offsh:send:cancel").setStyle(ButtonStyle.Danger).setLabel("Cancel"),
+  );
+
+  await i.reply({ embeds: [embed], components: [row], ephemeral: true });
+}
+
+// minimal GQL call to PnW to send A->A
+async function sendAllianceToAlliance(opts: {
+  sourceAid: number;
+  offshoreAid: number;
+  payload: Record<string, number>;
+  note?: string;
+}): Promise<boolean> {
+  // pull latest API key for the source alliance
+  const alliance = await prisma.alliance.findUnique({
+    where: { id: opts.sourceAid },
+    include: { keys: { orderBy: { id: "desc" }, take: 1 } },
+  });
+  const apiKeyEnc = alliance?.keys[0];
+  const apiKey = apiKeyEnc ? open(apiKeyEnc.encryptedApiKey as any, apiKeyEnc.nonceApi as any) : (process.env.PNW_DEFAULT_API_KEY || "");
+  const botKey = process.env.PNW_BOT_KEY || "";
+
+  if (!apiKey || !botKey) return false;
+
+  const fields = Object.entries(opts.payload)
+    .filter(([, v]) => Number(v) > 0)
+    .map(([k, v]) => `${k}:${Number(v)}`);
+  if (opts.note) fields.push(`note:${JSON.stringify(opts.note)}`);
+
+  const q = `mutation{
+    bankWithdraw(receiver:${opts.offshoreAid}, receiver_type:2, ${fields.join(",")}) { id }
+  }`;
+
+  const fetchFn: any = (globalThis as any).fetch;
+  const url = "https://api.politicsandwar.com/graphql?api_key=" + encodeURIComponent(apiKey);
+  const res = await fetchFn(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Api-Key": apiKey,
+      "X-Bot-Key": botKey,
+    },
+    body: JSON.stringify({ query: q }),
+  }).catch(() => null);
+
+  if (!res) return false;
+  let data: any = {};
+  try { data = await res.json(); } catch {}
+
+  if (!res.ok || data?.errors) {
+    console.error("[OFFSH_SEND_ERR]", res.status, JSON.stringify(data));
+    return false;
+  }
+  return Boolean(data?.data?.bankWithdraw?.id);
+}
+
+async function confirmSend(i: ButtonInteraction) {
+  const sess = sendSessions.get(i.user.id);
+  if (!sess) return i.reply({ content: "Session expired. Press **Send to Offshore** again.", ephemeral: true });
+
+  const payload = Object.fromEntries(
+    Object.entries(sess.data).filter(([, v]) => Number(v) > 0)
+  );
+
+  if (!Object.keys(payload).length) {
+    return i.reply({ content: "Nothing to send — all zeros.", ephemeral: true });
+  }
+
+  const ok = await sendAllianceToAlliance({
+    sourceAid: sess.sourceAid,
+    offshoreAid: sess.offshoreAid,
+    payload,
+    note: sess.note || undefined,
+  });
+
+  if (ok) {
+    sendSessions.delete(i.user.id);
+    await i.reply({ content: "✅ Sent to offshore.", ephemeral: true });
+  } else {
+    await i.reply({ content: "⚠️ Send failed. Check API/Bot keys and try again.", ephemeral: true });
   }
 }
 
-export async function handleModal(i: Interaction<CacheType>) {
-  if (!i.isModalSubmit()) return;
-  if (i.customId !== "offsh_send_modal") return;
+function cancelSend(i: ButtonInteraction) {
+  sendSessions.delete(i.user.id);
+  return i.reply({ content: "Canceled.", ephemeral: true });
+}
 
-  await i.deferReply({ ephemeral: true });
+// ---------- exports required by index.ts ----------
+export const data = new SlashCommandBuilder()
+  .setName("offshore")
+  .setDescription("Offshore tools")
+  .addSubcommand((s) => s.setName("show").setDescription("Show offshore holdings"));
 
+export async function execute(i: ChatInputCommandInteraction) {
+  const sub = i.options.getSubcommand() || "show";
+  if (sub === "show") return showHoldings(i);
+}
+
+// Buttons & Modals are routed by index.ts via customId prefix "offsh:"
+export async function handleButton(i: ButtonInteraction) {
   try {
-    const guildLink = await prisma.allianceGuild.findFirst({
-      where: { guildId: i.guildId! },
-      include: { alliance: true },
-    });
-    if (!guildLink?.alliance) throw new Error("Server not linked to an alliance.");
-    const alliance = guildLink.alliance;
+    const id = String(i.customId);
 
-    let offshoreAid: number | null = alliance.offshoreOverrideAllianceId ?? null;
-    if (!offshoreAid) {
-      const s = await prisma.setting.findUnique({ where: { key: "default_offshore_aid" } });
-      const v = (s?.value as any) || null;
-      if (v && typeof v.aid === "number") offshoreAid = v.aid;
+    if (id === "offsh:refresh") {
+      // re-show to refresh
+      const fake = i as unknown as ChatInputCommandInteraction;
+      return showHoldings(fake);
     }
-    if (!offshoreAid) throw new Error("No offshore alliance configured.");
 
-    const srcKeys = await decryptLatestKeys(alliance.id);
-    const offKeys = await decryptLatestKeys(offshoreAid);
+    if (id.startsWith("offsh:send:open")) {
+      const m = id.match(/^offsh:send:open:(\d+)$/);
+      const page = m ? Number(m[1]) : 0;
+      return openSendModal(i, page);
+    }
 
-    if (!srcKeys.apiKey) throw new Error("No API key saved for your alliance.");
-    if (!offKeys.apiKey) throw new Error("No API key saved for the offshore alliance.");
-    if (!offKeys.botKey) throw new Error("No bot (mutations) key saved for the offshore alliance.");
+    if (id === "offsh:send:review") return showSendReview(i);
+    if (id === "offsh:send:confirm") return confirmSend(i);
+    if (id === "offsh:send:cancel") return cancelSend(i);
+  } catch (err) {
+    console.error("[OFFSH_BTN_ERR]", err);
+    try { await i.reply({ content: "Something went wrong.", ephemeral: true }); } catch {}
+  }
+}
 
-    const moneyStr = i.fields.getTextInputValue("money")?.trim() || "";
-    const noteStr = i.fields.getTextInputValue("note")?.trim() || "";
-
-    const money = moneyStr ? Math.max(0, Number(moneyStr)) : 0;
-    const note = `${OFFSH_NOTE_TAG} • src ${alliance.id} -> off ${offshoreAid}${noteStr ? ` • ${noteStr}` : ""}`;
-
-    const id = await bankWithdraw({
-      sourceAidApiKey: srcKeys.apiKey!,
-      offshoreAidApiKey: offKeys.apiKey!,
-      botKey: offKeys.botKey!,
-      receiverAid: offshoreAid,
-      payload: { money, note },
-    });
-
-    await i.editReply(
-      id
-        ? `✅ Sent request **#${id}** — ${money ? `$${money.toLocaleString("en-US")}` : "no funds"} to ${offshoreAid}.`
-        : "✅ Request accepted (no id returned)."
-    );
-  } catch (err: any) {
-    await i.editReply(`❌ Send failed: ${err?.message || "Unknown error"}`);
+export async function handleModal(i: any) {
+  try {
+    return handleSendModal(i);
+  } catch (err) {
+    console.error("[OFFSH_MODAL_ERR]", err);
+    try { await i.reply({ content: "Something went wrong.", ephemeral: true }); } catch {}
   }
 }
