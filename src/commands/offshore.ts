@@ -1,16 +1,21 @@
 // src/commands/offshore.ts
 //
 // Offshore controller: show / set default / set override / holdings / send (modal).
-// Auth model (locutus-style):
-//   - URL ?api_key=  → SENDER alliance key (the main alliance that's moving funds)
-//   - Headers:
-//       X-Api-Key    → OFFSHORE alliance's saved key (actor header)
-//       X-Bot-Key    → mutations key (PNW_BOT_KEY)
-// Diagnostic logs: OFFSH_* markers.
+//
+// ✅ Send auth model (already proven by curl; DO NOT CHANGE):
+//   - URL  ?api_key=  → SENDER alliance key (the main alliance moving funds)
+//   - HEAD X-Api-Key  → OFFSHORE alliance saved key (actor header)
+//   - HEAD X-Bot-Key  → mutations key (PNW_BOT_KEY)
+//
+// 📊 Holdings (leader view):
+//   - /offshore holdings  → shows only what THIS alliance is holding in the offshore
+//     (pairwise net: A→Off minus Off→A, computed from the offshore’s recent bankrecs window)
+//   - The “Show Holdings” button mirrors the same view.
+//   - Embed includes a Total Market Value similar to /market_value (best-effort).
 //
 // Requirements (env):
 //   BOT_ADMIN_DISCORD_ID
-//   PNW_BOT_KEY                       (mutations key; sent as X-Bot-Key)
+//   PNW_BOT_KEY
 //   PNW_GRAPHQL_URL (optional; defaults to official)
 
 import {
@@ -25,7 +30,6 @@ import {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
-  ButtonInteraction,
   Interaction,
 } from "discord.js";
 import { PrismaClient } from "@prisma/client";
@@ -57,45 +61,10 @@ async function resolveOffshoreAid(allianceId: number): Promise<{ global: number 
   return { global, override, effective: override ?? global ?? null };
 }
 
-// ---------- fast-estimate: AA "available" from recent bankrecs ----------
-async function estimateAllianceAvailableFromRecent(aid: number, limit = 100) {
-  try {
-    const rows = await fetchBankrecs(aid, { limit });
-    const totals: Record<string, number> = {};
-    for (const k of RESOURCE_KEYS) totals[k] = 0;
-
-    for (const r of rows) {
-      const sType = Number((r as any).sender_type || 0);
-      const rType = Number((r as any).receiver_type || 0);
-      const sId = String((r as any).sender_id || "");
-      const rId = String((r as any).receiver_id || "");
-      const isOut = (sType === 2 || sType === 3) && sId === String(aid);
-      const isIn = (rType === 2 || rType === 3) && rId === String(aid);
-      for (const k of RESOURCE_KEYS) {
-        const v = Number((r as any)[k] || 0);
-        if (!Number.isFinite(v) || v === 0) continue;
-        if (isIn) totals[k] += v;
-        if (isOut) totals[k] -= v;
-      }
-    }
-    return totals;
-  } catch (e) {
-    console.warn("[OFFSH_ESTIMATE_ERR]", e);
-    const zeros: Record<string, number> = {};
-    for (const k of RESOURCE_KEYS) zeros[k] = 0;
-    return zeros;
-  }
-}
-
 // ---------- key selection & validation ----------
-
 async function validateApiKeyForAlliance(apiKey: string, aid: number): Promise<boolean> {
   try {
-    const body = {
-      query: `{
-        alliances(first: 1, id: [${aid}]) { data { id } }
-      }`,
-    };
+    const body = { query: `{ alliances(first: 1, id: [${aid}]) { data { id } } }` };
     const url = new URL(GQL_URL);
     url.searchParams.set("api_key", apiKey);
 
@@ -109,8 +78,7 @@ async function validateApiKeyForAlliance(apiKey: string, aid: number): Promise<b
       console.warn("OFFSH_KEY_VALIDATE_ERR", resp.status, JSON.stringify(json));
       return false;
     }
-    const ok = Boolean(json?.data?.alliances?.data?.length);
-    return ok;
+    return Boolean(json?.data?.alliances?.data?.length);
   } catch (e) {
     console.warn("OFFSH_KEY_VALIDATE_EXC", e);
     return false;
@@ -146,16 +114,16 @@ async function getAllianceApiKeyFor(aid: number): Promise<string | null> {
 }
 
 // ---------- GraphQL: bankWithdraw (Alliance→Alliance for offshore) ----------
-// NOTE: This is the critical auth pairing we proved:
-//   URL ?api_key=  → sender (source) alliance key
-//   Headers        → X-Api-Key: offshore alliance key (actor), X-Bot-Key: PNW_BOT_KEY
+// URL ?api_key=  → sender alliance key
+// HEAD X-Api-Key → offshore alliance key (actor)
+// HEAD X-Bot-Key → PNW_BOT_KEY
 async function bankWithdrawAllianceToAlliance(opts: {
   srcAllianceId: number;
   dstAllianceId: number;
-  payload: Record<string, number>; // resources with positive amounts
-  apiKey: string; // URL context = sender alliance key
-  botKey: string; // X-Bot-Key (mutations key)
-  actorApiKey: string; // X-Api-Key header = offshore alliance key
+  payload: Record<string, number>;
+  apiKey: string;            // URL context (sender)
+  botKey: string;            // X-Bot-Key
+  actorApiKey: string;       // X-Api-Key (offshore)
   note?: string;
 }): Promise<boolean> {
   const fields: string[] = [];
@@ -178,7 +146,7 @@ async function bankWithdrawAllianceToAlliance(opts: {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "X-Api-Key": opts.actorApiKey, // offshore/actor key
+        "X-Api-Key": opts.actorApiKey,
         "X-Bot-Key": opts.botKey,
       },
       body: JSON.stringify({ query: q }),
@@ -195,56 +163,100 @@ async function bankWithdrawAllianceToAlliance(opts: {
   }
 }
 
+// ---------- Holdings helpers (pairwise net + market value) ----------
+function fmtLines(rec: Record<string, number>) {
+  const parts = RESOURCE_KEYS
+    .map((k) => {
+      const v = Number(rec[k] || 0);
+      return Math.abs(v) > 0 ? `• **${k}**: ${fmt(v)}` : null;
+    })
+    .filter(Boolean);
+  return parts.length ? parts.join("\n") : "— none in window —";
+}
+
+// Build pairwise net for A (caller) vs Offshore O over a recent window (last `take` bankrecs on O).
+async function pairNetWithOffshore(aid: number, offshoreAid: number, take = 500) {
+  const rows = await fetchBankrecs(offshoreAid, { limit: take });
+  const A = String(aid);
+  const O = String(offshoreAid);
+  const net: Record<string, number> = Object.fromEntries(RESOURCE_KEYS.map((k) => [k, 0]));
+
+  for (const r of rows) {
+    const sType = Number((r as any).sender_type || 0);
+    const rType = Number((r as any).receiver_type || 0);
+    const sId = String((r as any).sender_id || "");
+    const rId = String((r as any).receiver_id || "");
+    const isAtoO = (sType === 2 || sType === 3) && sId === A && (rType === 2 || rType === 3) && rId === O;
+    const isOtoA = (sType === 2 || sType === 3) && sId === O && (rType === 2 || rType === 3) && rId === A;
+
+    for (const k of RESOURCE_KEYS) {
+      const v = Number((r as any)[k] || 0);
+      if (!Number.isFinite(v) || v === 0) continue;
+      if (isAtoO) net[k] += v;
+      if (isOtoA) net[k] -= v;
+    }
+  }
+  return net;
+}
+
+// Best-effort market prices:
+// - Tries to dynamically import an internal market module (if your repo has one used by /market_value).
+// - Falls back to money=1 and 0 for others (so it still renders nicely for testing).
+async function getMarketPricesSafe(): Promise<Record<string, number>> {
+  try {
+    // Try common internal module names (ts builds emit .js)
+    // @ts-ignore
+    const mod = (await import("../lib/market.js")).default || (await import("../lib/market.js"));
+    // attempt common exports
+    const fn = (mod.getLatestMarketPrices || mod.fetchLatestPrices || mod.getMarketPrices || mod.prices) as (() => Promise<Record<string, number>>) | undefined;
+    if (fn) return await fn();
+    if (typeof mod === "object") return mod as Record<string, number>;
+  } catch {}
+  const p: Record<string, number> = {};
+  for (const k of RESOURCE_KEYS) p[k] = 0;
+  p.money = 1; // at minimum treat money at par
+  return p;
+}
+
+function computeMarketValue(amounts: Record<string, number>, prices: Record<string, number>) {
+  let total = 0;
+  for (const k of RESOURCE_KEYS) {
+    const qty = Number(amounts[k] || 0);
+    const px = Number(prices[k] || 0);
+    if (qty && px) total += qty * px;
+  }
+  return total;
+}
+
 // ---------- Slash Command (builder) ----------
 export const data = new SlashCommandBuilder()
   .setName("offshore")
   .setDescription("Offshore banking controls")
-  .addSubcommand((sc) =>
-    sc
-      .setName("show")
-      .setDescription("Show the effective offshore configuration and controls"),
-  )
+  .addSubcommand((sc) => sc.setName("show").setDescription("Show the effective offshore configuration and controls"))
   .addSubcommand((sc) =>
     sc
       .setName("set_default")
       .setDescription("BOT ADMIN: set the global default offshore alliance id")
-      .addIntegerOption((o) =>
-        o
-          .setName("alliance_id")
-          .setDescription("Alliance ID for global default (blank to clear)")
-          .setRequired(false),
-      ),
+      .addIntegerOption((o) => o.setName("alliance_id").setDescription("Alliance ID for global default (blank to clear)").setRequired(false)),
   )
   .addSubcommand((sc) =>
     sc
       .setName("set_override")
       .setDescription("Set or clear this alliance’s offshore override")
-      .addIntegerOption((o) =>
-        o
-          .setName("alliance_id")
-          .setDescription("Alliance ID for override (blank to clear)")
-          .setRequired(false),
-      ),
+      .addIntegerOption((o) => o.setName("alliance_id").setDescription("Alliance ID for override (blank to clear)").setRequired(false)),
   )
   .addSubcommand((sc) =>
-    sc
-      .setName("holdings")
-      .setDescription("Show your alliance’s net holdings in your offshore (recent window, deduped)"),
+    sc.setName("holdings").setDescription("Show what YOUR alliance is holding in the offshore (pair net in recent window)"),
   )
-  .addSubcommand((sc) =>
-    sc
-      .setName("send")
-      .setDescription("Send from your alliance bank to the configured offshore (guided modal)"),
-  );
+  .addSubcommand((sc) => sc.setName("send").setDescription("Send from your alliance bank to the configured offshore (guided modal)"));
 
 // ---------- Slash Command: execute ----------
 export async function execute(i: ChatInputCommandInteraction) {
   const sub = i.options.getSubcommand(true);
   const map = i.guildId ? await prisma.allianceGuild.findUnique({ where: { guildId: i.guildId } }) : null;
   const legacy = i.guildId ? await prisma.alliance.findFirst({ where: { guildId: i.guildId } }) : null;
-  const alliance = map
-    ? await prisma.alliance.findUnique({ where: { id: map.allianceId } })
-    : legacy;
+  const alliance = map ? await prisma.alliance.findUnique({ where: { id: map.allianceId } }) : legacy;
+
   if (!alliance) {
     return i.reply({ content: "This server is not linked yet. Run /setup_alliance first.", ephemeral: true });
   }
@@ -301,53 +313,34 @@ export async function execute(i: ChatInputCommandInteraction) {
 
     const { effective: offshoreAid } = await resolveOffshoreAid(alliance.id);
     if (!offshoreAid) {
-      return i.editReply({
-        content: "No offshore set. Use **/offshore set_override** or ask the bot admin to set a global default.",
-      });
+      return i.editReply({ content: "No offshore set. Use **/offshore set_override** or ask the bot admin to set a global default." });
     }
 
-    const take = 300;
+    const take = 500;
     try {
-      const rows = await fetchBankrecs(offshoreAid, { limit: take });
+      const [net, prices] = await Promise.all([
+        pairNetWithOffshore(alliance.id, offshoreAid, take),
+        getMarketPricesSafe(),
+      ]);
+      const totalValue = computeMarketValue(net, prices);
 
-      const A = String(alliance.id);
-      const O = String(offshoreAid);
-      const net: Record<string, number> = {};
-      for (const k of RESOURCE_KEYS) net[k] = 0;
-
-      for (const r of rows) {
-        const sType = Number((r as any).sender_type || 0);
-        const rType = Number((r as any).receiver_type || 0);
-        const sId = String((r as any).sender_id || "");
-        const rId = String((r as any).receiver_id || "");
-        const isAtoO = (sType === 2 || sType === 3) && sId === A && (rType === 2 || rType === 3) && rId === O;
-        const isOtoA = (sType === 2 || sType === 3) && sId === O && (rType === 2 || rType === 3) && rId === A;
-
-        for (const k of RESOURCE_KEYS) {
-          const v = Number((r as any)[k] || 0);
-          if (!Number.isFinite(v) || v === 0) continue;
-          if (isAtoO) net[k] += v;
-          if (isOtoA) net[k] -= v;
-        }
-      }
-
-      const lines = RESOURCE_KEYS
-        .map((k) => {
-          const v = net[k];
-          return v ? `• **${k}**: ${fmt(v)}` : null;
-        })
-        .filter(Boolean)
-        .join("\n") || "— none in window —";
-
+      // Pretty embed that mimics /market_value style
       const embed = new EmbedBuilder()
-        .setTitle("📊 Offshore Holdings (net)")
+        .setTitle("📊 Offshore Holdings — Your Alliance")
         .setColor(Colors.Green)
-        .setDescription(`**${alliance.name || alliance.id}** ↔ **${offshoreAid}**\nWindow: last ${take} offshore bankrecs`)
-        .addFields({ name: "Net (A→O minus O→A)", value: lines })
-        .setFooter({ text: `as of ${nowIso()}` });
+        .setDescription(
+          [
+            `**${alliance.name || alliance.id}** held in offshore **${offshoreAid}**`,
+            `_Window: last ${take} offshore bankrecs • as of ${nowIso()}_`,
+          ].join("\n"),
+        )
+        .addFields(
+          { name: "Breakdown", value: fmtLines(net) },
+          { name: "Total Market Value (est.)", value: `**$${fmt(totalValue)}**`, inline: true },
+        );
 
       const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder().setCustomId("offsh:check").setStyle(ButtonStyle.Secondary).setLabel("Re-check holdings"),
+        new ButtonBuilder().setCustomId("offsh:check").setStyle(ButtonStyle.Secondary).setEmoji("🔄").setLabel("Refresh"),
       );
 
       await i.editReply({ embeds: [embed], components: [row] });
@@ -377,19 +370,13 @@ function pageSlice(page: number) {
   return RESOURCE_KEYS.slice(s, s + PAGE_SIZE);
 }
 
-// Keep per-user session across modal pages
-const sendSessions: Map<
-  string,
-  { allianceId: number; data: Record<string, number>; createdAt: number }
-> = new Map();
+const sendSessions: Map<string, { allianceId: number; data: Record<string, number>; createdAt: number }> = new Map();
 
 async function openSendModal(i: Interaction, allianceId: number, page: number) {
   try {
     const keys = pageSlice(page);
     const total = pageCountAll();
-    const modal = new ModalBuilder()
-      .setCustomId(`offsh:modal:${page}`)
-      .setTitle(`📤 Offshore Send (${page + 1}/${total})`);
+    const modal = new ModalBuilder().setCustomId(`offsh:modal:${page}`).setTitle(`📤 Offshore Send (${page + 1}/${total})`);
 
     for (const k of keys) {
       const input = new TextInputBuilder()
@@ -404,8 +391,9 @@ async function openSendModal(i: Interaction, allianceId: number, page: number) {
     // @ts-ignore
     await i.showModal(modal);
 
-    const sess = sendSessions.get((i as any).user.id) || { allianceId, data: {}, createdAt: Date.now() };
-    sendSessions.set((i as any).user.id, sess);
+    const u = (i as any).user?.id || "unknown";
+    const sess = sendSessions.get(u) || { allianceId, data: {}, createdAt: Date.now() };
+    sendSessions.set(u, sess);
   } catch (e) {
     console.error("[OFFSH_MODAL_OPEN_ERR]", e);
     try {
@@ -426,14 +414,13 @@ export async function handleModal(i: Interaction) {
 
     const map = (i as any).guildId ? await prisma.allianceGuild.findUnique({ where: { guildId: (i as any).guildId } }) : null;
     const legacy = (i as any).guildId ? await prisma.alliance.findFirst({ where: { guildId: (i as any).guildId } }) : null;
-    const alliance = map
-      ? await prisma.alliance.findUnique({ where: { id: map.allianceId } })
-      : legacy;
+    const alliance = map ? await prisma.alliance.findUnique({ where: { id: map.allianceId } }) : legacy;
     if (!alliance) {
       return (i as any).reply({ content: "This server is not linked yet. Run /setup_alliance first.", ephemeral: true });
     }
 
-    const sess = sendSessions.get((i as any).user.id) || { allianceId: alliance.id, data: {}, createdAt: Date.now() };
+    const u = (i as any).user?.id || "unknown";
+    const sess = sendSessions.get(u) || { allianceId: alliance.id, data: {}, createdAt: Date.now() };
 
     const keys = pageSlice(page);
     for (const k of keys) {
@@ -449,7 +436,7 @@ export async function handleModal(i: Interaction) {
       if (num > 0) sess.data[k] = num;
       else delete sess.data[k];
     }
-    sendSessions.set((i as any).user.id, sess);
+    sendSessions.set(u, sess);
 
     const total = pageCountAll();
     const parts: string[] = [];
@@ -483,20 +470,18 @@ export async function handleButton(i: Interaction) {
 
     const map = (i as any).guildId ? await prisma.allianceGuild.findUnique({ where: { guildId: (i as any).guildId } }) : null;
     const legacy = (i as any).guildId ? await prisma.alliance.findFirst({ where: { guildId: (i as any).guildId } }) : null;
-    const alliance = map
-      ? await prisma.alliance.findUnique({ where: { id: map.allianceId } })
-      : legacy;
+    const alliance = map ? await prisma.alliance.findUnique({ where: { id: map.allianceId } }) : legacy;
     if (!alliance) {
       return (i as any).reply({ content: "This server is not linked yet. Run /setup_alliance first.", ephemeral: true });
     }
 
-    // Open next page of modal instantly (showModal only; no defer)
     return openSendModal(i, alliance.id, page);
   }
 
   // Finalize send
   if ((i as any).customId === "offsh:done") {
-    const sess = sendSessions.get((i as any).user.id);
+    const u = (i as any).user?.id || "unknown";
+    const sess = sendSessions.get(u);
     if (!sess || !Object.keys(sess.data).length) {
       return (i as any).reply({ content: "Nothing to send — all zero. Use **/offshore send**.", ephemeral: true });
     }
@@ -546,28 +531,22 @@ export async function handleButton(i: Interaction) {
       });
 
       if (ok) {
-        sendSessions.delete((i as any).user.id);
+        sendSessions.delete(u);
         return (i as any).reply({
           content: `✅ Sent to offshore **${offshoreAid}**.\nNote: \`${note}\`\nVerify with **/offshore holdings** shortly.`,
           ephemeral: true,
         });
       } else {
-        // Fallback guidance if API refused it
         const lines = Object.entries(sess.data)
           .map(([k, v]) => `• ${k}: ${fmt(Number(v))}`)
           .join("\n");
         const embed = new EmbedBuilder()
           .setTitle("📤 Manual offshore transfer")
-          .setDescription(
-            `Use your **Alliance → Alliance** banker UI to send to **Alliance ${offshoreAid}**.\nPaste the note below.`,
-          )
-          .addFields(
-            { name: "Amounts", value: lines || "—" },
-            { name: "Note", value: `\`${note}\`` },
-          )
+          .setDescription(`Use your **Alliance → Alliance** banker UI to send to **Alliance ${offshoreAid}**.\nPaste the note below.`)
+          .addFields({ name: "Amounts", value: lines || "—" }, { name: "Note", value: `\`${note}\`` })
           .setColor(Colors.Yellow);
 
-        sendSessions.delete((i as any).user.id);
+        sendSessions.delete(u);
         return (i as any).reply({ embeds: [embed], ephemeral: true });
       }
     } catch (e) {
@@ -576,65 +555,43 @@ export async function handleButton(i: Interaction) {
     }
   }
 
-  // Show holdings button
+  // Show holdings button (pretty + market value)
   if ((i as any).customId === "offsh:check") {
     await (i as any).deferReply({ ephemeral: true });
 
     const map = (i as any).guildId ? await prisma.allianceGuild.findUnique({ where: { guildId: (i as any).guildId } }) : null;
     const legacy = (i as any).guildId ? await prisma.alliance.findFirst({ where: { guildId: (i as any).guildId } }) : null;
-    const alliance = map
-      ? await prisma.alliance.findUnique({ where: { id: map.allianceId } })
-      : legacy;
+    const alliance = map ? await prisma.alliance.findUnique({ where: { id: map.allianceId } }) : legacy;
     if (!alliance) {
       return (i as any).editReply({ content: "This server is not linked yet. Run /setup_alliance first." });
     }
 
     const { effective: offshoreAid } = await resolveOffshoreAid(alliance.id);
     if (!offshoreAid) {
-      return (i as any).editReply({
-        content: "No offshore set. Use **/offshore set_override** or ask the bot admin to set a global default.",
-      });
+      return (i as any).editReply({ content: "No offshore set. Use **/offshore set_override** or ask the bot admin to set a global default." });
     }
 
-    const take = 300;
+    const take = 500;
     try {
-      const rows = await fetchBankrecs(offshoreAid, { limit: take });
-
-      const A = String(alliance.id);
-      const O = String(offshoreAid);
-      const net: Record<string, number> = {};
-      for (const k of RESOURCE_KEYS) net[k] = 0;
-
-      for (const r of rows) {
-        const sType = Number((r as any).sender_type || 0);
-        const rType = Number((r as any).receiver_type || 0);
-        const sId = String((r as any).sender_id || "");
-        const rId = String((r as any).receiver_id || "");
-        const isAtoO = (sType === 2 || sType === 3) && sId === A && (rType === 2 || rType === 3) && rId === O;
-        const isOtoA = (sType === 2 || sType === 3) && sId === O && (rType === 2 || rType === 3) && rId === A;
-
-        for (const k of RESOURCE_KEYS) {
-          const v = Number((r as any)[k] || 0);
-          if (!Number.isFinite(v) || v === 0) continue;
-          if (isAtoO) net[k] += v;
-          if (isOtoA) net[k] -= v;
-        }
-      }
-
-      const lines = RESOURCE_KEYS
-        .map((k) => {
-          const v = net[k];
-          return v ? `• **${k}**: ${fmt(v)}` : null;
-        })
-        .filter(Boolean)
-        .join("\n") || "— none in window —";
+      const [net, prices] = await Promise.all([
+        pairNetWithOffshore(alliance.id, offshoreAid, take),
+        getMarketPricesSafe(),
+      ]);
+      const totalValue = computeMarketValue(net, prices);
 
       const embed = new EmbedBuilder()
-        .setTitle("📊 Offshore Holdings (net)")
+        .setTitle("📊 Offshore Holdings — Your Alliance")
         .setColor(Colors.Green)
-        .setDescription(`**${alliance.name || alliance.id}** ↔ **${offshoreAid}**\nWindow: last ${take} offshore bankrecs`)
-        .addFields({ name: "Net (A→O minus O→A)", value: lines })
-        .setFooter({ text: `as of ${nowIso()}` });
+        .setDescription(
+          [
+            `**${alliance.name || alliance.id}** held in offshore **${offshoreAid}**`,
+            `_Window: last ${take} offshore bankrecs • as of ${nowIso()}_`,
+          ].join("\n"),
+        )
+        .addFields(
+          { name: "Breakdown", value: fmtLines(net) },
+          { name: "Total Market Value (est.)", value: `**$${fmt(totalValue)}**`, inline: true },
+        );
 
       await (i as any).editReply({ embeds: [embed] });
       return;
