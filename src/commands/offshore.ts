@@ -194,29 +194,34 @@ async function bankWithdrawAllianceToAlliance(opts: {
 }
 
 // ---------- Pricing (identical sources to /market_value) ----------
+// (Merged-cache variant: keeps last good prices for commodities when source is partial)
 async function getAveragePricesCached(): Promise<{ prices: PriceMap; source: string; asOf: number } | null> {
   const now = Date.now();
   if (priceCache && (now - priceCache.at < PRICE_CACHE_MS)) {
     return { prices: priceCache.prices, source: priceCache.source, asOf: priceCache.asOf };
   }
-  const pricing = await fetchAveragePrices();
-  if (!pricing) return null;
 
-  // Normalize asOf to a number (epoch ms), fixes TS2322
-  const asOfNum =
-    typeof (pricing as any).asOf === "number"
-      ? (pricing as any).asOf
-      : ((): number => {
-          const v = (pricing as any).asOf;
-          const parsed = typeof v === "string" ? Date.parse(v) : NaN;
-          if (Number.isFinite(parsed)) return parsed;
-          const n = Number(v);
-          if (Number.isFinite(n)) return n;
-          return now;
-        })();
+  const latest = await fetchAveragePrices();
+  if (!latest && !priceCache) return null;
 
-  priceCache = { at: now, prices: pricing.prices, source: pricing.source, asOf: asOfNum };
-  return { prices: pricing.prices, source: pricing.source, asOf: asOfNum };
+  // Normalize asOf to epoch ms
+  const normAsOf = (v: any) => {
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+    if (typeof v === "string") {
+      const p = Date.parse(v);
+      if (Number.isFinite(p)) return p;
+    }
+    const n = Number(v);
+    return Number.isFinite(n) ? n : now;
+  };
+
+  const prevPrices = priceCache?.prices ?? ({} as PriceMap);
+  const nextPrices: PriceMap = { ...(prevPrices as any), ...(latest?.prices as any) };
+  const nextSource = latest ? latest.source : (priceCache!.source + " (stale)");
+  const nextAsOf = latest ? normAsOf((latest as any).asOf) : priceCache!.asOf;
+
+  priceCache = { at: now, prices: nextPrices, source: nextSource, asOf: nextAsOf };
+  return { prices: nextPrices, source: nextSource, asOf: nextAsOf };
 }
 
 const E: Record<Resource, string> = {
@@ -250,7 +255,7 @@ const ORDER: Array<{ key: Resource; label: string }> = [
   // { key: "credits", label: "Credits" },
 ];
 
-// ---------- Holdings helpers ----------
+// ---------- Holdings helpers (pairwise net, filtered by our note tag) ----------
 function pairFieldsPretty(qtys: Partial<Record<Resource, number>>, prices: PriceMap): {
   fields: { name: string; value: string; inline: boolean }[];
   total: number;
@@ -312,44 +317,46 @@ function pairFieldsPretty(qtys: Partial<Record<Resource, number>>, prices: Price
   return { fields, total, missing };
 }
 
-// ---------- Optional fast-path via ledger ----------
+// ---------- Optional fast-path via ledger (safe; falls back if unavailable) ----------
 async function tryLedgerNet(aid: number, offshoreAid: number): Promise<Record<string, number> | null> {
   if (!USE_LEDGER) return null;
   try {
+    // Dynamic import so we don't break build/types if names change.
+    // Expect functions exported from ../lib/offshore_ledger
     const mod: any = await import("../lib/offshore_ledger");
     const catchUp = mod?.catchUpLedgerForPair || mod?.["catchUpLedgerForPair"];
     const readHeldBalances = mod?.readHeldBalances || mod?.["readHeldBalances"];
     if (!catchUp || !readHeldBalances) return null;
 
-    try { await catchUp(prisma, aid, offshoreAid); } catch { /* ignore */ }
-
-    const ledgerRow = await readHeldBalances(prisma, aid, offshoreAid);
-    if (!ledgerRow || typeof ledgerRow !== "object") return null;
-
-    const net: Record<string, number> = {};
-    for (const k of RESOURCE_KEYS) net[k] = Number((ledgerRow as any)[k] || 0);
-    return net;
+    try { await catchUp(prisma, aid, offshoreAid); } catch { /* ignore background catch-up errors */ }
+    const net = await readHeldBalances(prisma, aid, offshoreAid);
+    if (net && typeof net === "object") {
+      const out: Record<string, number> = {};
+      for (const k of RESOURCE_KEYS) out[k] = Number((net as any)[k] || 0);
+      return out;
+    }
+    return null;
   } catch (e) {
     console.warn("[OFFSH_LEDGER_BG_ERR]", e);
     return null;
   }
 }
 
-// cached pairwise net (ledger → fallback scan)
+// cached pairwise net; counts only bankrecs with our note tag when onlyMarked=true
 async function pairNetWithOffshore(aid: number, offshoreAid: number, take = OFFSH_HOLDINGS_LIMIT, onlyMarked = true) {
   const key = cacheKeyPair(aid, offshoreAid, take, onlyMarked);
   const now = Date.now();
   const cached = pairCache.get(key);
   if (cached && now - cached.at < OFFSH_CACHE_MS) return cached.net;
 
-  // 1) Try ledger first
+  // 1) Try ledger fast-path first (if enabled).
   const ledgerNet = await tryLedgerNet(aid, offshoreAid);
   if (ledgerNet) {
     pairCache.set(key, { at: now, net: ledgerNet });
     return ledgerNet;
   }
 
-  // 2) Fallback to live scan
+  // 2) Fallback to live bankrecs scan (existing behavior).
   const rows = await fetchBankrecs(offshoreAid, { limit: take });
   const A = String(aid);
   const O = String(offshoreAid);
@@ -362,6 +369,7 @@ async function pairNetWithOffshore(aid: number, offshoreAid: number, take = OFFS
     const rId = String((r as any).receiver_id || "");
     const note = String((r as any).note || "");
     const marked = !onlyMarked || note.includes(OFFSH_NOTE_TAG);
+
     if (!marked) continue;
 
     const isAtoO = (sType === 2 || sType === 3) && sId === A && (rType === 2 || rType === 3) && rId === O;
@@ -377,6 +385,51 @@ async function pairNetWithOffshore(aid: number, offshoreAid: number, take = OFFS
 
   pairCache.set(key, { at: now, net });
   return net;
+}
+
+// ---- helper: invalidate all pair cache entries for a given A↔O ----
+function invalidatePairCache(aid: number, oid: number) {
+  const prefix = `${aid}:${oid}:`;
+  for (const key of Array.from(pairCache.keys())) {
+    if (key.startsWith(prefix)) pairCache.delete(key);
+  }
+}
+
+// ---- helper: immediately bump ledger on successful send (so Refresh shows it) ----
+const LEDGER_RES = [
+  "money","food","coal","oil","uranium","lead","iron",
+  "bauxite","gasoline","munitions","steel","aluminum",
+] as const;
+
+async function applyImmediateDelta(
+  allianceId: number,
+  offshoreId: number,
+  payload: Record<string, number>
+) {
+  if (!USE_LEDGER) return; // only when ledger mode is on
+
+  const dataUpdate: any = {};
+  for (const k of LEDGER_RES) {
+    const n = Number(payload[k] || 0);
+    if (n > 0) dataUpdate[k] = { increment: n };
+  }
+
+  if (Object.keys(dataUpdate).length === 0) return;
+
+  await prisma.offshoreLedger.upsert({
+    where: { allianceId_offshoreId: { allianceId, offshoreId } },
+    update: { ...dataUpdate, updatedAt: new Date() as any },
+    create: {
+      allianceId,
+      offshoreId,
+      ...LEDGER_RES.reduce((acc, k) => {
+        acc[k] = Number(payload[k] || 0);
+        return acc;
+      }, {} as any),
+      lastSeenBankrecId: 0,
+      updatedAt: new Date() as any,
+    },
+  });
 }
 
 // ---------- Slash Command (builder) ----------
@@ -496,6 +549,7 @@ export async function execute(i: ChatInputCommandInteraction) {
       const { fields, total, missing } = pairFieldsPretty(partial, pricing.prices);
 
       const embed = new EmbedBuilder()
+        // Title shows the calling alliance for clarity
         .setTitle(`📊 Offshore Holdings — ${alliance.name || alliance.id}`)
         .setColor(Colors.Green)
         .setDescription(
@@ -706,22 +760,13 @@ export async function handleButton(i: Interaction) {
       });
 
       if (ok) {
-        // 👉 Instant ledger bump so holdings reflect immediately
-        if (USE_LEDGER) {
-          try {
-            const mod: any = await import("../lib/offshore_ledger");
-            const applyImmediateDelta = mod?.applyImmediateDelta || mod?.["applyImmediateDelta"];
-            if (applyImmediateDelta) {
-              await applyImmediateDelta(prisma, alliance.id, offshoreAid, sess.data);
-            }
-          } catch (e) {
-            console.warn("[OFFSH_LEDGER_INSTANT_BUMP_ERR]", e);
-          }
-        }
+        // Immediate ledger bump and cache bust so Refresh shows the new numbers now
+        await applyImmediateDelta(alliance.id, offshoreAid, sess.data);
+        invalidatePairCache(alliance.id, offshoreAid);
 
         sendSessions.delete(u);
         return (i as any).reply({
-          content: `✅ Sent to offshore **${offshoreAid}**.\nNote: \`${note}\`\nVerify with **/offshore holdings** (Refresh) now.`,
+          content: `✅ Sent to offshore **${offshoreAid}**.\nNote: \`${note}\`\nVerify with **/offshore holdings** or press **Refresh**.`,
           ephemeral: true,
         });
       } else {
@@ -743,7 +788,7 @@ export async function handleButton(i: Interaction) {
     }
   }
 
-  // Show holdings (with Refresh)
+  // Show holdings button (pretty + market value) — bot-tagged only
   if ((i as any).customId === "offsh:check") {
     await (i as any).deferReply({ ephemeral: true });
 
