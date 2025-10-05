@@ -194,34 +194,15 @@ async function bankWithdrawAllianceToAlliance(opts: {
 }
 
 // ---------- Pricing (identical sources to /market_value) ----------
-// (Merged-cache variant: keeps last good prices for commodities when source is partial)
 async function getAveragePricesCached(): Promise<{ prices: PriceMap; source: string; asOf: number } | null> {
   const now = Date.now();
   if (priceCache && (now - priceCache.at < PRICE_CACHE_MS)) {
     return { prices: priceCache.prices, source: priceCache.source, asOf: priceCache.asOf };
   }
-
-  const latest = await fetchAveragePrices();
-  if (!latest && !priceCache) return null;
-
-  // Normalize asOf to epoch ms
-  const normAsOf = (v: any) => {
-    if (typeof v === "number" && Number.isFinite(v)) return v;
-    if (typeof v === "string") {
-      const p = Date.parse(v);
-      if (Number.isFinite(p)) return p;
-    }
-    const n = Number(v);
-    return Number.isFinite(n) ? n : now;
-  };
-
-  const prevPrices = priceCache?.prices ?? ({} as PriceMap);
-  const nextPrices: PriceMap = { ...(prevPrices as any), ...(latest?.prices as any) };
-  const nextSource = latest ? latest.source : (priceCache!.source + " (stale)");
-  const nextAsOf = latest ? normAsOf((latest as any).asOf) : priceCache!.asOf;
-
-  priceCache = { at: now, prices: nextPrices, source: nextSource, asOf: nextAsOf };
-  return { prices: nextPrices, source: nextSource, asOf: nextAsOf };
+  const pricing = await fetchAveragePrices();
+  if (!pricing) return { prices: { money: 1 } as any, source: "money-only", asOf: Date.now() }; // defensive
+  priceCache = { at: now, prices: pricing.prices, source: pricing.source, asOf: Number(pricing.asOf) || Date.now() };
+  return { prices: pricing.prices, source: pricing.source, asOf: Number(pricing.asOf) || Date.now() };
 }
 
 const E: Record<Resource, string> = {
@@ -322,18 +303,18 @@ async function tryLedgerNet(aid: number, offshoreAid: number): Promise<Record<st
   if (!USE_LEDGER) return null;
   try {
     // Dynamic import so we don't break build/types if names change.
-    // Expect functions exported from ../lib/offshore_ledger
     const mod: any = await import("../lib/offshore_ledger");
     const catchUp = mod?.catchUpLedgerForPair || mod?.["catchUpLedgerForPair"];
-    const readHeldBalances = mod?.readHeldBalances || mod?.["readHeldBalances"];
-    if (!catchUp || !readHeldBalances) return null;
+    const readLedger = mod?.readHeldBalances || mod?.["readHeldBalances"];
+    if (!catchUp || !readLedger) return null;
 
-    try { await catchUp(prisma, aid, offshoreAid); } catch { /* ignore background catch-up errors */ }
-    const net = await readHeldBalances(prisma, aid, offshoreAid);
+    // Small/zero catch-up; background job does heavy lifting.
+    try { await catchUp(prisma, aid, offshoreAid); } catch { /* ignore */ }
+    const net = await readLedger(prisma, aid, offshoreAid);
     if (net && typeof net === "object") {
-      const out: Record<string, number> = {};
-      for (const k of RESOURCE_KEYS) out[k] = Number((net as any)[k] || 0);
-      return out;
+      const copy: Record<string, number> = {};
+      for (const k of RESOURCE_KEYS) copy[k] = Number((net as any)[k] || 0);
+      return copy;
     }
     return null;
   } catch (e) {
@@ -385,51 +366,6 @@ async function pairNetWithOffshore(aid: number, offshoreAid: number, take = OFFS
 
   pairCache.set(key, { at: now, net });
   return net;
-}
-
-// ---- helper: invalidate all pair cache entries for a given A↔O ----
-function invalidatePairCache(aid: number, oid: number) {
-  const prefix = `${aid}:${oid}:`;
-  for (const key of Array.from(pairCache.keys())) {
-    if (key.startsWith(prefix)) pairCache.delete(key);
-  }
-}
-
-// ---- helper: immediately bump ledger on successful send (so Refresh shows it) ----
-const LEDGER_RES = [
-  "money","food","coal","oil","uranium","lead","iron",
-  "bauxite","gasoline","munitions","steel","aluminum",
-] as const;
-
-async function applyImmediateDelta(
-  allianceId: number,
-  offshoreId: number,
-  payload: Record<string, number>
-) {
-  if (!USE_LEDGER) return; // only when ledger mode is on
-
-  const dataUpdate: any = {};
-  for (const k of LEDGER_RES) {
-    const n = Number(payload[k] || 0);
-    if (n > 0) dataUpdate[k] = { increment: n };
-  }
-
-  if (Object.keys(dataUpdate).length === 0) return;
-
-  await prisma.offshoreLedger.upsert({
-    where: { allianceId_offshoreId: { allianceId, offshoreId } },
-    update: { ...dataUpdate, updatedAt: new Date() as any },
-    create: {
-      allianceId,
-      offshoreId,
-      ...LEDGER_RES.reduce((acc, k) => {
-        acc[k] = Number(payload[k] || 0);
-        return acc;
-      }, {} as any),
-      lastSeenBankrecId: 0,
-      updatedAt: new Date() as any,
-    },
-  });
 }
 
 // ---------- Slash Command (builder) ----------
@@ -549,7 +485,7 @@ export async function execute(i: ChatInputCommandInteraction) {
       const { fields, total, missing } = pairFieldsPretty(partial, pricing.prices);
 
       const embed = new EmbedBuilder()
-        // Title shows the calling alliance for clarity
+        // show calling alliance name in title
         .setTitle(`📊 Offshore Holdings — ${alliance.name || alliance.id}`)
         .setColor(Colors.Green)
         .setDescription(
@@ -568,6 +504,7 @@ export async function execute(i: ChatInputCommandInteraction) {
             .join(" • "),
         });
 
+      // refresh button here
       const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder().setCustomId("offsh:check").setStyle(ButtonStyle.Secondary).setEmoji("🔄").setLabel("Refresh"),
       );
@@ -759,14 +696,16 @@ export async function handleButton(i: Interaction) {
         note,
       });
 
-      if (ok) {
-        // Immediate ledger bump and cache bust so Refresh shows the new numbers now
-        await applyImmediateDelta(alliance.id, offshoreAid, sess.data);
-        invalidatePairCache(alliance.id, offshoreAid);
+      // common button for quick jump to holdings
+      const showBtnRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId("offsh:check").setStyle(ButtonStyle.Secondary).setEmoji("📊").setLabel("Show Holdings"),
+      );
 
+      if (ok) {
         sendSessions.delete(u);
         return (i as any).reply({
-          content: `✅ Sent to offshore **${offshoreAid}**.\nNote: \`${note}\`\nVerify with **/offshore holdings** or press **Refresh**.`,
+          content: `✅ Sent to offshore **${offshoreAid}**.\nNote: \`${note}\`\nVerify with **/offshore holdings** or press **Show Holdings**.`,
+          components: [showBtnRow],
           ephemeral: true,
         });
       } else {
@@ -780,7 +719,7 @@ export async function handleButton(i: Interaction) {
           .setColor(Colors.Yellow);
 
         sendSessions.delete(u);
-        return (i as any).reply({ embeds: [embed], ephemeral: true });
+        return (i as any).reply({ embeds: [embed], components: [showBtnRow], ephemeral: true });
       }
     } catch (e) {
       console.error("[OFFSH_DONE_ERR]", e);
@@ -831,6 +770,7 @@ export async function handleButton(i: Interaction) {
       const { fields, total, missing } = pairFieldsPretty(partial, pricing.prices);
 
       const embed = new EmbedBuilder()
+        // show calling alliance name in title
         .setTitle(`📊 Offshore Holdings — ${alliance.name || alliance.id}`)
         .setColor(Colors.Green)
         .setDescription(
